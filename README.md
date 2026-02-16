@@ -33,21 +33,31 @@ Override example:
 make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 SETUP_BIND_ADDR=127.0.0.1:18100 EDGE_AGENT_FLAGS="--klipper"
 ```
 
-Bambu Connect example:
+Bambu cloud auth example:
 
 ```bash
-make dev EDGE_API_KEY=pfh_edge_xxx EDGE_AGENT_FLAGS="--klipper --bambu --bambu-connect-uri=http://127.0.0.1:3123"
+make dev EDGE_API_KEY=pfh_edge_xxx EDGE_AGENT_FLAGS="--klipper --bambu"
 ```
 
 Run with both Klipper and Bambu discovery while connecting to SaaS:
 
 ```bash
-make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 EDGE_AGENT_FLAGS="--klipper --bambu --bambu-connect-uri=http://127.0.0.1:3123"
+make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 EDGE_AGENT_FLAGS="--klipper --bambu"
 ```
 
 - `EDGE_API_KEY` maps to `--api-key` for SaaS auth.
 - `DEV_CONTROL_PLANE_URL` maps to `--control-plane-url`.
-- Ensure Bambu Connect is installed and running at `--bambu-connect-uri`.
+
+## Current Bambu Status
+
+- Bambu startup now performs cloud authentication (MFA supported) and persists token material locally in `~/.printfarmhq/bambu/credentials.json`.
+- Bambu mode requires only `--bambu`.
+- Startup first tries stored token reuse (and refresh token when available). If not valid, it prompts for username/password interactively.
+- Password input is treated as secret in terminal sessions and is not echoed back.
+- When MFA is required, startup blocks and asks for the code on the interactive console.
+- Empty/invalid MFA code (or non-interactive console) makes startup fail with a non-zero exit.
+- Bambu print lifecycle actions are not enabled yet in this code path.
+- Cloud auth/MFA + cloud print lifecycle rollout is tracked in `backlog/todo/p0.md`.
 
 Direct run is also supported:
 
@@ -58,7 +68,7 @@ Direct run is also supported:
 Direct run with both adapters:
 
 ```bash
-./bin/edge-agent --klipper --bambu --bambu-connect-uri="http://127.0.0.1:3123" --control-plane-url="http://localhost:8000" --api-key="pfh_edge_xxx"
+./bin/edge-agent --klipper --bambu --control-plane-url="http://localhost:8000" --api-key="pfh_edge_xxx"
 ```
 
 `--saas-api-key` is accepted as an alias for `--api-key`.

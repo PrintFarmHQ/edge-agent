@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
+	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
 func newTestAgent(t *testing.T) *agent {
@@ -47,6 +51,55 @@ func newTestAgent(t *testing.T) *agent {
 		breakerUntil:   make(map[int]time.Time),
 		discoverySeeds: make(map[string]time.Time),
 	}
+}
+
+type fakeBambuAuthProvider struct {
+	loginFn   func(ctx context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error)
+	refreshFn func(ctx context.Context, req bambuauth.RefreshRequest) (bambuauth.Session, error)
+}
+
+func (f *fakeBambuAuthProvider) Login(ctx context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
+	if f.loginFn == nil {
+		return bambuauth.Session{}, errors.New("login not implemented")
+	}
+	return f.loginFn(ctx, req)
+}
+
+func (f *fakeBambuAuthProvider) Refresh(ctx context.Context, req bambuauth.RefreshRequest) (bambuauth.Session, error) {
+	if f.refreshFn == nil {
+		return bambuauth.Session{}, errors.New("refresh not implemented")
+	}
+	return f.refreshFn(ctx, req)
+}
+
+type memoryBambuCredentialsStore struct {
+	loadErr error
+	saveErr error
+	loaded  bambustore.BambuCredentials
+	last    bambustore.BambuCredentials
+	saveCnt int
+	loadCnt int
+}
+
+func (s *memoryBambuCredentialsStore) Save(_ context.Context, credentials bambustore.BambuCredentials) error {
+	s.saveCnt++
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	s.last = credentials
+	return nil
+}
+
+func (s *memoryBambuCredentialsStore) Load(_ context.Context) (bambustore.BambuCredentials, error) {
+	s.loadCnt++
+	if s.loadErr != nil {
+		return bambustore.BambuCredentials{}, s.loadErr
+	}
+	return s.loaded, nil
+}
+
+func (s *memoryBambuCredentialsStore) Path() string {
+	return ""
 }
 
 func TestParseRuntimeFlags(t *testing.T) {
@@ -83,10 +136,91 @@ func TestParseRuntimeFlagsRequiresAtLeastOneAdapter(t *testing.T) {
 	}
 }
 
-func TestParseRuntimeFlagsBambuRequiresConnectURI(t *testing.T) {
-	_, err := parseRuntimeFlags([]string{"--bambu"})
+func TestParseRuntimeFlagsBambuOnly(t *testing.T) {
+	flags, err := parseRuntimeFlags([]string{"--bambu"})
+	if err != nil {
+		t.Fatalf("parseRuntimeFlags returned error: %v", err)
+	}
+	if !flags.EnableBambu {
+		t.Fatalf("EnableBambu = false, want true")
+	}
+	if flags.EnableKlipper {
+		t.Fatalf("EnableKlipper = true, want false")
+	}
+}
+
+func TestParseRuntimeFlagsRejectsRemovedBambuConnectURIFlag(t *testing.T) {
+	_, err := parseRuntimeFlags([]string{"--bambu", "--bambu-connect-uri=http://127.0.0.1:8088"})
 	if err == nil {
-		t.Fatalf("expected parseRuntimeFlags to fail when --bambu-connect-uri is missing")
+		t.Fatalf("expected parseRuntimeFlags to reject removed --bambu-connect-uri flag")
+	}
+}
+
+func TestParseRuntimeFlagsRejectsRemovedBambuMFAFlags(t *testing.T) {
+	_, err := parseRuntimeFlags([]string{"--bambu", "--bambu-mfa-code=123456"})
+	if err == nil {
+		t.Fatalf("expected parseRuntimeFlags to reject removed --bambu-mfa-code flag")
+	}
+
+	_, err = parseRuntimeFlags([]string{"--bambu", "--bambu-mfa-code-cmd=printf 123456"})
+	if err == nil {
+		t.Fatalf("expected parseRuntimeFlags to reject removed --bambu-mfa-code-cmd flag")
+	}
+}
+
+func TestParseRuntimeFlagsRejectsRemovedBambuCredentialFlags(t *testing.T) {
+	_, err := parseRuntimeFlags([]string{"--bambu", "--bambu-username=user@example.com"})
+	if err == nil {
+		t.Fatalf("expected parseRuntimeFlags to reject removed --bambu-username flag")
+	}
+	if !strings.Contains(err.Error(), "bambu-username") {
+		t.Fatalf("unexpected error for removed --bambu-username flag: %v", err)
+	}
+
+	_, err = parseRuntimeFlags([]string{"--bambu", "--bambu-password=secret"})
+	if err == nil {
+		t.Fatalf("expected parseRuntimeFlags to reject removed --bambu-password flag")
+	}
+	if !strings.Contains(err.Error(), "bambu-password") {
+		t.Fatalf("unexpected error for removed --bambu-password flag: %v", err)
+	}
+}
+
+func TestLoadConfigIgnoresEnableBambuSpikeAlias(t *testing.T) {
+	t.Setenv("ENABLE_BAMBU", "")
+	t.Setenv("ENABLE_BAMBU_SPIKE", "true")
+
+	cfg := loadConfig()
+	if cfg.EnableBambu {
+		t.Fatalf("EnableBambu = true, want false when only ENABLE_BAMBU_SPIKE is set")
+	}
+}
+
+func TestDefaultEdgeStateDirUsesPrintfarmhq(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	got := defaultEdgeStateDir()
+	want := filepath.Join(homeDir, ".printfarmhq")
+	if got != want {
+		t.Fatalf("defaultEdgeStateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadConfigDefaultPathsUsePrintfarmhq(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	cfg := loadConfig()
+	wantRoot := filepath.Join(homeDir, ".printfarmhq")
+	if cfg.BootstrapConfigPath != filepath.Join(wantRoot, "bootstrap", "config.json") {
+		t.Fatalf("BootstrapConfigPath = %q, want %q", cfg.BootstrapConfigPath, filepath.Join(wantRoot, "bootstrap", "config.json"))
+	}
+	if cfg.AuditLogPath != filepath.Join(wantRoot, "logs", "audit.log") {
+		t.Fatalf("AuditLogPath = %q, want %q", cfg.AuditLogPath, filepath.Join(wantRoot, "logs", "audit.log"))
+	}
+	if cfg.ArtifactStageDir != filepath.Join(wantRoot, "artifacts") {
+		t.Fatalf("ArtifactStageDir = %q, want %q", cfg.ArtifactStageDir, filepath.Join(wantRoot, "artifacts"))
 	}
 }
 
@@ -100,7 +234,6 @@ func TestApplyRuntimeFlagsOverridesConfig(t *testing.T) {
 		APIKey:          "after-key",
 		EnableKlipper:   true,
 		EnableBambu:     true,
-		BambuConnectURI: "http://127.0.0.1:8088",
 	})
 	if out.StartupControlPlaneURL != "http://after" {
 		t.Fatalf("StartupControlPlaneURL = %q, want %q", out.StartupControlPlaneURL, "http://after")
@@ -111,11 +244,353 @@ func TestApplyRuntimeFlagsOverridesConfig(t *testing.T) {
 	if !out.EnableKlipper || !out.EnableBambu {
 		t.Fatalf("expected adapter flags to be enabled after runtime override")
 	}
-	if out.BambuConnectURI != "http://127.0.0.1:8088" {
-		t.Fatalf("BambuConnectURI = %q, want %q", out.BambuConnectURI, "http://127.0.0.1:8088")
-	}
 	if strings.Join(out.DiscoveryAllowedAdapters, ",") != "moonraker,bambu" {
 		t.Fatalf("DiscoveryAllowedAdapters = %v, want [moonraker bambu]", out.DiscoveryAllowedAdapters)
+	}
+}
+
+func TestBambuAuthStartupUsesStoredValidToken(t *testing.T) {
+	a := newTestAgent(t)
+
+	store := &memoryBambuCredentialsStore{
+		loaded: bambustore.BambuCredentials{
+			Username:           "saved@example.com",
+			AccessToken:        "stored-access-token",
+			RefreshToken:       "stored-refresh-token",
+			ExpiresAt:          time.Now().UTC().Add(30 * time.Minute),
+			MaskedEmail:        "s***@example.com",
+			AccountDisplayName: "Saved User",
+		},
+	}
+	a.bambuAuthStore = store
+
+	loginCalled := false
+	refreshCalled := false
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, _ bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalled = true
+			return bambuauth.Session{}, errors.New("login should not be called for valid stored token")
+		},
+		refreshFn: func(_ context.Context, _ bambuauth.RefreshRequest) (bambuauth.Session, error) {
+			refreshCalled = true
+			return bambuauth.Session{}, errors.New("refresh should not be called for valid stored token")
+		},
+	}
+
+	if err := a.initializeBambuAuth(context.Background()); err != nil {
+		t.Fatalf("initializeBambuAuth failed: %v", err)
+	}
+	state := a.snapshotBambuAuthState()
+	if !state.Ready {
+		t.Fatalf("bambu auth should be ready")
+	}
+	if state.MaskedEmail != "s***@example.com" {
+		t.Fatalf("masked email = %q, want s***@example.com", state.MaskedEmail)
+	}
+	if state.DisplayName != "Saved User" {
+		t.Fatalf("display name = %q, want Saved User", state.DisplayName)
+	}
+	if loginCalled || refreshCalled {
+		t.Fatalf("provider should not be called when stored token is still valid")
+	}
+	if store.saveCnt != 0 {
+		t.Fatalf("store save count = %d, want 0", store.saveCnt)
+	}
+}
+
+func setInteractiveBambuAuthTestInput(t *testing.T, input string, interactive bool) *bytes.Buffer {
+	t.Helper()
+	originalReader := bambuAuthInputReader
+	originalWriter := bambuAuthOutputWriter
+	originalInteractiveCheck := isBambuAuthInteractiveConsole
+
+	output := &bytes.Buffer{}
+	bambuAuthInputReader = strings.NewReader(input)
+	bambuAuthOutputWriter = output
+	isBambuAuthInteractiveConsole = func() bool {
+		return interactive
+	}
+
+	t.Cleanup(func() {
+		bambuAuthInputReader = originalReader
+		bambuAuthOutputWriter = originalWriter
+		isBambuAuthInteractiveConsole = originalInteractiveCheck
+	})
+
+	return output
+}
+
+func TestBambuAuthStartupRefreshesExpiredToken(t *testing.T) {
+	a := newTestAgent(t)
+	store := &memoryBambuCredentialsStore{
+		loaded: bambustore.BambuCredentials{
+			Username:     "saved@example.com",
+			AccessToken:  "expired-access-token",
+			RefreshToken: "stored-refresh-token",
+			ExpiresAt:    time.Now().UTC().Add(-30 * time.Minute),
+		},
+	}
+	a.bambuAuthStore = store
+	setInteractiveBambuAuthTestInput(t, "", false)
+
+	loginCalled := false
+	refreshCalled := false
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, _ bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalled = true
+			return bambuauth.Session{}, errors.New("interactive login should not run when refresh succeeds")
+		},
+		refreshFn: func(_ context.Context, req bambuauth.RefreshRequest) (bambuauth.Session, error) {
+			refreshCalled = true
+			if req.RefreshToken != "stored-refresh-token" {
+				t.Fatalf("refresh token = %q, want stored-refresh-token", req.RefreshToken)
+			}
+			return bambuauth.Session{
+				AccessToken:  "refreshed-access-token",
+				RefreshToken: "",
+				ExpiresAt:    time.Now().UTC().Add(2 * time.Hour),
+			}, nil
+		},
+	}
+
+	if err := a.initializeBambuAuth(context.Background()); err != nil {
+		t.Fatalf("initializeBambuAuth failed: %v", err)
+	}
+	if !a.snapshotBambuAuthState().Ready {
+		t.Fatalf("bambu auth should be ready")
+	}
+	if !refreshCalled {
+		t.Fatalf("refresh should be called for expired token with refresh token")
+	}
+	if loginCalled {
+		t.Fatalf("interactive login should not run when refresh succeeds")
+	}
+	if store.saveCnt != 1 {
+		t.Fatalf("store save count = %d, want 1", store.saveCnt)
+	}
+	if store.last.AccessToken != "refreshed-access-token" {
+		t.Fatalf("stored access token = %q, want refreshed-access-token", store.last.AccessToken)
+	}
+	if store.last.RefreshToken != "stored-refresh-token" {
+		t.Fatalf("stored refresh token = %q, want stored-refresh-token", store.last.RefreshToken)
+	}
+	if store.last.Username != "saved@example.com" {
+		t.Fatalf("stored username = %q, want saved@example.com", store.last.Username)
+	}
+}
+
+func TestBambuAuthRefreshFailureFallsBackToInteractiveLogin(t *testing.T) {
+	a := newTestAgent(t)
+	store := &memoryBambuCredentialsStore{
+		loaded: bambustore.BambuCredentials{
+			Username:     "saved@example.com",
+			AccessToken:  "expired-access-token",
+			RefreshToken: "stored-refresh-token",
+			ExpiresAt:    time.Now().UTC().Add(-30 * time.Minute),
+		},
+	}
+	a.bambuAuthStore = store
+	promptOutput := setInteractiveBambuAuthTestInput(t, "\nsecret\n", true)
+
+	loginCalled := false
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		refreshFn: func(_ context.Context, _ bambuauth.RefreshRequest) (bambuauth.Session, error) {
+			return bambuauth.Session{}, errors.New("refresh failed")
+		},
+		loginFn: func(_ context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalled = true
+			if req.Username != "saved@example.com" {
+				t.Fatalf("login username = %q, want saved@example.com", req.Username)
+			}
+			if req.Password != "secret" {
+				t.Fatalf("login password mismatch")
+			}
+			return bambuauth.Session{
+				AccessToken:  "interactive-access-token",
+				RefreshToken: "interactive-refresh-token",
+				ExpiresAt:    time.Now().UTC().Add(1 * time.Hour),
+			}, nil
+		},
+	}
+
+	if err := a.initializeBambuAuth(context.Background()); err != nil {
+		t.Fatalf("initializeBambuAuth failed: %v", err)
+	}
+	if !loginCalled {
+		t.Fatalf("interactive login should run when refresh fails")
+	}
+	if store.saveCnt != 1 {
+		t.Fatalf("store save count = %d, want 1", store.saveCnt)
+	}
+	if store.last.Username != "saved@example.com" {
+		t.Fatalf("stored username = %q, want saved@example.com", store.last.Username)
+	}
+	if !strings.Contains(promptOutput.String(), "Bambu username [saved@example.com]") {
+		t.Fatalf("expected username prompt with default, got %q", promptOutput.String())
+	}
+	if !strings.Contains(promptOutput.String(), "Bambu password: ") {
+		t.Fatalf("expected password prompt, got %q", promptOutput.String())
+	}
+	if strings.Contains(promptOutput.String(), "secret") {
+		t.Fatalf("password should never be written to auth output: %q", promptOutput.String())
+	}
+}
+
+func TestBambuAuthInteractiveLoginRequiresInteractiveConsole(t *testing.T) {
+	a := newTestAgent(t)
+	a.bambuAuthStore = &memoryBambuCredentialsStore{loadErr: os.ErrNotExist}
+	setInteractiveBambuAuthTestInput(t, "user@example.com\nsecret\n", false)
+
+	loginCalled := false
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, _ bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalled = true
+			return bambuauth.Session{}, errors.New("login should not be called without interactive console")
+		},
+	}
+
+	err := a.initializeBambuAuth(context.Background())
+	if err == nil {
+		t.Fatalf("expected initializeBambuAuth to fail when console is not interactive")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "interactive") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loginCalled {
+		t.Fatalf("login should not be called when interactive console is unavailable")
+	}
+	if a.snapshotBambuAuthState().Ready {
+		t.Fatalf("bambu auth should not be ready")
+	}
+}
+
+func TestBambuAuthMFAWithInteractiveCodeSucceeds(t *testing.T) {
+	a := newTestAgent(t)
+	a.bambuAuthStore = &memoryBambuCredentialsStore{loadErr: os.ErrNotExist}
+	promptOutput := setInteractiveBambuAuthTestInput(t, "user@example.com\nsecret\n654321\n", true)
+
+	loginCalls := 0
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalls++
+			if req.Username != "user@example.com" {
+				t.Fatalf("login username = %q, want user@example.com", req.Username)
+			}
+			if loginCalls == 1 {
+				if req.MFACode != "" {
+					t.Fatalf("first login should not include MFA code")
+				}
+				if req.Password != "secret" {
+					t.Fatalf("first login password mismatch")
+				}
+				return bambuauth.Session{}, &bambuauth.Error{Kind: bambuauth.ErrMFARequired, Message: "mfa required"}
+			}
+			if req.MFACode != "654321" {
+				t.Fatalf("second login mfa code = %q, want 654321", req.MFACode)
+			}
+			return bambuauth.Session{
+				AccessToken: "access-token",
+				ExpiresAt:   time.Now().UTC().Add(1 * time.Hour),
+			}, nil
+		},
+	}
+
+	if err := a.initializeBambuAuth(context.Background()); err != nil {
+		t.Fatalf("initializeBambuAuth failed: %v", err)
+	}
+	if !a.snapshotBambuAuthState().Ready {
+		t.Fatalf("bambu auth should be ready")
+	}
+	if loginCalls != 2 {
+		t.Fatalf("login call count = %d, want 2", loginCalls)
+	}
+	if !strings.Contains(promptOutput.String(), "Bambu username: ") {
+		t.Fatalf("expected username prompt output, got %q", promptOutput.String())
+	}
+	if !strings.Contains(promptOutput.String(), "Bambu password: ") {
+		t.Fatalf("expected password prompt output, got %q", promptOutput.String())
+	}
+	if !strings.Contains(promptOutput.String(), "Bambu MFA code required") {
+		t.Fatalf("expected MFA prompt output, got %q", promptOutput.String())
+	}
+	if strings.Contains(promptOutput.String(), "secret") || strings.Contains(promptOutput.String(), "654321") {
+		t.Fatalf("sensitive auth values should never be written to output: %q", promptOutput.String())
+	}
+	store := a.bambuAuthStore.(*memoryBambuCredentialsStore)
+	if store.saveCnt != 1 {
+		t.Fatalf("store save count = %d, want 1", store.saveCnt)
+	}
+	if store.last.Username != "user@example.com" {
+		t.Fatalf("stored username = %q, want user@example.com", store.last.Username)
+	}
+}
+
+func TestBambuAuthMFAWithEmptyInteractiveCodeFails(t *testing.T) {
+	a := newTestAgent(t)
+	a.bambuAuthStore = &memoryBambuCredentialsStore{loadErr: os.ErrNotExist}
+	setInteractiveBambuAuthTestInput(t, "user@example.com\nsecret\n\n", true)
+
+	loginCalls := 0
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalls++
+			if loginCalls == 1 {
+				if req.MFACode != "" {
+					t.Fatalf("first login should not include MFA code")
+				}
+				return bambuauth.Session{}, &bambuauth.Error{Kind: bambuauth.ErrMFARequired, Message: "mfa required"}
+			}
+			return bambuauth.Session{}, errors.New("unexpected second login")
+		},
+	}
+
+	err := a.initializeBambuAuth(context.Background())
+	if err == nil {
+		t.Fatalf("expected initializeBambuAuth to fail for empty MFA code")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "cannot be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loginCalls != 1 {
+		t.Fatalf("login call count = %d, want 1", loginCalls)
+	}
+}
+
+func TestBambuAuthMFAWrongCodeFails(t *testing.T) {
+	a := newTestAgent(t)
+	store := &memoryBambuCredentialsStore{loadErr: os.ErrNotExist}
+	a.bambuAuthStore = store
+	setInteractiveBambuAuthTestInput(t, "user@example.com\nsecret\n111111\n", true)
+
+	loginCalls := 0
+	a.bambuAuthProvider = &fakeBambuAuthProvider{
+		loginFn: func(_ context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
+			loginCalls++
+			if loginCalls == 1 {
+				return bambuauth.Session{}, &bambuauth.Error{Kind: bambuauth.ErrMFARequired, Message: "mfa required"}
+			}
+			if req.MFACode != "111111" {
+				t.Fatalf("second login mfa code = %q, want 111111", req.MFACode)
+			}
+			return bambuauth.Session{}, &bambuauth.Error{Kind: bambuauth.ErrInvalidCredentials, Message: "incorrect MFA code"}
+		},
+	}
+
+	err := a.initializeBambuAuth(context.Background())
+	if err == nil {
+		t.Fatalf("expected initializeBambuAuth to fail with wrong MFA code")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "incorrect mfa code") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loginCalls != 2 {
+		t.Fatalf("login call count = %d, want 2", loginCalls)
+	}
+	if store.saveCnt != 0 {
+		t.Fatalf("store save count = %d, want 0", store.saveCnt)
+	}
+	if a.snapshotBambuAuthState().Ready {
+		t.Fatalf("bambu auth should not be ready")
 	}
 }
 
@@ -573,7 +1048,7 @@ func TestClaimWithSaaSSendsDiscoveryCapabilities(t *testing.T) {
 	a.cfg.DiscoveryNetworkMode = "host"
 	a.cfg.DiscoveryAllowedAdapters = []string{"moonraker", "bambu"}
 	a.cfg.EnableBambu = true
-	a.cfg.BambuConnectURI = "http://127.0.0.1:8088"
+	a.setBambuAuthState(bambuAuthState{Ready: true})
 
 	saasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/edge/agents/claim" {
@@ -596,11 +1071,11 @@ func TestClaimWithSaaSSendsDiscoveryCapabilities(t *testing.T) {
 		if req.Capabilities["bambu_enabled"] != "true" {
 			t.Fatalf("unexpected bambu_enabled: %q", req.Capabilities["bambu_enabled"])
 		}
-		if req.Capabilities["bambu_connect_uri_configured"] != "true" {
-			t.Fatalf("unexpected bambu_connect_uri_configured: %q", req.Capabilities["bambu_connect_uri_configured"])
+		if req.Capabilities["bambu_auth_ready"] != "true" {
+			t.Fatalf("unexpected bambu_auth_ready: %q", req.Capabilities["bambu_auth_ready"])
 		}
-		if req.Capabilities["bambu_spike_enabled"] != "true" {
-			t.Fatalf("unexpected bambu_spike_enabled: %q", req.Capabilities["bambu_spike_enabled"])
+		if _, exists := req.Capabilities["bambu_spike_enabled"]; exists {
+			t.Fatalf("legacy capability bambu_spike_enabled should not be present")
 		}
 		writeJSON(w, http.StatusOK, claimResponse{
 			AgentID:                 "edge_1",
@@ -874,6 +1349,7 @@ func TestExecuteDiscoveryJobBambuConnectCandidates(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableKlipper = false
 	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true})
 	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
 	a.cfg.DiscoveryProbeTimeout = 2 * time.Second
 
@@ -930,6 +1406,7 @@ func TestExecuteDiscoveryJobBambuConnectUnreachable(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableKlipper = false
 	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true})
 	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
 	a.cfg.DiscoveryProbeTimeout = 150 * time.Millisecond
 	a.cfg.BambuConnectURI = "http://127.0.0.1:9"
@@ -2051,6 +2528,7 @@ func TestExecuteActionBambuDisabled(t *testing.T) {
 func TestExecuteActionBambuConnectRejected(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true})
 
 	err := a.executeAction(
 		context.Background(),
@@ -2068,6 +2546,7 @@ func TestExecuteActionBambuConnectRejected(t *testing.T) {
 func TestFetchBindingSnapshotBambuConnectEnabled(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true})
 
 	connectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/printers/printer-123/status" {

@@ -2,7 +2,7 @@
 
 BIN_DIR := $(CURDIR)/bin
 BIN_PATH := $(BIN_DIR)/edge-agent
-EDGE_STATE_DIR ?= $(HOME)/.printfarmhq-edge
+EDGE_STATE_DIR ?= $(HOME)/.printfarmhq
 BOOTSTRAP_CONFIG_PATH ?= $(EDGE_STATE_DIR)/bootstrap/config.json
 AUDIT_LOG_PATH ?= $(EDGE_STATE_DIR)/logs/audit.log
 ARTIFACT_STAGE_DIR ?= $(EDGE_STATE_DIR)/artifacts

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -21,12 +22,17 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
+	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
+	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
 const (
@@ -41,10 +47,14 @@ const (
 	discoverySourceSeedHistory   = "seed_inventory_history"
 	discoverySourceCIDRAllowlist = "cidr_allowlist"
 	discoverySourceLocalSubnets  = "local_private_subnets"
+	discoverySourceBambuConnect  = "bambu_connect"
+	telemetrySourceBambuConnect  = "bambu_connect"
 )
 
 var agentSupportedSchemaVersions = []int{1, agentSchemaVersion}
 var errEdgeAuthRevoked = errors.New("edge_api_key_revoked")
+var errBambuConnectActionsUnsupported = errors.New("validation_error: bambu actions are not enabled via bambu connect bridge")
+var errBambuAuthUnavailable = errors.New("validation_error: bambu auth is not ready")
 var macAddressPattern = regexp.MustCompile(`([0-9a-f]{1,2}([:-][0-9a-f]{1,2}){5})`)
 var arpCommandWarningOnce sync.Once
 var runARPCommand = func(parts []string) ([]byte, error) {
@@ -54,6 +64,9 @@ var runARPCommand = func(parts []string) ([]byte, error) {
 var logARPCommandWarning = func(message string, args ...any) {
 	log.Printf(message, args...)
 }
+var bambuAuthInputReader io.Reader = os.Stdin
+var bambuAuthOutputWriter io.Writer = os.Stdout
+var isBambuAuthInteractiveConsole = defaultIsBambuAuthInteractiveConsole
 
 type bootstrapConfig struct {
 	ControlPlaneURL string    `json:"control_plane_url"`
@@ -325,6 +338,16 @@ type bindingSnapshot struct {
 	DetectedModelHint  string
 }
 
+type bambuAuthState struct {
+	Ready         bool
+	ExpiresAt     time.Time
+	MaskedEmail   string
+	MaskedPhone   string
+	DisplayName   string
+	LastError     string
+	LastAttemptAt time.Time
+}
+
 type appConfig struct {
 	SetupBindAddr               string
 	BootstrapConfigPath         string
@@ -334,6 +357,7 @@ type appConfig struct {
 	StartupSaaSAPIKey           string
 	EnableKlipper               bool
 	EnableBambu                 bool
+	BambuCloudAuthBaseURL       string
 	BambuConnectURI             string
 	BindingsPollInterval        time.Duration
 	DesiredStatePollInterval    time.Duration
@@ -365,12 +389,16 @@ type runtimeFlags struct {
 	APIKey          string
 	EnableKlipper   bool
 	EnableBambu     bool
-	BambuConnectURI string
 }
 
 type agent struct {
 	cfg    appConfig
 	client *http.Client
+
+	bambuAuthProvider bambuauth.Provider
+	bambuAuthStore    bambustore.BambuCredentialsStore
+	bambuAuthMu       sync.RWMutex
+	bambuAuth         bambuAuthState
 
 	mu              sync.RWMutex
 	bootstrap       bootstrapConfig
@@ -424,6 +452,10 @@ func main() {
 	}
 	if err := app.bootstrapFromStartupCredentials(context.Background()); err != nil {
 		log.Fatalf("failed to bootstrap from startup credentials: %v", err)
+	}
+	if err := app.initializeBambuAuth(context.Background()); err != nil {
+		app.audit("bambu_auth_init_error", map[string]any{"error": err.Error()})
+		log.Fatalf("failed to initialize bambu auth: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -551,16 +583,373 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 	return nil
 }
 
+func (a *agent) initializeBambuAuth(ctx context.Context) error {
+	if !a.cfg.EnableBambu {
+		a.setBambuAuthState(bambuAuthState{})
+		return nil
+	}
+
+	state := bambuAuthState{LastAttemptAt: time.Now().UTC()}
+	a.setBambuAuthState(state)
+	a.audit("bambu_auth_start", map[string]any{
+		"mode":             "token_reuse_with_interactive_fallback",
+		"interactive_auth": true,
+	})
+
+	provider := a.bambuAuthProvider
+	if provider == nil {
+		provider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+			AuthBaseURL: strings.TrimSpace(a.cfg.BambuCloudAuthBaseURL),
+			Client:      a.client,
+		})
+		a.bambuAuthProvider = provider
+	}
+
+	credentialsStore := a.bambuAuthStore
+	if credentialsStore == nil {
+		store, err := bambustore.NewDefaultBambuCredentialsFileStore()
+		if err != nil {
+			state.LastError = fmt.Sprintf("bambu token store init failed: %v", err)
+			a.setBambuAuthState(state)
+			a.audit("bambu_auth_failure", map[string]any{"error": state.LastError})
+			return err
+		}
+		credentialsStore = store
+		a.bambuAuthStore = credentialsStore
+	}
+
+	session, username, shouldPersist, err := a.establishBambuSession(ctx, provider, credentialsStore)
+	if err != nil {
+		state.LastError = err.Error()
+		a.setBambuAuthState(state)
+		a.audit("bambu_auth_failure", map[string]any{"error": state.LastError})
+		return err
+	}
+
+	if shouldPersist {
+		credentials := bambustore.BambuCredentials{
+			Username:           strings.TrimSpace(username),
+			AccessToken:        session.AccessToken,
+			RefreshToken:       session.RefreshToken,
+			ExpiresAt:          session.ExpiresAt.UTC(),
+			MaskedEmail:        session.MaskedEmail,
+			MaskedPhone:        session.MaskedPhone,
+			AccountDisplayName: session.AccountDisplayName,
+		}
+		if err := credentialsStore.Save(ctx, credentials); err != nil {
+			state.LastError = fmt.Sprintf("bambu token store write failed: %v", err)
+			a.setBambuAuthState(state)
+			a.audit("bambu_auth_persist_failure", map[string]any{"error": state.LastError})
+			return err
+		}
+	}
+
+	state = bambuAuthState{
+		Ready:         true,
+		ExpiresAt:     session.ExpiresAt.UTC(),
+		MaskedEmail:   session.MaskedEmail,
+		MaskedPhone:   session.MaskedPhone,
+		DisplayName:   session.AccountDisplayName,
+		LastAttemptAt: time.Now().UTC(),
+	}
+	a.setBambuAuthState(state)
+	a.audit("bambu_auth_success", map[string]any{
+		"expires_at":      state.ExpiresAt,
+		"masked_email":    state.MaskedEmail,
+		"masked_phone":    state.MaskedPhone,
+		"display_name":    state.DisplayName,
+		"refresh_present": session.RefreshToken != "",
+	})
+	return nil
+}
+
+func (a *agent) establishBambuSession(
+	ctx context.Context,
+	provider bambuauth.Provider,
+	store bambustore.BambuCredentialsStore,
+) (bambuauth.Session, string, bool, error) {
+	now := time.Now().UTC()
+	storedCredentials, loadErr := store.Load(ctx)
+	if loadErr == nil {
+		storedUsername := strings.TrimSpace(storedCredentials.Username)
+		if isStoredBambuTokenUsable(storedCredentials, now) {
+			a.audit("bambu_auth_token_loaded", map[string]any{
+				"expires_at": storedCredentials.ExpiresAt,
+			})
+			return sessionFromStoredBambuCredentials(storedCredentials), storedUsername, false, nil
+		}
+
+		refreshToken := strings.TrimSpace(storedCredentials.RefreshToken)
+		if refreshToken != "" {
+			a.audit("bambu_auth_token_refresh_attempt", map[string]any{
+				"expires_at": storedCredentials.ExpiresAt,
+			})
+			refreshedSession, refreshErr := provider.Refresh(ctx, bambuauth.RefreshRequest{RefreshToken: refreshToken})
+			if refreshErr == nil {
+				if strings.TrimSpace(refreshedSession.RefreshToken) == "" {
+					refreshedSession.RefreshToken = refreshToken
+				}
+				a.audit("bambu_auth_token_refresh_success", map[string]any{
+					"expires_at": refreshedSession.ExpiresAt,
+				})
+				return refreshedSession, storedUsername, true, nil
+			}
+			a.audit("bambu_auth_token_refresh_failure", map[string]any{
+				"error": refreshErr.Error(),
+			})
+		}
+
+		a.audit("bambu_auth_interactive_login_required", map[string]any{
+			"reason": "stored_token_unusable",
+		})
+		session, promptedUsername, loginErr := loginBambuCloudInteractive(ctx, provider, storedUsername)
+		if loginErr != nil {
+			return bambuauth.Session{}, "", false, loginErr
+		}
+		return session, promptedUsername, true, nil
+	}
+
+	if !errors.Is(loadErr, os.ErrNotExist) {
+		return bambuauth.Session{}, "", false, fmt.Errorf("load bambu credentials: %w", loadErr)
+	}
+
+	a.audit("bambu_auth_interactive_login_required", map[string]any{
+		"reason": "missing_token",
+	})
+	session, promptedUsername, loginErr := loginBambuCloudInteractive(ctx, provider, "")
+	if loginErr != nil {
+		return bambuauth.Session{}, "", false, loginErr
+	}
+	return session, promptedUsername, true, nil
+}
+
+func loginBambuCloudInteractive(
+	ctx context.Context,
+	provider bambuauth.Provider,
+	defaultUsername string,
+) (bambuauth.Session, string, error) {
+	reader := bufio.NewReader(bambuAuthInputReader)
+	username, password, promptErr := promptForBambuCredentials(ctx, reader, defaultUsername)
+	if promptErr != nil {
+		return bambuauth.Session{}, "", promptErr
+	}
+
+	loginReq := bambuauth.LoginRequest{
+		Username: username,
+		Password: password,
+	}
+	session, err := provider.Login(ctx, loginReq)
+	if err == nil {
+		return session, username, nil
+	}
+	if !errors.Is(err, bambuauth.ErrMFARequired) {
+		return bambuauth.Session{}, "", err
+	}
+
+	mfaCode, promptErr := promptForBambuMFACode(ctx, reader)
+	if promptErr != nil {
+		return bambuauth.Session{}, "", promptErr
+	}
+	loginReq.MFACode = mfaCode
+	session, err = provider.Login(ctx, loginReq)
+	if err != nil {
+		return bambuauth.Session{}, "", err
+	}
+	return session, username, nil
+}
+
+func promptForBambuCredentials(
+	ctx context.Context,
+	reader *bufio.Reader,
+	defaultUsername string,
+) (username string, password string, err error) {
+	if !isBambuAuthInteractiveConsole() {
+		return "", "", errors.New("bambu login requires interactive console input, but no interactive console is available")
+	}
+	select {
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	default:
+	}
+
+	if reader == nil {
+		reader = bufio.NewReader(bambuAuthInputReader)
+	}
+	trimmedDefaultUsername := strings.TrimSpace(defaultUsername)
+	if trimmedDefaultUsername != "" {
+		_, _ = io.WriteString(bambuAuthOutputWriter, fmt.Sprintf("Bambu username [%s]: ", trimmedDefaultUsername))
+	} else {
+		_, _ = io.WriteString(bambuAuthOutputWriter, "Bambu username: ")
+	}
+	rawUsername, readErr := readLineFromBambuAuthInput(reader)
+	if readErr != nil {
+		return "", "", fmt.Errorf("failed to read Bambu username: %w", readErr)
+	}
+	username = strings.TrimSpace(rawUsername)
+	if username == "" {
+		username = trimmedDefaultUsername
+	}
+	if username == "" {
+		return "", "", errors.New("bambu username cannot be empty")
+	}
+
+	_, _ = io.WriteString(bambuAuthOutputWriter, "Bambu password: ")
+	password, readErr = readBambuPasswordInput(reader)
+	if readErr != nil {
+		return "", "", fmt.Errorf("failed to read Bambu password: %w", readErr)
+	}
+	if password == "" {
+		return "", "", errors.New("bambu password cannot be empty")
+	}
+	return username, password, nil
+}
+
+func promptForBambuMFACode(ctx context.Context, reader *bufio.Reader) (string, error) {
+	if !isBambuAuthInteractiveConsole() {
+		return "", errors.New("bambu cloud requires interactive MFA input, but no interactive console is available")
+	}
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
+	_, _ = io.WriteString(bambuAuthOutputWriter, "Bambu MFA code required. Enter code sent via email: ")
+	if reader == nil {
+		reader = bufio.NewReader(bambuAuthInputReader)
+	}
+	rawCode, readErr := readLineFromBambuAuthInput(reader)
+	if readErr != nil {
+		return "", fmt.Errorf("failed to read MFA code from console: %w", readErr)
+	}
+	code := strings.TrimSpace(trimTrailingLineBreak(rawCode))
+	if code == "" {
+		return "", errors.New("bambu MFA code cannot be empty")
+	}
+	return code, nil
+}
+
+func readLineFromBambuAuthInput(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if errors.Is(err, io.EOF) && line == "" {
+		return "", io.EOF
+	}
+	return line, nil
+}
+
+func readBambuPasswordInput(reader *bufio.Reader) (string, error) {
+	if reader == nil {
+		reader = bufio.NewReader(bambuAuthInputReader)
+	}
+	if shouldUseHiddenBambuPasswordInput() {
+		return readBambuPasswordWithoutEcho()
+	}
+
+	rawPassword, err := readLineFromBambuAuthInput(reader)
+	if err != nil {
+		return "", err
+	}
+	return trimTrailingLineBreak(rawPassword), nil
+}
+
+func shouldUseHiddenBambuPasswordInput() bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	if bambuAuthInputReader != os.Stdin {
+		return false
+	}
+	return isBambuAuthInteractiveConsole()
+}
+
+func readBambuPasswordWithoutEcho() (string, error) {
+	terminalState, err := readTerminalState()
+	if err != nil {
+		return "", err
+	}
+	if err := setTerminalState("-echo"); err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = setTerminalState(terminalState)
+		_, _ = io.WriteString(bambuAuthOutputWriter, "\n")
+	}()
+
+	reader := bufio.NewReader(os.Stdin)
+	rawPassword, err := readLineFromBambuAuthInput(reader)
+	if err != nil {
+		return "", err
+	}
+	return trimTrailingLineBreak(rawPassword), nil
+}
+
+func readTerminalState() (string, error) {
+	cmd := exec.Command("stty", "-g")
+	cmd.Stdin = os.Stdin
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func setTerminalState(state string) error {
+	cmd := exec.Command("stty", state)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run()
+}
+
+func trimTrailingLineBreak(raw string) string {
+	return strings.TrimRight(strings.TrimRight(raw, "\n"), "\r")
+}
+
+func defaultIsBambuAuthInteractiveConsole() bool {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) != 0
+}
+
+func isStoredBambuTokenUsable(credentials bambustore.BambuCredentials, now time.Time) bool {
+	if strings.TrimSpace(credentials.AccessToken) == "" {
+		return false
+	}
+	expiresAt := credentials.ExpiresAt.UTC()
+	if expiresAt.IsZero() {
+		return false
+	}
+	return expiresAt.After(now.Add(60 * time.Second))
+}
+
+func sessionFromStoredBambuCredentials(credentials bambustore.BambuCredentials) bambuauth.Session {
+	return bambuauth.Session{
+		AccessToken:        strings.TrimSpace(credentials.AccessToken),
+		RefreshToken:       strings.TrimSpace(credentials.RefreshToken),
+		ExpiresAt:          credentials.ExpiresAt.UTC(),
+		MaskedEmail:        strings.TrimSpace(credentials.MaskedEmail),
+		MaskedPhone:        strings.TrimSpace(credentials.MaskedPhone),
+		AccountDisplayName: strings.TrimSpace(credentials.AccountDisplayName),
+	}
+}
+
 func loadConfig() appConfig {
+	defaultStateDir := defaultEdgeStateDir()
 	return appConfig{
 		SetupBindAddr:               getEnvOrDefault("SETUP_BIND_ADDR", "0.0.0.0:8090"),
-		BootstrapConfigPath:         getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", "/var/lib/printfarm-edge/bootstrap/config.json"),
-		AuditLogPath:                getEnvOrDefault("AUDIT_LOG_PATH", "/var/log/printfarm-edge/audit.log"),
-		ArtifactStageDir:            getEnvOrDefault("ARTIFACT_STAGE_DIR", "/tmp/printfarm-edge/artifacts"),
+		BootstrapConfigPath:         getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", filepath.Join(defaultStateDir, "bootstrap", "config.json")),
+		AuditLogPath:                getEnvOrDefault("AUDIT_LOG_PATH", filepath.Join(defaultStateDir, "logs", "audit.log")),
+		ArtifactStageDir:            getEnvOrDefault("ARTIFACT_STAGE_DIR", filepath.Join(defaultStateDir, "artifacts")),
 		StartupControlPlaneURL:      getEnvOrDefault("CONTROL_PLANE_URL", ""),
 		StartupSaaSAPIKey:           getEnvOrDefault("SAAS_API_KEY", getEnvOrDefault("EDGE_API_KEY", "")),
 		EnableKlipper:               parseBoolEnv("ENABLE_KLIPPER", false),
-		EnableBambu:                 parseBoolEnv("ENABLE_BAMBU", parseBoolEnv("ENABLE_BAMBU_SPIKE", false)),
+		EnableBambu:                 parseBoolEnv("ENABLE_BAMBU", false),
+		BambuCloudAuthBaseURL:       getEnvOrDefault("BAMBU_CLOUD_AUTH_BASE_URL", "https://api.bambulab.com"),
 		BambuConnectURI:             getEnvOrDefault("BAMBU_CONNECT_URI", ""),
 		BindingsPollInterval:        parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
 		DesiredStatePollInterval:    parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
@@ -589,6 +978,14 @@ func loadConfig() appConfig {
 	}
 }
 
+func defaultEdgeStateDir() string {
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".printfarmhq")
+	}
+	return filepath.Join(os.TempDir(), ".printfarmhq")
+}
+
 func parseRuntimeFlags(args []string) (runtimeFlags, error) {
 	flagSet := flag.NewFlagSet("edge-agent", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
@@ -599,8 +996,7 @@ func parseRuntimeFlags(args []string) (runtimeFlags, error) {
 	flagSet.StringVar(&out.APIKey, "api-key", "", "SaaS API key used for startup auto-claim")
 	flagSet.StringVar(&saasAPIKey, "saas-api-key", "", "Alias for --api-key")
 	flagSet.BoolVar(&out.EnableKlipper, "klipper", false, "Enable Klipper/Moonraker discovery and operations")
-	flagSet.BoolVar(&out.EnableBambu, "bambu", false, "Enable Bambu discovery and polling via Bambu Connect")
-	flagSet.StringVar(&out.BambuConnectURI, "bambu-connect-uri", "", "Bambu Connect base URI (required when --bambu is enabled)")
+	flagSet.BoolVar(&out.EnableBambu, "bambu", false, "Enable Bambu cloud discovery and operations")
 
 	if err := flagSet.Parse(args); err != nil {
 		return runtimeFlags{}, err
@@ -614,12 +1010,8 @@ func parseRuntimeFlags(args []string) (runtimeFlags, error) {
 	if out.APIKey == "" {
 		out.APIKey = strings.TrimSpace(saasAPIKey)
 	}
-	out.BambuConnectURI = strings.TrimSpace(out.BambuConnectURI)
 	if !out.EnableKlipper && !out.EnableBambu {
 		return runtimeFlags{}, errors.New("at least one adapter must be enabled via --klipper and/or --bambu")
-	}
-	if out.EnableBambu && out.BambuConnectURI == "" {
-		return runtimeFlags{}, errors.New("--bambu requires --bambu-connect-uri")
 	}
 	return out, nil
 }
@@ -633,9 +1025,6 @@ func applyRuntimeFlags(cfg appConfig, flags runtimeFlags) appConfig {
 	}
 	cfg.EnableKlipper = flags.EnableKlipper
 	cfg.EnableBambu = flags.EnableBambu
-	if flags.BambuConnectURI != "" {
-		cfg.BambuConnectURI = flags.BambuConnectURI
-	}
 	cfg.DiscoveryAllowedAdapters = enabledDiscoveryAdapters(cfg.EnableKlipper, cfg.EnableBambu)
 	return cfg
 }
@@ -781,6 +1170,30 @@ func (a *agent) snapshotBootstrap() bootstrapConfig {
 	return a.bootstrap
 }
 
+func (a *agent) setBambuAuthState(state bambuAuthState) {
+	a.bambuAuthMu.Lock()
+	defer a.bambuAuthMu.Unlock()
+	a.bambuAuth = state
+}
+
+func (a *agent) snapshotBambuAuthState() bambuAuthState {
+	a.bambuAuthMu.RLock()
+	defer a.bambuAuthMu.RUnlock()
+	return a.bambuAuth
+}
+
+func (a *agent) isBambuAuthReady() bool {
+	if !a.cfg.EnableBambu {
+		return false
+	}
+	state := a.snapshotBambuAuthState()
+	return state.Ready
+}
+
+func (a *agent) isBambuOperational() bool {
+	return a.cfg.EnableBambu && a.isBambuAuthReady()
+}
+
 func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -807,21 +1220,23 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	currentCount := len(a.currentState)
 	a.mu.RUnlock()
 	claimed := a.isClaimed()
+	bambuAuth := a.snapshotBambuAuthState()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":                       "healthy",
-		"version":                      agentVersion,
-		"claimed":                      claimed,
-		"agent_id":                     bootstrap.AgentID,
-		"desired_count":                desiredCount,
-		"current_count":                currentCount,
-		"queue_depth":                  queueDepth,
-		"dead_letters":                 deadLetterCount,
-		"breakers_open":                breakerCount,
-		"klipper_enabled":              a.cfg.EnableKlipper,
-		"bambu_enabled":                a.cfg.EnableBambu,
-		"bambu_connect_uri_configured": strings.TrimSpace(a.cfg.BambuConnectURI) != "",
-		"bambu_spike_enabled":          a.cfg.EnableBambu,
+		"status":                "healthy",
+		"version":               agentVersion,
+		"claimed":               claimed,
+		"agent_id":              bootstrap.AgentID,
+		"desired_count":         desiredCount,
+		"current_count":         currentCount,
+		"queue_depth":           queueDepth,
+		"dead_letters":          deadLetterCount,
+		"breakers_open":         breakerCount,
+		"klipper_enabled":       a.cfg.EnableKlipper,
+		"bambu_enabled":         a.cfg.EnableBambu,
+		"bambu_auth_ready":      bambuAuth.Ready,
+		"bambu_auth_expires_at": bambuAuth.ExpiresAt,
+		"bambu_auth_last_error": bambuAuth.LastError,
 	})
 }
 
@@ -904,26 +1319,11 @@ func (a *agent) handleSetupClaim(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agent) claimWithSaaS(controlPlaneURL, apiKey string) (claimResponse, error) {
-	discoveryProfileMax := parseDiscoveryProfile(a.cfg.DiscoveryProfileMax)
-	discoveryNetworkMode := parseDiscoveryNetworkMode(a.cfg.DiscoveryNetworkMode)
-	discoveryAllowedAdapters := a.cfg.DiscoveryAllowedAdapters
-	if len(discoveryAllowedAdapters) == 0 {
-		discoveryAllowedAdapters = []string{"moonraker"}
-	}
 	payload := claimRequest{
 		Hostname:     hostnameOrUnknown(),
 		Fingerprint:  hostnameOrUnknown(),
 		AgentVersion: agentVersion,
-		Capabilities: map[string]string{
-			"adapter_family":               "klipper",
-			"discovery_profile_max":        discoveryProfileMax,
-			"discovery_network_mode":       discoveryNetworkMode,
-			"discovery_allowed_adapters":   strings.Join(discoveryAllowedAdapters, ","),
-			"enabled_adapters":             strings.Join(discoveryAllowedAdapters, ","),
-			"bambu_enabled":                strconv.FormatBool(a.cfg.EnableBambu),
-			"bambu_connect_uri_configured": strconv.FormatBool(strings.TrimSpace(a.cfg.BambuConnectURI) != ""),
-			"bambu_spike_enabled":          strconv.FormatBool(a.cfg.EnableBambu),
-		},
+		Capabilities: a.buildClaimCapabilities(),
 	}
 
 	var out claimResponse
@@ -957,6 +1357,24 @@ func (a *agent) claimWithSaaS(controlPlaneURL, apiKey string) (claimResponse, er
 		)
 	}
 	return out, nil
+}
+
+func (a *agent) buildClaimCapabilities() map[string]string {
+	discoveryAllowedAdapters := a.cfg.DiscoveryAllowedAdapters
+	if len(discoveryAllowedAdapters) == 0 {
+		discoveryAllowedAdapters = []string{"moonraker"}
+	}
+	enabledAdapters := strings.Join(discoveryAllowedAdapters, ",")
+	bambuAuthReady := a.isBambuAuthReady()
+	return map[string]string{
+		"adapter_family":             "klipper",
+		"discovery_profile_max":      parseDiscoveryProfile(a.cfg.DiscoveryProfileMax),
+		"discovery_network_mode":     parseDiscoveryNetworkMode(a.cfg.DiscoveryNetworkMode),
+		"discovery_allowed_adapters": enabledAdapters,
+		"enabled_adapters":           enabledAdapters,
+		"bambu_enabled":              strconv.FormatBool(a.cfg.EnableBambu),
+		"bambu_auth_ready":           strconv.FormatBool(bambuAuthReady),
+	}
 }
 
 func hostnameOrUnknown() string {
@@ -1577,6 +1995,9 @@ func (a *agent) executeAction(ctx context.Context, queuedAction action, binding 
 	if family == "bambu" && !a.cfg.EnableBambu {
 		return errors.New("validation_error: adapter_family bambu is disabled (set --bambu to enable)")
 	}
+	if family == "bambu" && !a.isBambuAuthReady() {
+		return fmt.Errorf("%w: start edge-agent with --bambu and complete interactive auth", errBambuAuthUnavailable)
+	}
 
 	switch family {
 	case "moonraker":
@@ -1626,7 +2047,7 @@ func (a *agent) executeBambuConnectAction(ctx context.Context, queuedAction acti
 	_ = ctx
 	_ = queuedAction
 	_ = binding
-	return errors.New("validation_error: bambu actions are not enabled via bambu connect bridge")
+	return errBambuConnectActionsUnsupported
 }
 
 func (a *agent) executePrintAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
@@ -2461,7 +2882,7 @@ func (a *agent) runAndSubmitDiscoveryInventoryScan(
 			continue
 		}
 		adapterFamily := normalizeAdapterFamily(candidate.AdapterFamily)
-		if !isSupportedDiscoveryAdapter(adapterFamily, a.cfg.EnableKlipper, a.cfg.EnableBambu) {
+		if !isSupportedDiscoveryAdapter(adapterFamily, a.cfg.EnableKlipper, a.isBambuOperational()) {
 			continue
 		}
 		entry := discoveryInventoryEntryReport{
@@ -2726,12 +3147,13 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 		endpointURL     string
 		discoverySource string
 	}
+	bambuEnabled := a.isBambuOperational()
 	allowedAdapters := map[string]struct{}{}
 	for _, adapter := range a.cfg.DiscoveryAllowedAdapters {
 		allowedAdapters[normalizeAdapterFamily(adapter)] = struct{}{}
 	}
 	if len(allowedAdapters) == 0 {
-		for _, adapter := range enabledDiscoveryAdapters(a.cfg.EnableKlipper, a.cfg.EnableBambu) {
+		for _, adapter := range enabledDiscoveryAdapters(a.cfg.EnableKlipper, bambuEnabled) {
 			allowedAdapters[normalizeAdapterFamily(adapter)] = struct{}{}
 		}
 	}
@@ -2750,7 +3172,7 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 		jobAdapters = append(jobAdapters, normalized)
 	}
 	if len(jobAdapters) == 0 {
-		jobAdapters = append(jobAdapters, enabledDiscoveryAdapters(a.cfg.EnableKlipper, a.cfg.EnableBambu)...)
+		jobAdapters = append(jobAdapters, enabledDiscoveryAdapters(a.cfg.EnableKlipper, bambuEnabled)...)
 	}
 
 	if strings.EqualFold(strings.TrimSpace(job.Profile), "aggressive") &&
@@ -2833,11 +3255,11 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 				})
 			}
 		case "bambu":
-			if !a.cfg.EnableBambu {
+			if !bambuEnabled {
 				candidates = append(candidates, discoveryCandidateResult{
 					AdapterFamily:   adapter,
 					Status:          "policy_rejected",
-					RejectionReason: "adapter_disabled",
+					RejectionReason: "adapter_unavailable",
 				})
 				continue
 			}
@@ -2848,8 +3270,8 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 					Status:          "policy_rejected",
 					RejectionReason: "no_targets",
 					Evidence: map[string]any{
-						"source":           "bambu_connect",
-						"discovery_source": "bambu_connect",
+						"source":           discoverySourceBambuConnect,
+						"discovery_source": discoverySourceBambuConnect,
 					},
 				})
 				continue
@@ -2967,8 +3389,8 @@ func (a *agent) executeBambuConnectDiscovery(ctx context.Context, probeTimeout t
 				Status:          "policy_rejected",
 				RejectionReason: "missing_bambu_connect_uri",
 				Evidence: map[string]any{
-					"source":           "bambu_connect",
-					"discovery_source": "bambu_connect",
+					"source":           discoverySourceBambuConnect,
+					"discovery_source": discoverySourceBambuConnect,
 				},
 			},
 		}
@@ -2997,8 +3419,8 @@ func (a *agent) executeBambuConnectDiscovery(ctx context.Context, probeTimeout t
 				Status:            "unreachable",
 				ConnectivityError: err.Error(),
 				Evidence: map[string]any{
-					"source":             "bambu_connect",
-					"discovery_source":   "bambu_connect",
+					"source":             discoverySourceBambuConnect,
+					"discovery_source":   discoverySourceBambuConnect,
 					"bambu_connect_host": redactBambuConnectURI(uri),
 				},
 			},
@@ -3028,8 +3450,8 @@ func (a *agent) executeBambuConnectDiscovery(ctx context.Context, probeTimeout t
 			DetectedPrinterName: detectedName,
 			DetectedModelHint:   strings.TrimSpace(firstNonEmpty(printer.Model, printer.MachineType)),
 			Evidence: map[string]any{
-				"source":             "bambu_connect",
-				"discovery_source":   "bambu_connect",
+				"source":             discoverySourceBambuConnect,
+				"discovery_source":   discoverySourceBambuConnect,
 				"bambu_connect_host": redactBambuConnectURI(uri),
 			},
 		})
@@ -3303,12 +3725,12 @@ func (a *agent) probeDiscoveryEndpoint(
 	discoverySource string,
 ) discoveryCandidateResult {
 	adapter := normalizeAdapterFamily(adapterFamily)
-	if adapter == "bambu" && !a.cfg.EnableBambu {
+	if adapter == "bambu" && !a.isBambuOperational() {
 		return discoveryCandidateResult{
 			AdapterFamily:   adapter,
 			EndpointURL:     endpointURL,
 			Status:          "policy_rejected",
-			RejectionReason: "adapter_disabled",
+			RejectionReason: "adapter_unavailable",
 		}
 	}
 
@@ -3354,7 +3776,7 @@ func (a *agent) probeDiscoveryEndpoint(
 				Status:            "unreachable",
 				ConnectivityError: err.Error(),
 				Evidence: map[string]any{
-					"source":           "bambu_connect",
+					"source":           discoverySourceBambuConnect,
 					"discovery_source": strings.TrimSpace(discoverySource),
 				},
 			}
@@ -3368,7 +3790,7 @@ func (a *agent) probeDiscoveryEndpoint(
 			DetectedPrinterName: snapshot.DetectedName,
 			DetectedModelHint:   snapshot.DetectedModelHint,
 			Evidence: map[string]any{
-				"source":           "bambu_connect",
+				"source":           discoverySourceBambuConnect,
 				"discovery_source": strings.TrimSpace(discoverySource),
 			},
 		}
@@ -3830,6 +4252,9 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if !a.cfg.EnableBambu {
 			return bindingSnapshot{}, errors.New("validation_error: adapter_family bambu is disabled (set --bambu to enable)")
 		}
+		if !a.isBambuAuthReady() {
+			return bindingSnapshot{}, errBambuAuthUnavailable
+		}
 		snapshot, err := a.fetchBambuConnectSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if err != nil {
 			a.audit("bambu_connect_snapshot_error", map[string]any{
@@ -3883,7 +4308,7 @@ func (a *agent) fetchBambuConnectSnapshotByPrinterID(ctx context.Context, printe
 	return bindingSnapshot{
 		PrinterState:      printerState,
 		JobState:          jobState,
-		TelemetrySource:   "bambu_connect",
+		TelemetrySource:   telemetrySourceBambuConnect,
 		DetectedName:      detectedName,
 		DetectedModelHint: strings.TrimSpace(firstNonEmpty(record.Model, record.MachineType)),
 	}, nil
@@ -3995,7 +4420,7 @@ func (a *agent) fetchBambuConnectPrinterRecordPath(ctx context.Context, path str
 func (a *agent) fetchBambuConnectBody(ctx context.Context, path string) ([]byte, error) {
 	baseURI := strings.TrimSpace(a.cfg.BambuConnectURI)
 	if baseURI == "" {
-		return nil, errors.New("validation_error: --bambu-connect-uri is required when --bambu is enabled")
+		return nil, errors.New("validation_error: BAMBU_CONNECT_URI is required for bambu connect bridge")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolveURL(baseURI, path), nil)
 	if err != nil {
