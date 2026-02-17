@@ -56,8 +56,16 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
 - Password input is treated as secret in terminal sessions and is not echoed back.
 - When MFA is required, startup blocks and asks for the code on the interactive console.
 - Empty/invalid MFA code (or non-interactive console) makes startup fail with a non-zero exit.
+- Bambu cloud devices are discovered through the same discovery inventory pipeline as Klipper and submitted to SaaS on the periodic inventory cadence (default 30s).
 - Bambu print lifecycle actions are not enabled yet in this code path.
 - Cloud auth/MFA + cloud print lifecycle rollout is tracked in `backlog/todo/p0.md`.
+
+## Docs
+
+- `docs/architecture-overview.md`
+- `docs/edge-agent-state-normalization.md`
+- `docs/discovery-vs-runtime-state.md`
+- `docs/bambu-adoption-behavior.md`
 
 Direct run is also supported:
 

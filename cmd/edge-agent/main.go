@@ -48,6 +48,8 @@ const (
 	discoverySourceCIDRAllowlist = "cidr_allowlist"
 	discoverySourceLocalSubnets  = "local_private_subnets"
 	discoverySourceBambuConnect  = "bambu_connect"
+	discoverySourceBambuCloud    = "bambu_cloud"
+	telemetrySourceBambuCloud    = "bambu_cloud"
 	telemetrySourceBambuConnect  = "bambu_connect"
 )
 
@@ -340,6 +342,7 @@ type bindingSnapshot struct {
 
 type bambuAuthState struct {
 	Ready         bool
+	AccessToken   string
 	ExpiresAt     time.Time
 	MaskedEmail   string
 	MaskedPhone   string
@@ -646,6 +649,7 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 
 	state = bambuAuthState{
 		Ready:         true,
+		AccessToken:   strings.TrimSpace(session.AccessToken),
 		ExpiresAt:     session.ExpiresAt.UTC(),
 		MaskedEmail:   session.MaskedEmail,
 		MaskedPhone:   session.MaskedPhone,
@@ -661,6 +665,10 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		"refresh_present": session.RefreshToken != "",
 	})
 	return nil
+}
+
+type bambuCloudDeviceLister interface {
+	ListBoundDevices(ctx context.Context, accessToken string) ([]bambucloud.CloudDevice, error)
 }
 
 func (a *agent) establishBambuSession(
@@ -964,7 +972,7 @@ func loadConfig() appConfig {
 		CircuitBreakerCooldown:      parseDurationMS("CIRCUIT_BREAKER_COOLDOWN_MS", 15000),
 		ProbePollInterval:           parseDurationMS("PROBE_POLL_INTERVAL_MS", 2000),
 		DiscoveryPollInterval:       parseDurationMS("DISCOVERY_POLL_INTERVAL_MS", 4000),
-		DiscoveryInventoryInterval:  parseDurationMS("DISCOVERY_INVENTORY_INTERVAL_MS", 60000),
+		DiscoveryInventoryInterval:  parseDurationMS("DISCOVERY_INVENTORY_INTERVAL_MS", 30000),
 		DiscoveryManualPollInterval: parseDurationMS("DISCOVERY_MANUAL_POLL_INTERVAL_MS", 5000),
 		DiscoveryProfileMax:         parseDiscoveryProfile(getEnvOrDefault("DISCOVERY_PROFILE_MAX", "hybrid")),
 		// Binary runtime should scan host LAN by default. Bridge mode remains opt-in.
@@ -2660,7 +2668,7 @@ func (a *agent) discoveryInventoryLoop(ctx context.Context, wg *sync.WaitGroup) 
 	defer wg.Done()
 	interval := a.cfg.DiscoveryInventoryInterval
 	if interval <= 0 {
-		interval = 60 * time.Second
+		interval = 30 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -2876,9 +2884,10 @@ func (a *agent) runAndSubmitDiscoveryInventoryScan(
 	}
 	entries := make([]discoveryInventoryEntryReport, 0, len(result.Candidates))
 	for _, candidate := range result.Candidates {
-		// Inventory should represent currently reachable devices only.
-		// Unreachable/policy candidates are operational diagnostics, not adoptable inventory.
-		if candidate.Status != "reachable" {
+		candidateStatus := strings.ToLower(strings.TrimSpace(candidate.Status))
+		switch candidateStatus {
+		case "reachable", "unreachable", "lost":
+		default:
 			continue
 		}
 		adapterFamily := normalizeAdapterFamily(candidate.AdapterFamily)
@@ -2888,7 +2897,7 @@ func (a *agent) runAndSubmitDiscoveryInventoryScan(
 		entry := discoveryInventoryEntryReport{
 			AdapterFamily:       adapterFamily,
 			EndpointURL:         strings.TrimSpace(candidate.EndpointURL),
-			Status:              candidate.Status,
+			Status:              candidateStatus,
 			ConnectivityError:   strings.TrimSpace(candidate.ConnectivityError),
 			DetectedPrinterName: strings.TrimSpace(candidate.DetectedPrinterName),
 			DetectedModelHint:   strings.TrimSpace(candidate.DetectedModelHint),
@@ -3263,15 +3272,15 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 				})
 				continue
 			}
-			bambuCandidates := a.executeBambuConnectDiscovery(ctx, probeTimeout)
+			bambuCandidates := a.executeBambuCloudDiscovery(ctx, probeTimeout)
 			if len(bambuCandidates) == 0 {
 				candidates = append(candidates, discoveryCandidateResult{
 					AdapterFamily:   adapter,
 					Status:          "policy_rejected",
 					RejectionReason: "no_targets",
 					Evidence: map[string]any{
-						"source":           discoverySourceBambuConnect,
-						"discovery_source": discoverySourceBambuConnect,
+						"source":           discoverySourceBambuCloud,
+						"discovery_source": discoverySourceBambuCloud,
 					},
 				})
 				continue
@@ -3377,6 +3386,157 @@ func (a *agent) executeDiscoveryJob(ctx context.Context, job discoveryJobItem) d
 			ErrorsCount:     errorsCount,
 		},
 		Candidates: candidates,
+	}
+}
+
+func (a *agent) executeBambuCloudDiscovery(ctx context.Context, probeTimeout time.Duration) []discoveryCandidateResult {
+	authState := a.snapshotBambuAuthState()
+	accessToken := strings.TrimSpace(authState.AccessToken)
+	if accessToken == "" {
+		return []discoveryCandidateResult{
+			{
+				AdapterFamily:   "bambu",
+				Status:          "policy_rejected",
+				RejectionReason: "auth_token_missing",
+				Evidence: map[string]any{
+					"source":           discoverySourceBambuCloud,
+					"discovery_source": discoverySourceBambuCloud,
+				},
+			},
+		}
+	}
+
+	provider := a.bambuAuthProvider
+	if provider == nil {
+		return []discoveryCandidateResult{
+			{
+				AdapterFamily:   "bambu",
+				Status:          "policy_rejected",
+				RejectionReason: "auth_provider_missing",
+				Evidence: map[string]any{
+					"source":           discoverySourceBambuCloud,
+					"discovery_source": discoverySourceBambuCloud,
+				},
+			},
+		}
+	}
+	deviceProvider, ok := provider.(bambuCloudDeviceLister)
+	if !ok {
+		return []discoveryCandidateResult{
+			{
+				AdapterFamily:   "bambu",
+				Status:          "policy_rejected",
+				RejectionReason: "cloud_listing_unsupported",
+				Evidence: map[string]any{
+					"source":           discoverySourceBambuCloud,
+					"discovery_source": discoverySourceBambuCloud,
+				},
+			},
+		}
+	}
+
+	requestTimeout := probeTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = a.cfg.MoonrakerRequestTimeout
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = 2 * time.Second
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	devices, err := deviceProvider.ListBoundDevices(requestCtx, accessToken)
+	if err != nil {
+		a.audit("bambu_cloud_discovery_error", map[string]any{"error": err.Error()})
+		return []discoveryCandidateResult{
+			{
+				AdapterFamily:     "bambu",
+				EndpointURL:       formatBambuPrinterEndpoint("cloud"),
+				Status:            "unreachable",
+				ConnectivityError: err.Error(),
+				Evidence: map[string]any{
+					"source":           discoverySourceBambuCloud,
+					"discovery_source": discoverySourceBambuCloud,
+				},
+			},
+		}
+	}
+	if len(devices) == 0 {
+		return nil
+	}
+
+	out := make([]discoveryCandidateResult, 0, len(devices))
+	for _, device := range devices {
+		printerID := strings.TrimSpace(device.DeviceID)
+		if printerID == "" {
+			continue
+		}
+		printerState, jobState := mapBambuCloudStates(device.Online, device.PrintStatus)
+		candidateStatus := "reachable"
+		if !device.Online {
+			candidateStatus = "unreachable"
+			printerState = ""
+			jobState = ""
+		}
+		detectedName := strings.TrimSpace(device.Name)
+		if detectedName == "" {
+			detectedName = printerID
+		}
+		modelHint := strings.TrimSpace(device.Model)
+
+		evidence := map[string]any{
+			"source":           discoverySourceBambuCloud,
+			"discovery_source": discoverySourceBambuCloud,
+			"cloud_online":     device.Online,
+		}
+		if status := strings.TrimSpace(device.PrintStatus); status != "" {
+			evidence["cloud_print_status"] = status
+		}
+		if name := strings.TrimSpace(device.Name); name != "" {
+			evidence["cloud_name"] = name
+		}
+		if modelHint != "" {
+			evidence["cloud_model"] = modelHint
+		}
+
+		out = append(out, discoveryCandidateResult{
+			AdapterFamily:       "bambu",
+			EndpointURL:         formatBambuPrinterEndpoint(printerID),
+			Status:              candidateStatus,
+			CurrentPrinterState: printerState,
+			CurrentJobState:     jobState,
+			DetectedPrinterName: detectedName,
+			DetectedModelHint:   modelHint,
+			Evidence:            evidence,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := strings.TrimSpace(out[i].EndpointURL)
+		right := strings.TrimSpace(out[j].EndpointURL)
+		return left < right
+	})
+	return out
+}
+
+func mapBambuCloudStates(online bool, rawPrintStatus string) (printerState string, jobState string) {
+	if !online {
+		return "error", "failed"
+	}
+	switch strings.ToLower(strings.TrimSpace(rawPrintStatus)) {
+	case "printing", "running", "in_progress":
+		return "printing", "printing"
+	case "queued", "pending", "preparing", "starting", "heating", "slicing":
+		return "queued", "pending"
+	case "paused", "pausing":
+		return "paused", "printing"
+	case "error", "failed", "fault":
+		return "error", "failed"
+	case "canceled", "cancelled":
+		return "idle", "canceled"
+	case "idle", "ready", "standby", "finished", "completed", "active", "":
+		return "idle", "completed"
+	default:
+		return "idle", "completed"
 	}
 }
 
@@ -4255,18 +4415,106 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if !a.isBambuAuthReady() {
 			return bindingSnapshot{}, errBambuAuthUnavailable
 		}
-		snapshot, err := a.fetchBambuConnectSnapshotFromEndpoint(ctx, binding.EndpointURL)
+		snapshot, err := a.fetchBambuCloudSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if err != nil {
-			a.audit("bambu_connect_snapshot_error", map[string]any{
-				"endpoint_url": binding.EndpointURL,
-				"error":        err.Error(),
-			})
+			var offlineErr *bambuCloudDeviceOfflineError
+			if !errors.As(err, &offlineErr) {
+				a.audit("bambu_cloud_snapshot_error", map[string]any{
+					"endpoint_url": binding.EndpointURL,
+					"error":        err.Error(),
+				})
+			}
 			return bindingSnapshot{}, err
 		}
 		return snapshot, nil
 	default:
 		return bindingSnapshot{}, fmt.Errorf("validation_error: unsupported adapter_family: %s", family)
 	}
+}
+
+func (a *agent) fetchBambuCloudSnapshotFromEndpoint(ctx context.Context, endpointURL string) (bindingSnapshot, error) {
+	printerID, err := parseBambuPrinterEndpointID(endpointURL)
+	if err != nil {
+		return bindingSnapshot{}, err
+	}
+	return a.fetchBambuCloudSnapshotByPrinterID(ctx, printerID)
+}
+
+func (a *agent) fetchBambuCloudSnapshotByPrinterID(ctx context.Context, printerID string) (bindingSnapshot, error) {
+	normalizedPrinterID := strings.TrimSpace(printerID)
+	if normalizedPrinterID == "" {
+		return bindingSnapshot{}, errors.New("validation_error: missing bambu printer identifier")
+	}
+
+	authState := a.snapshotBambuAuthState()
+	accessToken := strings.TrimSpace(authState.AccessToken)
+	if accessToken == "" {
+		return bindingSnapshot{}, errBambuAuthUnavailable
+	}
+
+	deviceProvider, err := a.bambuCloudDeviceProvider()
+	if err != nil {
+		return bindingSnapshot{}, err
+	}
+
+	requestTimeout := a.cfg.MoonrakerRequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 8 * time.Second
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	devices, err := deviceProvider.ListBoundDevices(requestCtx, accessToken)
+	if err != nil {
+		return bindingSnapshot{}, err
+	}
+
+	var matched *bambucloud.CloudDevice
+	for i := range devices {
+		if strings.EqualFold(strings.TrimSpace(devices[i].DeviceID), normalizedPrinterID) {
+			matched = &devices[i]
+			break
+		}
+	}
+	if matched == nil {
+		return bindingSnapshot{}, fmt.Errorf("bambu cloud device %q is not bound to this account", normalizedPrinterID)
+	}
+	if !matched.Online {
+		return bindingSnapshot{}, &bambuCloudDeviceOfflineError{PrinterID: normalizedPrinterID}
+	}
+
+	printerState, jobState := mapBambuCloudStates(matched.Online, matched.PrintStatus)
+	detectedName := strings.TrimSpace(matched.Name)
+	if detectedName == "" {
+		detectedName = normalizedPrinterID
+	}
+	return bindingSnapshot{
+		PrinterState:      printerState,
+		JobState:          jobState,
+		TelemetrySource:   telemetrySourceBambuCloud,
+		DetectedName:      detectedName,
+		DetectedModelHint: strings.TrimSpace(matched.Model),
+	}, nil
+}
+
+type bambuCloudDeviceOfflineError struct {
+	PrinterID string
+}
+
+func (e *bambuCloudDeviceOfflineError) Error() string {
+	return fmt.Sprintf("bambu cloud device %q is offline", strings.TrimSpace(e.PrinterID))
+}
+
+func (a *agent) bambuCloudDeviceProvider() (bambuCloudDeviceLister, error) {
+	provider := a.bambuAuthProvider
+	if provider == nil {
+		return nil, errors.New("validation_error: bambu cloud provider is not configured")
+	}
+	deviceProvider, ok := provider.(bambuCloudDeviceLister)
+	if !ok {
+		return nil, errors.New("validation_error: bambu cloud provider does not support device listing")
+	}
+	return deviceProvider, nil
 }
 
 type bambuConnectPrinterRecord struct {

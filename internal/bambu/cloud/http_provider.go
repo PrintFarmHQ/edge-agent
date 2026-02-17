@@ -16,19 +16,22 @@ import (
 
 const defaultLoginPath = "/v1/user-service/user/login"
 const defaultRefreshPath = "/v1/user-service/user/refreshtoken"
+const defaultUserBindPath = "/v1/iot-service/api/user/bind"
 
 type HTTPProviderConfig struct {
-	AuthBaseURL string
-	Client      *http.Client
-	LoginPath   string
-	RefreshPath string
+	AuthBaseURL  string
+	Client       *http.Client
+	LoginPath    string
+	RefreshPath  string
+	UserBindPath string
 }
 
 type HTTPProvider struct {
-	authBaseURL string
-	client      *http.Client
-	loginPath   string
-	refreshPath string
+	authBaseURL  string
+	client       *http.Client
+	loginPath    string
+	refreshPath  string
+	userBindPath string
 }
 
 func NewHTTPProvider(cfg HTTPProviderConfig) *HTTPProvider {
@@ -40,16 +43,42 @@ func NewHTTPProvider(cfg HTTPProviderConfig) *HTTPProvider {
 	if refreshPath == "" {
 		refreshPath = defaultRefreshPath
 	}
+	userBindPath := strings.TrimSpace(cfg.UserBindPath)
+	if userBindPath == "" {
+		userBindPath = defaultUserBindPath
+	}
 	client := cfg.Client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &HTTPProvider{
-		authBaseURL: strings.TrimSpace(cfg.AuthBaseURL),
-		client:      client,
-		loginPath:   loginPath,
-		refreshPath: refreshPath,
+		authBaseURL:  strings.TrimSpace(cfg.AuthBaseURL),
+		client:       client,
+		loginPath:    loginPath,
+		refreshPath:  refreshPath,
+		userBindPath: userBindPath,
 	}
+}
+
+type CloudDevice struct {
+	DeviceID    string
+	Name        string
+	Model       string
+	PrintStatus string
+	Online      bool
+}
+
+type cloudDevicePayload struct {
+	DevID          string `json:"dev_id"`
+	DeviceID       string `json:"device_id"`
+	Name           string `json:"name"`
+	DeviceName     string `json:"device_name"`
+	DevModelName   string `json:"dev_model_name"`
+	DevProductName string `json:"dev_product_name"`
+	Model          string `json:"model"`
+	PrintStatus    string `json:"print_status"`
+	Status         string `json:"status"`
+	Online         *bool  `json:"online"`
 }
 
 func (p *HTTPProvider) Login(ctx context.Context, req bambuauth.LoginRequest) (bambuauth.Session, error) {
@@ -158,6 +187,50 @@ func (p *HTTPProvider) Refresh(ctx context.Context, req bambuauth.RefreshRequest
 	return parsed, nil
 }
 
+func (p *HTTPProvider) ListBoundDevices(ctx context.Context, accessToken string) ([]CloudDevice, error) {
+	baseURL := strings.TrimSpace(p.authBaseURL)
+	if baseURL == "" {
+		return nil, &bambuauth.Error{Kind: bambuauth.ErrTemporary, Message: "bambu auth endpoint is not configured"}
+	}
+	token := strings.TrimSpace(accessToken)
+	if token == "" {
+		return nil, &bambuauth.Error{Kind: bambuauth.ErrInvalidCredentials, Message: "missing access token"}
+	}
+
+	endpoint := strings.TrimSuffix(baseURL, "/") + p.userBindPath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build bambu device list request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, &bambuauth.Error{Kind: bambuauth.ErrTemporary, Message: fmt.Sprintf("bambu device list request failed: %v", err)}
+	}
+	defer resp.Body.Close()
+
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+	if resp.StatusCode != http.StatusOK {
+		message := strings.TrimSpace(string(payload))
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			return nil, &bambuauth.Error{Kind: bambuauth.ErrInvalidCredentials, Message: "bambu device list rejected access token"}
+		case resp.StatusCode >= 500:
+			return nil, &bambuauth.Error{Kind: bambuauth.ErrTemporary, Message: fmt.Sprintf("bambu device list temporary failure (%d)", resp.StatusCode)}
+		default:
+			return nil, fmt.Errorf("bambu device list returned %d from %s: %s", resp.StatusCode, endpoint, message)
+		}
+	}
+
+	devices, err := parseBoundDevicesPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	return devices, nil
+}
+
 func parseSessionPayload(payload []byte) (bambuauth.Session, error) {
 	type accountPayload struct {
 		EmailMasked string `json:"email_masked"`
@@ -255,4 +328,77 @@ func parseSessionPayload(payload []byte) (bambuauth.Session, error) {
 		MaskedPhone:        strings.TrimSpace(resp.Account.PhoneMasked),
 		AccountDisplayName: strings.TrimSpace(resp.Account.DisplayName),
 	}, nil
+}
+
+func parseBoundDevicesPayload(payload []byte) ([]CloudDevice, error) {
+	type responseEnvelope struct {
+		Devices []cloudDevicePayload `json:"devices"`
+		Data    struct {
+			Devices []cloudDevicePayload `json:"devices"`
+			Items   []cloudDevicePayload `json:"items"`
+		} `json:"data"`
+		Items []cloudDevicePayload `json:"items"`
+	}
+
+	var direct []cloudDevicePayload
+	if err := json.Unmarshal(payload, &direct); err == nil {
+		return normalizeCloudDevices(direct), nil
+	}
+
+	var envelope responseEnvelope
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return nil, fmt.Errorf("decode bambu device list response: %w", err)
+	}
+
+	switch {
+	case len(envelope.Devices) > 0:
+		return normalizeCloudDevices(envelope.Devices), nil
+	case len(envelope.Data.Devices) > 0:
+		return normalizeCloudDevices(envelope.Data.Devices), nil
+	case len(envelope.Data.Items) > 0:
+		return normalizeCloudDevices(envelope.Data.Items), nil
+	case len(envelope.Items) > 0:
+		return normalizeCloudDevices(envelope.Items), nil
+	default:
+		return []CloudDevice{}, nil
+	}
+}
+
+func normalizeCloudDevices(values []cloudDevicePayload) []CloudDevice {
+	out := make([]CloudDevice, 0, len(values))
+	for _, item := range values {
+		deviceID := strings.TrimSpace(item.DevID)
+		if deviceID == "" {
+			deviceID = strings.TrimSpace(item.DeviceID)
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.DeviceName)
+		}
+		model := strings.TrimSpace(item.DevProductName)
+		if model == "" {
+			model = strings.TrimSpace(item.DevModelName)
+		}
+		if model == "" {
+			model = strings.TrimSpace(item.Model)
+		}
+		printStatus := strings.TrimSpace(item.PrintStatus)
+		if printStatus == "" {
+			printStatus = strings.TrimSpace(item.Status)
+		}
+
+		online := false
+		if item.Online != nil {
+			online = *item.Online
+		}
+
+		out = append(out, CloudDevice{
+			DeviceID:    deviceID,
+			Name:        name,
+			Model:       model,
+			PrintStatus: printStatus,
+			Online:      online,
+		})
+	}
+	return out
 }

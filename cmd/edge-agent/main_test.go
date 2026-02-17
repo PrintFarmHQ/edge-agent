@@ -21,6 +21,7 @@ import (
 	"time"
 
 	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
+	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -224,6 +225,14 @@ func TestLoadConfigDefaultPathsUsePrintfarmhq(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDefaultsDiscoveryInventoryIntervalToThirtySeconds(t *testing.T) {
+	t.Setenv("DISCOVERY_INVENTORY_INTERVAL_MS", "")
+	cfg := loadConfig()
+	if cfg.DiscoveryInventoryInterval != 30*time.Second {
+		t.Fatalf("DiscoveryInventoryInterval = %s, want 30s", cfg.DiscoveryInventoryInterval)
+	}
+}
+
 func TestApplyRuntimeFlagsOverridesConfig(t *testing.T) {
 	cfg := appConfig{
 		StartupControlPlaneURL: "http://before",
@@ -376,6 +385,68 @@ func TestBambuAuthStartupRefreshesExpiredToken(t *testing.T) {
 	}
 	if store.last.Username != "saved@example.com" {
 		t.Fatalf("stored username = %q, want saved@example.com", store.last.Username)
+	}
+}
+
+func TestInitializeBambuAuthDoesNotPrintCloudDevicesToStdout(t *testing.T) {
+	a := newTestAgent(t)
+	store := &memoryBambuCredentialsStore{
+		loaded: bambustore.BambuCredentials{
+			Username:    "saved@example.com",
+			AccessToken: "stored-access-token",
+			ExpiresAt:   time.Now().UTC().Add(30 * time.Minute),
+		},
+	}
+	a.bambuAuthStore = store
+	output := &bytes.Buffer{}
+	originalWriter := bambuAuthOutputWriter
+	bambuAuthOutputWriter = output
+	t.Cleanup(func() {
+		bambuAuthOutputWriter = originalWriter
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer stored-access-token" {
+			t.Fatalf("authorization header = %q, want Bearer stored-access-token", got)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"devices": []map[string]any{
+				{
+					"dev_id":           "dev-active",
+					"name":             "P1S Office",
+					"dev_product_name": "P1S",
+					"print_status":     "ACTIVE",
+					"online":           true,
+				},
+				{
+					"dev_id":           "dev-offline",
+					"name":             "X1C Garage",
+					"dev_product_name": "X1C",
+					"print_status":     "OFFLINE",
+					"online":           false,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	a.cfg.BambuCloudAuthBaseURL = srv.URL
+	a.client = &http.Client{Timeout: 2 * time.Second}
+
+	if err := a.initializeBambuAuth(context.Background()); err != nil {
+		t.Fatalf("initializeBambuAuth failed: %v", err)
+	}
+	if !a.snapshotBambuAuthState().Ready {
+		t.Fatalf("bambu auth should be ready")
+	}
+
+	stdout := output.String()
+	if strings.TrimSpace(stdout) != "" {
+		t.Fatalf("expected no cloud device stdout output, got %q", stdout)
 	}
 }
 
@@ -1345,40 +1416,46 @@ func TestExecuteDiscoveryJobUsesHistorySeedTargets(t *testing.T) {
 	}
 }
 
-func TestExecuteDiscoveryJobBambuConnectCandidates(t *testing.T) {
+func TestExecuteDiscoveryJobBambuCloudCandidates(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableKlipper = false
 	a.cfg.EnableBambu = true
-	a.setBambuAuthState(bambuAuthState{Ready: true})
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
 	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
 	a.cfg.DiscoveryProbeTimeout = 2 * time.Second
 
-	connectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/printers" {
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
 			http.NotFound(w, r)
 			return
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-1" {
+			t.Fatalf("authorization header = %q, want Bearer access-1", got)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"printers": []map[string]any{
+			"devices": []map[string]any{
 				{
-					"printer_id":    "printer-1",
-					"printer_name":  "Bambu One",
-					"machine_type":  "X1C",
-					"printer_state": "printing",
-					"job_state":     "printing",
+					"dev_id":           "printer-1",
+					"name":             "Bambu One",
+					"dev_product_name": "X1C",
+					"print_status":     "ACTIVE",
+					"online":           true,
 				},
 				{
-					"printer_id":    "printer-2",
-					"printer_name":  "Bambu Two",
-					"machine_type":  "P1S",
-					"printer_state": "idle",
-					"job_state":     "pending",
+					"dev_id":           "printer-2",
+					"name":             "Bambu Two",
+					"dev_product_name": "P1S",
+					"print_status":     "OFFLINE",
+					"online":           false,
 				},
 			},
 		})
 	}))
-	defer connectSrv.Close()
-	a.cfg.BambuConnectURI = connectSrv.URL
+	defer cloudSrv.Close()
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: cloudSrv.URL,
+		Client:      a.client,
+	})
 
 	result := a.executeDiscoveryJob(context.Background(), discoveryJobItem{
 		JobID:    "scan_bambu_1",
@@ -1386,30 +1463,61 @@ func TestExecuteDiscoveryJobBambuConnectCandidates(t *testing.T) {
 		Adapters: []string{"bambu"},
 	})
 
-	if result.JobStatus != "completed" {
-		t.Fatalf("job_status = %q, want completed", result.JobStatus)
+	if result.JobStatus != "partial" {
+		t.Fatalf("job_status = %q, want partial", result.JobStatus)
 	}
 	if len(result.Candidates) != 2 {
 		t.Fatalf("candidate count = %d, want 2", len(result.Candidates))
 	}
+
+	byEndpoint := map[string]discoveryCandidateResult{}
 	for _, candidate := range result.Candidates {
-		if candidate.Status != "reachable" {
-			t.Fatalf("candidate status = %q, want reachable", candidate.Status)
-		}
-		if !strings.HasPrefix(candidate.EndpointURL, "bambu://") {
-			t.Fatalf("endpoint_url = %q, expected bambu:// scheme", candidate.EndpointURL)
-		}
+		byEndpoint[candidate.EndpointURL] = candidate
+	}
+
+	online := byEndpoint["bambu://printer-1"]
+	if online.Status != "reachable" {
+		t.Fatalf("online candidate status = %q, want reachable", online.Status)
+	}
+	if online.CurrentPrinterState != "idle" {
+		t.Fatalf("online current_printer_state = %q, want idle", online.CurrentPrinterState)
+	}
+	if online.CurrentJobState != "completed" {
+		t.Fatalf("online current_job_state = %q, want completed", online.CurrentJobState)
+	}
+	if source, _ := online.Evidence["discovery_source"].(string); source != discoverySourceBambuCloud {
+		t.Fatalf("online discovery_source = %q, want %q", source, discoverySourceBambuCloud)
+	}
+	if cloudOnline, ok := online.Evidence["cloud_online"].(bool); !ok || !cloudOnline {
+		t.Fatalf("online cloud_online evidence = %v, want true", online.Evidence["cloud_online"])
+	}
+
+	offline := byEndpoint["bambu://printer-2"]
+	if offline.Status != "unreachable" {
+		t.Fatalf("offline candidate status = %q, want unreachable", offline.Status)
+	}
+	if offline.CurrentPrinterState != "" {
+		t.Fatalf("offline current_printer_state = %q, want empty", offline.CurrentPrinterState)
+	}
+	if offline.CurrentJobState != "" {
+		t.Fatalf("offline current_job_state = %q, want empty", offline.CurrentJobState)
+	}
+	if cloudOnline, ok := offline.Evidence["cloud_online"].(bool); !ok || cloudOnline {
+		t.Fatalf("offline cloud_online evidence = %v, want false", offline.Evidence["cloud_online"])
 	}
 }
 
-func TestExecuteDiscoveryJobBambuConnectUnreachable(t *testing.T) {
+func TestExecuteDiscoveryJobBambuCloudUnreachable(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableKlipper = false
 	a.cfg.EnableBambu = true
-	a.setBambuAuthState(bambuAuthState{Ready: true})
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
 	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
 	a.cfg.DiscoveryProbeTimeout = 150 * time.Millisecond
-	a.cfg.BambuConnectURI = "http://127.0.0.1:9"
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: "http://127.0.0.1:9",
+		Client:      a.client,
+	})
 
 	result := a.executeDiscoveryJob(context.Background(), discoveryJobItem{
 		JobID:    "scan_bambu_2",
@@ -1426,6 +1534,98 @@ func TestExecuteDiscoveryJobBambuConnectUnreachable(t *testing.T) {
 	}
 	if candidate.AdapterFamily != "bambu" {
 		t.Fatalf("adapter_family = %q, want bambu", candidate.AdapterFamily)
+	}
+	if candidate.EndpointURL != "bambu://cloud" {
+		t.Fatalf("endpoint_url = %q, want bambu://cloud", candidate.EndpointURL)
+	}
+}
+
+func TestExecuteDiscoveryJobBambuCloudMissingTokenRejected(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableKlipper = false
+	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true})
+	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
+
+	result := a.executeDiscoveryJob(context.Background(), discoveryJobItem{
+		JobID:    "scan_bambu_3",
+		Profile:  "hybrid",
+		Adapters: []string{"bambu"},
+	})
+
+	if len(result.Candidates) != 1 {
+		t.Fatalf("candidate count = %d, want 1", len(result.Candidates))
+	}
+	candidate := result.Candidates[0]
+	if candidate.Status != "policy_rejected" {
+		t.Fatalf("candidate status = %q, want policy_rejected", candidate.Status)
+	}
+	if candidate.RejectionReason != "auth_token_missing" {
+		t.Fatalf("rejection_reason = %q, want auth_token_missing", candidate.RejectionReason)
+	}
+}
+
+func TestMapBambuCloudStatesProducesSchemaCompatibleValues(t *testing.T) {
+	printerAllowed := map[string]struct{}{
+		"idle":     {},
+		"queued":   {},
+		"printing": {},
+		"paused":   {},
+		"error":    {},
+	}
+	jobAllowed := map[string]struct{}{
+		"pending":   {},
+		"printing":  {},
+		"completed": {},
+		"failed":    {},
+		"canceled":  {},
+	}
+
+	cases := []struct {
+		name        string
+		online      bool
+		printStatus string
+	}{
+		{name: "offline", online: false, printStatus: "OFFLINE"},
+		{name: "active", online: true, printStatus: "ACTIVE"},
+		{name: "paused", online: true, printStatus: "PAUSED"},
+		{name: "error", online: true, printStatus: "ERROR"},
+		{name: "unknown", online: true, printStatus: "MYSTERY"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			printerState, jobState := mapBambuCloudStates(tc.online, tc.printStatus)
+			if _, ok := printerAllowed[printerState]; !ok {
+				t.Fatalf("printer_state=%q is not schema-compatible", printerState)
+			}
+			if _, ok := jobAllowed[jobState]; !ok {
+				t.Fatalf("job_state=%q is not schema-compatible", jobState)
+			}
+		})
+	}
+}
+
+func TestMapBambuCloudStatesNormalizesActiveAndOfflineStates(t *testing.T) {
+	tests := []struct {
+		name        string
+		online      bool
+		printStatus string
+		wantPrinter string
+		wantJob     string
+	}{
+		{name: "active treated as idle", online: true, printStatus: "ACTIVE", wantPrinter: "idle", wantJob: "completed"},
+		{name: "printing", online: true, printStatus: "PRINTING", wantPrinter: "printing", wantJob: "printing"},
+		{name: "offline", online: false, printStatus: "OFFLINE", wantPrinter: "error", wantJob: "failed"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			printerState, jobState := mapBambuCloudStates(tc.online, tc.printStatus)
+			if printerState != tc.wantPrinter || jobState != tc.wantJob {
+				t.Fatalf("mapBambuCloudStates(%t,%q)=(%q,%q), want (%q,%q)", tc.online, tc.printStatus, printerState, jobState, tc.wantPrinter, tc.wantJob)
+			}
+		})
 	}
 }
 
@@ -1590,7 +1790,121 @@ func TestSubmitDiscoveryInventoryPostsPayload(t *testing.T) {
 	}
 }
 
-func TestRunAndSubmitDiscoveryInventoryScanReportsReachableOnly(t *testing.T) {
+func TestRunAndSubmitDiscoveryInventoryScanIncludesBambuCloudDevices(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableKlipper = false
+	a.cfg.EnableBambu = true
+	a.cfg.DiscoveryAllowedAdapters = []string{"bambu"}
+	a.cfg.DiscoveryProbeTimeout = 2 * time.Second
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
+
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-1" {
+			t.Fatalf("authorization header = %q, want Bearer access-1", got)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"devices": []map[string]any{
+				{
+					"dev_id":           "printer-online",
+					"name":             "Bambu Online",
+					"dev_product_name": "X1C",
+					"print_status":     "ACTIVE",
+					"online":           true,
+				},
+				{
+					"dev_id":           "printer-offline",
+					"name":             "Bambu Offline",
+					"dev_product_name": "P1S",
+					"print_status":     "OFFLINE",
+					"online":           false,
+				},
+			},
+		})
+	}))
+	defer cloudSrv.Close()
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: cloudSrv.URL,
+		Client:      a.client,
+	})
+
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: "http://localhost:8000",
+		SaaSAPIKey:      "edge_key",
+		AgentID:         "edge_1",
+		OrgID:           1,
+	}
+	a.claimed = true
+
+	var captured discoveryInventoryReportRequest
+	var calls int
+	saasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/edge/agents/edge_1/discovery-inventory") {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode discovery inventory payload failed: %v", err)
+		}
+		calls++
+		writeJSON(w, http.StatusOK, discoveryInventoryIngestResponse{
+			ScanID:          captured.ScanID,
+			AcceptedEntries: len(captured.Entries),
+			MatchedEntries:  0,
+			PendingEntries:  len(captured.Entries),
+			GeneratedAt:     time.Now().UTC(),
+		})
+	}))
+	defer saasSrv.Close()
+	a.bootstrap.ControlPlaneURL = saasSrv.URL
+
+	if err := a.runAndSubmitDiscoveryInventoryScan(context.Background(), "manual", "scan_req_bambu", time.Time{}); err != nil {
+		t.Fatalf("runAndSubmitDiscoveryInventoryScan failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("inventory submit calls = %d, want 1", calls)
+	}
+	if len(captured.Entries) != 2 {
+		t.Fatalf("inventory entries = %d, want 2", len(captured.Entries))
+	}
+	entriesByEndpoint := map[string]discoveryInventoryEntryReport{}
+	for _, entry := range captured.Entries {
+		if entry.AdapterFamily != "bambu" {
+			t.Fatalf("entry adapter_family = %q, want bambu", entry.AdapterFamily)
+		}
+		entriesByEndpoint[entry.EndpointURL] = entry
+	}
+	online, ok := entriesByEndpoint["bambu://printer-online"]
+	if !ok {
+		t.Fatalf("expected inventory entry for bambu://printer-online")
+	}
+	onlineFlag, ok := online.Evidence["cloud_online"].(bool)
+	if !ok || !onlineFlag {
+		t.Fatalf("online cloud_online evidence = %v, want true", online.Evidence["cloud_online"])
+	}
+	offline, ok := entriesByEndpoint["bambu://printer-offline"]
+	if !ok {
+		t.Fatalf("expected inventory entry for bambu://printer-offline")
+	}
+	if offline.Status != "unreachable" {
+		t.Fatalf("offline status = %q, want unreachable", offline.Status)
+	}
+	if offline.CurrentPrinterState != "" {
+		t.Fatalf("offline current_printer_state = %q, want empty", offline.CurrentPrinterState)
+	}
+	if offline.CurrentJobState != "" {
+		t.Fatalf("offline current_job_state = %q, want empty", offline.CurrentJobState)
+	}
+	offlineFlag, ok := offline.Evidence["cloud_online"].(bool)
+	if !ok || offlineFlag {
+		t.Fatalf("offline cloud_online evidence = %v, want false", offline.Evidence["cloud_online"])
+	}
+}
+
+func TestRunAndSubmitDiscoveryInventoryScanReportsReachableAndUnreachable(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.DiscoveryAllowedAdapters = []string{"moonraker"}
 	a.cfg.DiscoveryProfileMax = "hybrid"
@@ -1664,14 +1978,29 @@ func TestRunAndSubmitDiscoveryInventoryScanReportsReachableOnly(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("inventory submit calls = %d, want 1", calls)
 	}
-	if len(captured.Entries) != 1 {
-		t.Fatalf("inventory entries = %d, want 1 reachable-only entry", len(captured.Entries))
+	if len(captured.Entries) != 2 {
+		t.Fatalf("inventory entries = %d, want 2 entries (reachable + unreachable)", len(captured.Entries))
 	}
-	if captured.Entries[0].Status != "reachable" {
-		t.Fatalf("entry status = %q, want reachable", captured.Entries[0].Status)
+	entriesByEndpoint := map[string]discoveryInventoryEntryReport{}
+	for _, entry := range captured.Entries {
+		entriesByEndpoint[entry.EndpointURL] = entry
 	}
-	if !strings.Contains(captured.Entries[0].EndpointURL, "127.0.0.1") {
-		t.Fatalf("expected reachable local test endpoint, got %q", captured.Entries[0].EndpointURL)
+	reachableEntry, ok := entriesByEndpoint[moonrakerSrv.URL]
+	if !ok {
+		t.Fatalf("expected reachable entry for %q", moonrakerSrv.URL)
+	}
+	if reachableEntry.Status != "reachable" {
+		t.Fatalf("reachable entry status = %q, want reachable", reachableEntry.Status)
+	}
+	unreachableEntry, ok := entriesByEndpoint["http://127.0.0.1:1"]
+	if !ok {
+		t.Fatalf("expected unreachable entry for http://127.0.0.1:1")
+	}
+	if unreachableEntry.Status != "unreachable" {
+		t.Fatalf("unreachable entry status = %q, want unreachable", unreachableEntry.Status)
+	}
+	if strings.TrimSpace(unreachableEntry.ConnectivityError) == "" {
+		t.Fatalf("expected connectivity_error for unreachable entry")
 	}
 }
 
@@ -2543,20 +2872,27 @@ func TestExecuteActionBambuConnectRejected(t *testing.T) {
 	}
 }
 
-func TestFetchBindingSnapshotBambuConnectEnabled(t *testing.T) {
+func TestFetchBindingSnapshotBambuCloudEnabledWithoutConnectURI(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
-	a.setBambuAuthState(bambuAuthState{Ready: true})
+	a.cfg.BambuConnectURI = "http://127.0.0.1:9"
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
 
-	connectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/printers/printer-123/status" {
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte(`{"printer_id":"printer-123","printer_state":"printing","job_state":"printing","printer_name":"Bambu Unit","model":"X1C"}`))
+		if got := r.Header.Get("Authorization"); got != "Bearer access-1" {
+			t.Fatalf("authorization header = %q, want Bearer access-1", got)
+		}
+		_, _ = w.Write([]byte(`{"devices":[{"dev_id":"printer-123","name":"Bambu Unit","dev_product_name":"X1C","print_status":"ACTIVE","online":true}]}`))
 	}))
-	defer connectSrv.Close()
-	a.cfg.BambuConnectURI = connectSrv.URL
+	defer cloudSrv.Close()
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: cloudSrv.URL,
+		Client:      a.client,
+	})
 
 	state, job, err := a.fetchBindingSnapshot(context.Background(), edgeBinding{
 		PrinterID:     1,
@@ -2566,8 +2902,74 @@ func TestFetchBindingSnapshotBambuConnectEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchBindingSnapshot failed: %v", err)
 	}
-	if state != "printing" || job != "printing" {
-		t.Fatalf("snapshot = (%s,%s), want (printing,printing)", state, job)
+	if state != "idle" || job != "completed" {
+		t.Fatalf("snapshot = (%s,%s), want (idle,completed)", state, job)
+	}
+}
+
+func TestFetchBindingSnapshotBambuCloudDeviceNotFoundReturnsError(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
+
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"devices":[{"dev_id":"different-printer","name":"Other Unit","dev_product_name":"X1C","print_status":"ACTIVE","online":true}]}`))
+	}))
+	defer cloudSrv.Close()
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: cloudSrv.URL,
+		Client:      a.client,
+	})
+
+	_, _, err := a.fetchBindingSnapshot(context.Background(), edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-123",
+	})
+	if err == nil {
+		t.Fatalf("expected snapshot error when cloud device is missing")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "not bound") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchBindingSnapshotBambuCloudOfflineReturnsError(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.setBambuAuthState(bambuAuthState{Ready: true, AccessToken: "access-1"})
+
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/bind" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"devices":[{"dev_id":"printer-123","name":"Bambu Unit","dev_product_name":"X1C","print_status":"OFFLINE","online":false}]}`))
+	}))
+	defer cloudSrv.Close()
+	a.bambuAuthProvider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
+		AuthBaseURL: cloudSrv.URL,
+		Client:      a.client,
+	})
+
+	_, _, err := a.fetchBindingSnapshot(context.Background(), edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-123",
+	})
+	if err == nil {
+		t.Fatalf("expected snapshot error for offline cloud device")
+	}
+	var offlineErr *bambuCloudDeviceOfflineError
+	if !errors.As(err, &offlineErr) {
+		t.Fatalf("expected bambuCloudDeviceOfflineError, got %T (%v)", err, err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "offline") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
