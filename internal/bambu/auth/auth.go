@@ -28,6 +28,7 @@ type Session struct {
 	MaskedEmail        string
 	MaskedPhone        string
 	AccountDisplayName string
+	MQTTUsername       string
 }
 
 type Provider interface {

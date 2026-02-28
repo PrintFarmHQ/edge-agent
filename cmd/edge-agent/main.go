@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -51,11 +52,13 @@ const (
 	discoverySourceBambuCloud    = "bambu_cloud"
 	telemetrySourceBambuCloud    = "bambu_cloud"
 	telemetrySourceBambuConnect  = "bambu_connect"
+	defaultBambuMQTTTopic        = "device/%s/request"
+	defaultBambuMQTTBrokerGlobal = "us.mqtt.bambulab.com:8883"
+	defaultBambuMQTTBrokerChina  = "cn.mqtt.bambulab.com:8883"
 )
 
 var agentSupportedSchemaVersions = []int{1, agentSchemaVersion}
 var errEdgeAuthRevoked = errors.New("edge_api_key_revoked")
-var errBambuConnectActionsUnsupported = errors.New("validation_error: bambu actions are not enabled via bambu connect bridge")
 var errBambuAuthUnavailable = errors.New("validation_error: bambu auth is not ready")
 var macAddressPattern = regexp.MustCompile(`([0-9a-f]{1,2}([:-][0-9a-f]{1,2}){5})`)
 var arpCommandWarningOnce sync.Once
@@ -344,6 +347,8 @@ type bambuAuthState struct {
 	Ready         bool
 	AccessToken   string
 	ExpiresAt     time.Time
+	Username      string
+	MQTTUsername  string
 	MaskedEmail   string
 	MaskedPhone   string
 	DisplayName   string
@@ -361,6 +366,10 @@ type appConfig struct {
 	EnableKlipper               bool
 	EnableBambu                 bool
 	BambuCloudAuthBaseURL       string
+	BambuCloudUploadPath        string
+	BambuCloudPrintPath         string
+	BambuCloudMQTTBroker        string
+	BambuCloudMQTTTopicTemplate string
 	BambuConnectURI             string
 	BindingsPollInterval        time.Duration
 	DesiredStatePollInterval    time.Duration
@@ -369,6 +378,7 @@ type appConfig struct {
 	ActionExecInterval          time.Duration
 	ActionRetryBaseInterval     time.Duration
 	ActionMaxAttempts           int
+	ActionNonRetryableCooldown  time.Duration
 	MoonrakerRequestTimeout     time.Duration
 	ArtifactUploadTimeout       time.Duration
 	ArtifactDownloadTimeout     time.Duration
@@ -400,6 +410,7 @@ type agent struct {
 
 	bambuAuthProvider bambuauth.Provider
 	bambuAuthStore    bambustore.BambuCredentialsStore
+	bambuMQTTPublish  bambuPrintCommandPublisher
 	bambuAuthMu       sync.RWMutex
 	bambuAuth         bambuAuthState
 
@@ -414,6 +425,7 @@ type agent struct {
 	deadLetters     map[int][]action
 	queuedSince     map[int]time.Time
 	recentEnqueue   map[string]time.Time
+	suppressedUntil map[string]time.Time
 	resyncRequested bool
 	breakerUntil    map[int]time.Time
 
@@ -434,17 +446,18 @@ func main() {
 	cfg := loadConfig()
 	cfg = applyRuntimeFlags(cfg, flags)
 	app := &agent{
-		cfg:            cfg,
-		client:         &http.Client{Timeout: 15 * time.Second},
-		desiredState:   make(map[int]desiredStateItem),
-		bindings:       make(map[int]edgeBinding),
-		currentState:   make(map[int]currentStateItem),
-		actionQueue:    make(map[int][]action),
-		deadLetters:    make(map[int][]action),
-		queuedSince:    make(map[int]time.Time),
-		recentEnqueue:  make(map[string]time.Time),
-		breakerUntil:   make(map[int]time.Time),
-		discoverySeeds: make(map[string]time.Time),
+		cfg:             cfg,
+		client:          &http.Client{Timeout: 15 * time.Second},
+		desiredState:    make(map[int]desiredStateItem),
+		bindings:        make(map[int]edgeBinding),
+		currentState:    make(map[int]currentStateItem),
+		actionQueue:     make(map[int][]action),
+		deadLetters:     make(map[int][]action),
+		queuedSince:     make(map[int]time.Time),
+		recentEnqueue:   make(map[string]time.Time),
+		suppressedUntil: make(map[string]time.Time),
+		breakerUntil:    make(map[int]time.Time),
+		discoverySeeds:  make(map[string]time.Time),
 	}
 
 	if err := app.loadBootstrapConfig(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -468,6 +481,9 @@ func main() {
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	signalEvents := make(chan os.Signal, 1)
+	signal.Notify(signalEvents, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signalEvents)
 
 	// Attempt one bootstrap sync when restarting with persisted claim.
 	if app.isClaimed() {
@@ -498,7 +514,16 @@ func main() {
 	}()
 
 	<-rootCtx.Done()
-	app.audit("agent_shutdown", map[string]any{"reason": "signal"})
+	receivedSignal := "unknown"
+	select {
+	case sig := <-signalEvents:
+		receivedSignal = strings.TrimSpace(sig.String())
+	default:
+	}
+	app.audit("agent_shutdown", map[string]any{
+		"reason": "signal",
+		"kind":   receivedSignal,
+	})
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -604,6 +629,8 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		provider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
 			AuthBaseURL: strings.TrimSpace(a.cfg.BambuCloudAuthBaseURL),
 			Client:      a.client,
+			UploadPath:  strings.TrimSpace(a.cfg.BambuCloudUploadPath),
+			PrintPath:   strings.TrimSpace(a.cfg.BambuCloudPrintPath),
 		})
 		a.bambuAuthProvider = provider
 	}
@@ -638,6 +665,7 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 			MaskedEmail:        session.MaskedEmail,
 			MaskedPhone:        session.MaskedPhone,
 			AccountDisplayName: session.AccountDisplayName,
+			MQTTUsername:       strings.TrimSpace(session.MQTTUsername),
 		}
 		if err := credentialsStore.Save(ctx, credentials); err != nil {
 			state.LastError = fmt.Sprintf("bambu token store write failed: %v", err)
@@ -651,6 +679,8 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		Ready:         true,
 		AccessToken:   strings.TrimSpace(session.AccessToken),
 		ExpiresAt:     session.ExpiresAt.UTC(),
+		Username:      strings.TrimSpace(username),
+		MQTTUsername:  strings.TrimSpace(session.MQTTUsername),
 		MaskedEmail:   session.MaskedEmail,
 		MaskedPhone:   session.MaskedPhone,
 		DisplayName:   session.AccountDisplayName,
@@ -662,6 +692,7 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		"masked_email":    state.MaskedEmail,
 		"masked_phone":    state.MaskedPhone,
 		"display_name":    state.DisplayName,
+		"mqtt_username":   state.MQTTUsername,
 		"refresh_present": session.RefreshToken != "",
 	})
 	return nil
@@ -669,6 +700,26 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 
 type bambuCloudDeviceLister interface {
 	ListBoundDevices(ctx context.Context, accessToken string) ([]bambucloud.CloudDevice, error)
+}
+
+type bambuCloudActionProvider interface {
+	bambuCloudDeviceLister
+	GetUploadURLs(ctx context.Context, accessToken, filename string, sizeBytes int64) (bambucloud.CloudUploadURLs, error)
+	UploadToSignedURLs(ctx context.Context, uploadURLs bambucloud.CloudUploadURLs, fileBytes []byte) error
+	StartPrintJob(ctx context.Context, accessToken string, req bambucloud.CloudPrintStartRequest) error
+}
+
+type bambuMQTTCommandRequest struct {
+	BrokerAddr string
+	Topic      string
+	Username   string
+	Password   string
+	Command    string
+	Param      map[string]any
+}
+
+type bambuPrintCommandPublisher interface {
+	PublishPrintCommand(ctx context.Context, req bambuMQTTCommandRequest) error
 }
 
 func (a *agent) establishBambuSession(
@@ -696,6 +747,9 @@ func (a *agent) establishBambuSession(
 			if refreshErr == nil {
 				if strings.TrimSpace(refreshedSession.RefreshToken) == "" {
 					refreshedSession.RefreshToken = refreshToken
+				}
+				if strings.TrimSpace(refreshedSession.MQTTUsername) == "" {
+					refreshedSession.MQTTUsername = strings.TrimSpace(storedCredentials.MQTTUsername)
 				}
 				a.audit("bambu_auth_token_refresh_success", map[string]any{
 					"expires_at": refreshedSession.ExpiresAt,
@@ -943,11 +997,13 @@ func sessionFromStoredBambuCredentials(credentials bambustore.BambuCredentials) 
 		MaskedEmail:        strings.TrimSpace(credentials.MaskedEmail),
 		MaskedPhone:        strings.TrimSpace(credentials.MaskedPhone),
 		AccountDisplayName: strings.TrimSpace(credentials.AccountDisplayName),
+		MQTTUsername:       strings.TrimSpace(credentials.MQTTUsername),
 	}
 }
 
 func loadConfig() appConfig {
 	defaultStateDir := defaultEdgeStateDir()
+	bambuCloudAuthBaseURL := getEnvOrDefault("BAMBU_CLOUD_AUTH_BASE_URL", "https://api.bambulab.com")
 	return appConfig{
 		SetupBindAddr:               getEnvOrDefault("SETUP_BIND_ADDR", "0.0.0.0:8090"),
 		BootstrapConfigPath:         getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", filepath.Join(defaultStateDir, "bootstrap", "config.json")),
@@ -957,7 +1013,11 @@ func loadConfig() appConfig {
 		StartupSaaSAPIKey:           getEnvOrDefault("SAAS_API_KEY", getEnvOrDefault("EDGE_API_KEY", "")),
 		EnableKlipper:               parseBoolEnv("ENABLE_KLIPPER", false),
 		EnableBambu:                 parseBoolEnv("ENABLE_BAMBU", false),
-		BambuCloudAuthBaseURL:       getEnvOrDefault("BAMBU_CLOUD_AUTH_BASE_URL", "https://api.bambulab.com"),
+		BambuCloudAuthBaseURL:       bambuCloudAuthBaseURL,
+		BambuCloudUploadPath:        getEnvOrDefault("BAMBU_CLOUD_UPLOAD_PATH", "/v1/iot-service/api/user/upload"),
+		BambuCloudPrintPath:         getEnvOrDefault("BAMBU_CLOUD_PRINT_PATH", "/v1/iot-service/api/user/print"),
+		BambuCloudMQTTBroker:        getEnvOrDefault("BAMBU_CLOUD_MQTT_BROKER", defaultBambuCloudMQTTBroker(bambuCloudAuthBaseURL)),
+		BambuCloudMQTTTopicTemplate: getEnvOrDefault("BAMBU_CLOUD_MQTT_TOPIC_TEMPLATE", defaultBambuMQTTTopic),
 		BambuConnectURI:             getEnvOrDefault("BAMBU_CONNECT_URI", ""),
 		BindingsPollInterval:        parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
 		DesiredStatePollInterval:    parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
@@ -966,6 +1026,7 @@ func loadConfig() appConfig {
 		ActionExecInterval:          parseDurationMS("ACTION_EXEC_INTERVAL_MS", 250),
 		ActionRetryBaseInterval:     parseDurationMS("ACTION_RETRY_BASE_INTERVAL_MS", 1000),
 		ActionMaxAttempts:           parsePositiveInt("ACTION_MAX_ATTEMPTS", 3),
+		ActionNonRetryableCooldown:  parseDurationMS("ACTION_NON_RETRYABLE_COOLDOWN_MS", 180000),
 		MoonrakerRequestTimeout:     parseDurationMS("MOONRAKER_REQUEST_TIMEOUT_MS", 8000),
 		ArtifactUploadTimeout:       parseDurationMS("ARTIFACT_UPLOAD_TIMEOUT_MS", 90000),
 		ArtifactDownloadTimeout:     parseDurationMS("ARTIFACT_DOWNLOAD_TIMEOUT_MS", 15000),
@@ -984,6 +1045,18 @@ func loadConfig() appConfig {
 		DiscoveryWorkerCount:     parsePositiveInt("DISCOVERY_WORKER_COUNT", 64),
 		DiscoveryProbeTimeout:    parseDurationMS("DISCOVERY_PROBE_TIMEOUT_MS", 2000),
 	}
+}
+
+func defaultBambuCloudMQTTBroker(authBaseURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(authBaseURL))
+	if err != nil {
+		return defaultBambuMQTTBrokerGlobal
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if strings.HasSuffix(host, ".cn") {
+		return defaultBambuMQTTBrokerChina
+	}
+	return defaultBambuMQTTBrokerGlobal
 }
 
 func defaultEdgeStateDir() string {
@@ -1599,6 +1672,7 @@ func (a *agent) reconcileOnce() {
 	a.mu.Lock()
 	now := time.Now().UTC()
 	pruneRecentEnqueueLocked(a.recentEnqueue, now)
+	pruneSuppressedActionsLocked(a.suppressedUntil, now)
 	for printerID := range a.actionQueue {
 		if _, exists := a.desiredState[printerID]; exists {
 			continue
@@ -1685,6 +1759,10 @@ func (a *agent) reconcileOnce() {
 			continue
 		}
 		if isBreakerOpenLocked(a.breakerUntil, printerID, now) {
+			continue
+		}
+		suppressedKey := actionThrottleKey(printerID, kind, desired)
+		if isActionSuppressedLocked(a.suppressedUntil, suppressedKey, now) {
 			continue
 		}
 		if !allowEnqueueLocked(a.recentEnqueue, printerID, kind, desired, now) {
@@ -1783,6 +1861,26 @@ func pruneRecentEnqueueLocked(recent map[string]time.Time, now time.Time) {
 	}
 }
 
+func isActionSuppressedLocked(suppressed map[string]time.Time, key string, now time.Time) bool {
+	until, ok := suppressed[key]
+	if !ok {
+		return false
+	}
+	if now.After(until) {
+		delete(suppressed, key)
+		return false
+	}
+	return true
+}
+
+func pruneSuppressedActionsLocked(suppressed map[string]time.Time, now time.Time) {
+	for key, until := range suppressed {
+		if now.After(until) {
+			delete(suppressed, key)
+		}
+	}
+}
+
 func isBreakerOpenLocked(breakerUntil map[int]time.Time, printerID int, now time.Time) bool {
 	until, ok := breakerUntil[printerID]
 	if !ok {
@@ -1851,12 +1949,38 @@ func (a *agent) tryRecoverUncertainConnectivityAction(ctx context.Context, queue
 	if probeTimeout < 250*time.Millisecond {
 		probeTimeout = 250 * time.Millisecond
 	}
-	printerState, jobState, err := a.fetchMoonrakerSnapshotWithTimeout(ctx, binding.EndpointURL, probeTimeout)
+	family := normalizeAdapterFamily(binding.AdapterFamily)
+	var (
+		printerState    string
+		jobState        string
+		telemetrySource string
+		err             error
+	)
+	switch family {
+	case "moonraker":
+		printerState, jobState, err = a.fetchMoonrakerSnapshotWithTimeout(ctx, binding.EndpointURL, probeTimeout)
+		telemetrySource = "moonraker"
+	case "bambu":
+		requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+		snapshot, fetchErr := a.fetchBambuCloudSnapshotFromEndpoint(requestCtx, binding.EndpointURL)
+		if fetchErr != nil {
+			return false
+		}
+		printerState = snapshot.PrinterState
+		jobState = snapshot.JobState
+		telemetrySource = snapshot.TelemetrySource
+	default:
+		return false
+	}
 	if err != nil {
 		return false
 	}
 	if printerState != "printing" && printerState != "queued" && printerState != "paused" {
 		return false
+	}
+	if strings.TrimSpace(telemetrySource) == "" {
+		telemetrySource = family
 	}
 
 	now := time.Now().UTC()
@@ -1874,7 +1998,7 @@ func (a *agent) tryRecoverUncertainConnectivityAction(ctx context.Context, queue
 	current.LastErrorMessage = ""
 	current.ProgressPct = nil
 	current.RemainingSeconds = nil
-	current.TelemetrySource = "moonraker"
+	current.TelemetrySource = telemetrySource
 	current.ManualIntervention = ""
 	current.ReportedAt = now
 	a.currentState[queuedAction.PrinterID] = current
@@ -1951,6 +2075,9 @@ func (a *agent) handleActionFailure(queuedAction action, errorCode, message stri
 		a.requeueActionWithBackoff(queuedAction, errorCode, message)
 		return
 	}
+	if !retryable {
+		a.suppressActionReenqueue(queuedAction, errorCode, message)
+	}
 	a.moveToDeadLetter(queuedAction, errorCode, message)
 	a.markActionFailure(queuedAction, errorCode, message)
 }
@@ -1975,6 +2102,29 @@ func (a *agent) requeueActionWithBackoff(queuedAction action, errorCode, message
 		"next_attempt_at": queuedAction.NextAttempt,
 		"error_code":      errorCode,
 		"error_message":   message,
+	})
+}
+
+func (a *agent) suppressActionReenqueue(queuedAction action, errorCode, message string) {
+	cooldown := a.cfg.ActionNonRetryableCooldown
+	if cooldown <= 0 {
+		return
+	}
+	suppressedKey := actionThrottleKey(queuedAction.PrinterID, queuedAction.Kind, queuedAction.Target)
+	suppressedUntil := time.Now().UTC().Add(cooldown)
+	a.mu.Lock()
+	currentUntil, exists := a.suppressedUntil[suppressedKey]
+	if !exists || currentUntil.Before(suppressedUntil) {
+		a.suppressedUntil[suppressedKey] = suppressedUntil
+	}
+	a.mu.Unlock()
+	a.audit("action_reenqueue_suppressed", map[string]any{
+		"printer_id":       queuedAction.PrinterID,
+		"kind":             queuedAction.Kind,
+		"intent_version":   queuedAction.Target.IntentVersion,
+		"error_code":       errorCode,
+		"error_message":    message,
+		"suppressed_until": suppressedUntil,
 	})
 }
 
@@ -2003,15 +2153,12 @@ func (a *agent) executeAction(ctx context.Context, queuedAction action, binding 
 	if family == "bambu" && !a.cfg.EnableBambu {
 		return errors.New("validation_error: adapter_family bambu is disabled (set --bambu to enable)")
 	}
-	if family == "bambu" && !a.isBambuAuthReady() {
-		return fmt.Errorf("%w: start edge-agent with --bambu and complete interactive auth", errBambuAuthUnavailable)
-	}
 
 	switch family {
 	case "moonraker":
 		return a.executeMoonrakerAction(ctx, queuedAction, binding)
 	case "bambu":
-		return a.executeBambuConnectAction(ctx, queuedAction, binding)
+		return a.executeBambuCloudAction(ctx, queuedAction, binding)
 	default:
 		return fmt.Errorf("validation_error: unsupported adapter_family: %s", family)
 	}
@@ -2051,11 +2198,522 @@ func (a *agent) executeMoonrakerAction(ctx context.Context, queuedAction action,
 	}
 }
 
-func (a *agent) executeBambuConnectAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	_ = ctx
-	_ = queuedAction
-	_ = binding
-	return errBambuConnectActionsUnsupported
+func (a *agent) executeBambuCloudAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
+	exec := func(token string) error {
+		return a.executeBambuCloudActionWithToken(ctx, queuedAction, binding, token)
+	}
+	return a.executeWithBambuTokenRetry(ctx, exec)
+}
+
+func (a *agent) executeBambuCloudActionWithToken(ctx context.Context, queuedAction action, binding edgeBinding, accessToken string) error {
+	switch queuedAction.Kind {
+	case "print":
+		return a.executeBambuCloudPrintAction(ctx, queuedAction, binding, accessToken)
+	case "pause":
+		return a.executeBambuCloudControlAction(ctx, queuedAction, binding, accessToken, "pause")
+	case "resume":
+		return a.executeBambuCloudControlAction(ctx, queuedAction, binding, accessToken, "resume")
+	case "stop":
+		return a.executeBambuCloudControlAction(ctx, queuedAction, binding, accessToken, "stop")
+	default:
+		return fmt.Errorf("unsupported action kind: %s", queuedAction.Kind)
+	}
+}
+
+func (a *agent) executeWithBambuTokenRetry(ctx context.Context, op func(accessToken string) error) error {
+	accessToken, err := a.ensureBambuAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	if err := op(accessToken); err != nil {
+		if !errors.Is(err, bambuauth.ErrInvalidCredentials) {
+			return err
+		}
+		if authErr := a.initializeBambuAuth(ctx); authErr != nil {
+			return authErr
+		}
+		accessToken, tokenErr := a.ensureBambuAccessToken(ctx)
+		if tokenErr != nil {
+			return tokenErr
+		}
+		return op(accessToken)
+	}
+	return nil
+}
+
+func (a *agent) ensureBambuAccessToken(ctx context.Context) (string, error) {
+	state := a.snapshotBambuAuthState()
+	if strings.TrimSpace(state.AccessToken) != "" && state.Ready && state.ExpiresAt.After(time.Now().UTC().Add(60*time.Second)) {
+		return strings.TrimSpace(state.AccessToken), nil
+	}
+	if err := a.initializeBambuAuth(ctx); err != nil {
+		return "", err
+	}
+	state = a.snapshotBambuAuthState()
+	if !state.Ready || strings.TrimSpace(state.AccessToken) == "" {
+		return "", errBambuAuthUnavailable
+	}
+	return strings.TrimSpace(state.AccessToken), nil
+}
+
+func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction action, binding edgeBinding, accessToken string) error {
+	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	if err != nil {
+		return err
+	}
+	provider, err := a.bambuCloudActionProvider()
+	if err != nil {
+		return err
+	}
+
+	localPath, remoteName, err := a.downloadArtifact(ctx, queuedAction.Target)
+	if err != nil {
+		return err
+	}
+	defer a.cleanupArtifact(localPath)
+
+	fileBytes, err := os.ReadFile(localPath)
+	if err != nil {
+		return err
+	}
+
+	a.audit("artifact_downloaded", map[string]any{
+		"printer_id":      queuedAction.PrinterID,
+		"job_id":          queuedAction.Target.JobID,
+		"plate_id":        queuedAction.Target.PlateID,
+		"filename":        remoteName,
+		"adapter_family":  "bambu",
+		"desired_printer": queuedAction.Target.DesiredPrinterState,
+	})
+
+	uploadURLs, err := provider.GetUploadURLs(ctx, accessToken, remoteName, int64(len(fileBytes)))
+	if err != nil {
+		return err
+	}
+	if err := provider.UploadToSignedURLs(ctx, uploadURLs, fileBytes); err != nil {
+		return err
+	}
+
+	a.audit("artifact_uploaded", map[string]any{
+		"printer_id":      queuedAction.PrinterID,
+		"job_id":          queuedAction.Target.JobID,
+		"plate_id":        queuedAction.Target.PlateID,
+		"filename":        remoteName,
+		"adapter_family":  "bambu",
+		"desired_printer": queuedAction.Target.DesiredPrinterState,
+	})
+
+	fileURL := strings.TrimSpace(uploadURLs.FileURL)
+	if fileURL == "" {
+		return errors.New("validation_error: bambu upload response missing file_url")
+	}
+	fileName := strings.TrimSpace(uploadURLs.FileName)
+	if fileName == "" {
+		fileName = remoteName
+	}
+	startTransport := "cloud_http"
+	startReq := bambucloud.CloudPrintStartRequest{
+		DeviceID: strings.TrimSpace(printerID),
+		FileName: fileName,
+		FileURL:  fileURL,
+		FileID:   strings.TrimSpace(uploadURLs.FileID),
+	}
+	if err := provider.StartPrintJob(ctx, accessToken, startReq); err != nil {
+		if !errors.Is(err, bambucloud.ErrPrintStartUnsupported) {
+			return err
+		}
+		startTransport = "mqtt_fallback"
+		a.audit("bambu_print_start_http_unsupported", map[string]any{
+			"printer_id":     queuedAction.PrinterID,
+			"job_id":         queuedAction.Target.JobID,
+			"plate_id":       queuedAction.Target.PlateID,
+			"endpoint_url":   binding.EndpointURL,
+			"print_path":     strings.TrimSpace(a.cfg.BambuCloudPrintPath),
+			"error_message":  err.Error(),
+			"adapter_family": "bambu",
+		})
+		mqttParam := map[string]any{
+			"file_name": fileName,
+			"file_url":  fileURL,
+		}
+		if fileID := strings.TrimSpace(uploadURLs.FileID); fileID != "" {
+			mqttParam["file_id"] = fileID
+		}
+		if err := a.publishBambuCloudMQTTCommand(
+			ctx,
+			provider,
+			accessToken,
+			strings.TrimSpace(printerID),
+			"start",
+			mqttParam,
+		); err != nil {
+			return fmt.Errorf("bambu print start fallback mqtt failed: %w", err)
+		}
+	}
+	a.audit("bambu_print_start_dispatch_attempt", map[string]any{
+		"printer_id":     queuedAction.PrinterID,
+		"job_id":         queuedAction.Target.JobID,
+		"plate_id":       queuedAction.Target.PlateID,
+		"filename":       fileName,
+		"transport":      startTransport,
+		"adapter_family": "bambu",
+	})
+	if err := a.verifyBambuPrintStart(ctx, strings.TrimSpace(printerID)); err != nil {
+		return err
+	}
+	a.audit("bambu_print_start_verified", map[string]any{
+		"printer_id":     queuedAction.PrinterID,
+		"job_id":         queuedAction.Target.JobID,
+		"plate_id":       queuedAction.Target.PlateID,
+		"filename":       fileName,
+		"transport":      startTransport,
+		"adapter_family": "bambu",
+	})
+
+	a.audit("print_start_requested", map[string]any{
+		"printer_id":      queuedAction.PrinterID,
+		"job_id":          queuedAction.Target.JobID,
+		"plate_id":        queuedAction.Target.PlateID,
+		"filename":        fileName,
+		"adapter_family":  "bambu",
+		"desired_printer": queuedAction.Target.DesiredPrinterState,
+		"transport":       startTransport,
+	})
+	return nil
+}
+
+func (a *agent) executeBambuCloudControlAction(
+	ctx context.Context,
+	queuedAction action,
+	binding edgeBinding,
+	accessToken string,
+	command string,
+) error {
+	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	if err != nil {
+		return err
+	}
+	provider, err := a.bambuCloudActionProvider()
+	if err != nil {
+		return err
+	}
+	if err := a.publishBambuCloudMQTTCommand(ctx, provider, accessToken, strings.TrimSpace(printerID), command, nil); err != nil {
+		return err
+	}
+	return a.verifyBambuControlAction(ctx, strings.TrimSpace(printerID), command)
+}
+
+func (a *agent) publishBambuCloudMQTTCommand(
+	ctx context.Context,
+	provider bambuCloudDeviceLister,
+	accessToken string,
+	printerID string,
+	command string,
+	param map[string]any,
+) error {
+	trimmedPrinterID := strings.TrimSpace(printerID)
+	if trimmedPrinterID == "" {
+		return errors.New("validation_error: missing bambu printer identifier")
+	}
+	if provider == nil {
+		return errors.New("validation_error: bambu cloud provider does not support device listing")
+	}
+
+	devices, err := provider.ListBoundDevices(ctx, accessToken)
+	if err != nil {
+		return err
+	}
+	device, ok := findBambuCloudDeviceByID(devices, trimmedPrinterID)
+	if !ok {
+		return fmt.Errorf("bambu cloud device %q is not bound to this account", trimmedPrinterID)
+	}
+	if !device.Online {
+		return fmt.Errorf("connection error: bambu cloud device %q is offline", trimmedPrinterID)
+	}
+	accessCode := strings.TrimSpace(device.AccessCode)
+	if accessCode == "" {
+		return fmt.Errorf("validation_error: bambu cloud device %q is missing access code", trimmedPrinterID)
+	}
+
+	username, usernameSource, err := a.resolveBambuMQTTUsername(accessToken)
+	if err != nil {
+		return err
+	}
+	a.audit("bambu_mqtt_username_resolved", map[string]any{
+		"printer_id":     trimmedPrinterID,
+		"command":        command,
+		"source":         usernameSource,
+		"adapter_family": "bambu",
+	})
+	a.updateBambuMQTTUsername(ctx, username)
+	topic := strings.TrimSpace(a.cfg.BambuCloudMQTTTopicTemplate)
+	if topic == "" {
+		topic = defaultBambuMQTTTopic
+	}
+	if strings.Contains(topic, "%s") {
+		topic = fmt.Sprintf(topic, trimmedPrinterID)
+	}
+	if strings.TrimSpace(topic) == "" {
+		return errors.New("validation_error: bambu mqtt topic is empty")
+	}
+
+	brokerAddr := strings.TrimSpace(a.cfg.BambuCloudMQTTBroker)
+	if brokerAddr == "" {
+		brokerAddr = defaultBambuCloudMQTTBroker(a.cfg.BambuCloudAuthBaseURL)
+	}
+	publisher := a.bambuMQTTPublish
+	if publisher == nil {
+		publisher = defaultBambuPrintCommandPublisher{}
+	}
+	return publisher.PublishPrintCommand(ctx, bambuMQTTCommandRequest{
+		BrokerAddr: brokerAddr,
+		Topic:      topic,
+		Username:   username,
+		Password:   accessCode,
+		Command:    command,
+		Param:      param,
+	})
+}
+
+func (a *agent) resolveBambuMQTTUsername(accessToken string) (string, string, error) {
+	tokenUsername, tokenErr := bambuMQTTUsernameFromAccessToken(accessToken)
+	if tokenErr != nil {
+		return "", "", fmt.Errorf("validation_error: unable to resolve bambu mqtt username from access token (%v)", tokenErr)
+	}
+	return tokenUsername, "token_claim", nil
+}
+
+func (a *agent) updateBambuMQTTUsername(ctx context.Context, username string) {
+	trimmedUsername := strings.TrimSpace(username)
+	if trimmedUsername == "" {
+		return
+	}
+
+	authState := a.snapshotBambuAuthState()
+	if strings.EqualFold(strings.TrimSpace(authState.MQTTUsername), trimmedUsername) {
+		return
+	}
+	authState.MQTTUsername = trimmedUsername
+	a.setBambuAuthState(authState)
+
+	if a.bambuAuthStore == nil {
+		return
+	}
+	credentials, err := a.bambuAuthStore.Load(ctx)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.audit("bambu_mqtt_username_load_error", map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		credentials = bambustore.BambuCredentials{}
+	}
+	if strings.EqualFold(strings.TrimSpace(credentials.MQTTUsername), trimmedUsername) {
+		return
+	}
+
+	credentials.MQTTUsername = trimmedUsername
+	if strings.TrimSpace(credentials.AccessToken) == "" {
+		credentials.AccessToken = strings.TrimSpace(authState.AccessToken)
+	}
+	if credentials.ExpiresAt.IsZero() {
+		credentials.ExpiresAt = authState.ExpiresAt
+	}
+	if strings.TrimSpace(credentials.Username) == "" {
+		credentials.Username = strings.TrimSpace(authState.Username)
+	}
+	if strings.TrimSpace(credentials.MaskedEmail) == "" {
+		credentials.MaskedEmail = strings.TrimSpace(authState.MaskedEmail)
+	}
+	if strings.TrimSpace(credentials.MaskedPhone) == "" {
+		credentials.MaskedPhone = strings.TrimSpace(authState.MaskedPhone)
+	}
+	if strings.TrimSpace(credentials.AccountDisplayName) == "" {
+		credentials.AccountDisplayName = strings.TrimSpace(authState.DisplayName)
+	}
+	if strings.TrimSpace(credentials.AccessToken) == "" || credentials.ExpiresAt.IsZero() {
+		return
+	}
+	if err := a.bambuAuthStore.Save(ctx, credentials); err != nil {
+		a.audit("bambu_mqtt_username_persist_error", map[string]any{
+			"error": err.Error(),
+		})
+	}
+}
+
+func bambuMQTTUsernameFromUploadURLs(uploadURLs bambucloud.CloudUploadURLs) string {
+	for _, rawURL := range []string{uploadURLs.UploadFileURL, uploadURLs.FileURL, uploadURLs.UploadSizeURL} {
+		if username := bambuMQTTUsernameFromUploadURL(rawURL); username != "" {
+			return username
+		}
+	}
+	return ""
+}
+
+func bambuMQTTUsernameFromUploadURL(rawURL string) string {
+	trimmedURL := strings.TrimSpace(rawURL)
+	if trimmedURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmedURL)
+	if err != nil {
+		return ""
+	}
+	path := strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	for i := 0; i < len(parts)-1; i++ {
+		if !strings.EqualFold(strings.TrimSpace(parts[i]), "users") {
+			continue
+		}
+		username := strings.TrimSpace(parts[i+1])
+		if username != "" {
+			return username
+		}
+	}
+	return ""
+}
+
+func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) error {
+	timeout := a.cfg.MoonrakerRequestTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().UTC().Add(timeout)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().UTC().After(deadline) {
+			return fmt.Errorf("connection error: bambu print start verification timeout after %s", timeout)
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, timeout)
+		snapshot, err := a.fetchBambuCloudSnapshotByPrinterID(requestCtx, printerID)
+		cancel()
+		if err == nil && matchesBambuPrintStartExpectation(snapshot.PrinterState, snapshot.JobState) {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func matchesBambuPrintStartExpectation(printerState string, jobState string) bool {
+	return printerState == "printing" || printerState == "queued" || (printerState == "paused" && jobState == "printing")
+}
+
+func (a *agent) verifyBambuControlAction(ctx context.Context, printerID string, command string) error {
+	timeout := a.cfg.MoonrakerRequestTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().UTC().Add(timeout)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().UTC().After(deadline) {
+			return fmt.Errorf("bambu command verification timeout after %s", timeout)
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, timeout)
+		snapshot, err := a.fetchBambuCloudSnapshotByPrinterID(requestCtx, printerID)
+		cancel()
+		if err == nil && matchesBambuControlExpectation(snapshot.PrinterState, snapshot.JobState, command) {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func matchesBambuControlExpectation(printerState string, jobState string, command string) bool {
+	switch strings.ToLower(strings.TrimSpace(command)) {
+	case "pause":
+		return printerState == "paused"
+	case "resume":
+		return printerState == "printing" || printerState == "queued"
+	case "stop":
+		return printerState == "idle" || jobState == "canceled"
+	default:
+		return false
+	}
+}
+
+func findBambuCloudDeviceByID(devices []bambucloud.CloudDevice, printerID string) (bambucloud.CloudDevice, bool) {
+	trimmedID := strings.TrimSpace(printerID)
+	for _, device := range devices {
+		if strings.EqualFold(strings.TrimSpace(device.DeviceID), trimmedID) {
+			return device, true
+		}
+	}
+	return bambucloud.CloudDevice{}, false
+}
+
+func bambuMQTTUsernameFromAccessToken(accessToken string) (string, error) {
+	claims, err := parseJWTPayloadClaims(accessToken)
+	if err != nil {
+		return "", err
+	}
+	for _, key := range []string{"user_id", "uid", "sub"} {
+		raw, ok := claims[key]
+		if !ok {
+			continue
+		}
+		value := strings.TrimSpace(claimValueToString(raw))
+		if value != "" {
+			return value, nil
+		}
+	}
+	return "", errors.New("validation_error: bambu access token missing user identifier claim")
+}
+
+func parseJWTPayloadClaims(accessToken string) (map[string]any, error) {
+	token := strings.TrimSpace(accessToken)
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil, errors.New("validation_error: invalid bambu access token format")
+	}
+	payload := strings.TrimSpace(parts[1])
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(payload)
+		if err != nil {
+			return nil, fmt.Errorf("validation_error: decode bambu access token payload: %w", err)
+		}
+	}
+	claims := map[string]any{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil, fmt.Errorf("validation_error: parse bambu access token payload: %w", err)
+	}
+	return claims, nil
+}
+
+func claimValueToString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case float64:
+		return strconv.FormatInt(int64(typed), 10)
+	case float32:
+		return strconv.FormatInt(int64(typed), 10)
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	default:
+		return ""
+	}
 }
 
 func (a *agent) executePrintAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
@@ -2384,9 +3042,16 @@ func classifyActionError(err error) (code string, retryable bool) {
 	switch {
 	case strings.Contains(msg, "artifact_fetch_error"):
 		return "artifact_fetch_error", false
+	case strings.Contains(msg, "signaturedoesnotmatch"), strings.Contains(msg, "signature does not match"):
+		return "validation_error", false
 	case strings.Contains(msg, "validation"):
 		return "validation_error", false
-	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"), strings.Contains(msg, "connection"), strings.Contains(msg, "refused"):
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "connection"),
+		strings.Contains(msg, "refused"),
+		strings.Contains(msg, "offline"),
+		strings.Contains(msg, "temporary failure"):
 		return "connectivity_error", true
 	case strings.Contains(msg, "status=5"):
 		return "printer_busy", true
@@ -4239,6 +4904,7 @@ func (a *agent) handleControlPlaneAuthFailure(endpoint string, statusCode int, r
 	a.deadLetters = make(map[int][]action)
 	a.queuedSince = make(map[int]time.Time)
 	a.recentEnqueue = make(map[string]time.Time)
+	a.suppressedUntil = make(map[string]time.Time)
 	a.breakerUntil = make(map[int]time.Time)
 	a.mu.Unlock()
 
@@ -4515,6 +5181,18 @@ func (a *agent) bambuCloudDeviceProvider() (bambuCloudDeviceLister, error) {
 		return nil, errors.New("validation_error: bambu cloud provider does not support device listing")
 	}
 	return deviceProvider, nil
+}
+
+func (a *agent) bambuCloudActionProvider() (bambuCloudActionProvider, error) {
+	provider := a.bambuAuthProvider
+	if provider == nil {
+		return nil, errors.New("validation_error: bambu cloud provider is not configured")
+	}
+	actionProvider, ok := provider.(bambuCloudActionProvider)
+	if !ok {
+		return nil, errors.New("validation_error: bambu cloud provider does not support action execution")
+	}
+	return actionProvider, nil
 }
 
 type bambuConnectPrinterRecord struct {
@@ -5220,8 +5898,12 @@ func shouldLogAuditEventToStdout(event string) bool {
 	// Keep successful operational events visible in stdout for manual runtime verification.
 	switch e {
 	case "action_executed",
+		"action_reenqueue_suppressed",
 		"artifact_downloaded",
 		"artifact_uploaded",
+		"bambu_print_start_http_unsupported",
+		"bambu_print_start_dispatch_attempt",
+		"bambu_print_start_verified",
 		"print_start_requested",
 		"uncertain_action_resolved",
 		"state_pushed",

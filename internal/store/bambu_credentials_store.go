@@ -19,6 +19,7 @@ type BambuCredentials struct {
 	MaskedEmail        string    `json:"masked_email,omitempty"`
 	MaskedPhone        string    `json:"masked_phone,omitempty"`
 	AccountDisplayName string    `json:"account_display_name,omitempty"`
+	MQTTUsername       string    `json:"mqtt_username,omitempty"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 

@@ -23,6 +23,7 @@ func TestBambuCredentialsStorePermissions0600(t *testing.T) {
 		RefreshToken: "refresh-token",
 		ExpiresAt:    time.Now().UTC().Add(1 * time.Hour),
 		MaskedEmail:  "j***@example.com",
+		MQTTUsername: "3911589060",
 	})
 	if err != nil {
 		t.Fatalf("Save failed: %v", err)
@@ -51,6 +52,9 @@ func TestBambuCredentialsStorePermissions0600(t *testing.T) {
 	}
 	if loaded.ExpiresAt.IsZero() {
 		t.Fatalf("loaded expires_at should not be zero")
+	}
+	if loaded.MQTTUsername != "3911589060" {
+		t.Fatalf("loaded mqtt username = %q, want 3911589060", loaded.MQTTUsername)
 	}
 }
 
