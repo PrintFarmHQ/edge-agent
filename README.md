@@ -57,7 +57,18 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
 - When MFA is required, startup blocks and asks for the code on the interactive console.
 - Empty/invalid MFA code (or non-interactive console) makes startup fail with a non-zero exit.
 - Bambu cloud devices are discovered through the same discovery inventory pipeline as Klipper and submitted to SaaS on the periodic inventory cadence (default 30s).
-- Bambu print lifecycle actions are not enabled yet in this code path.
+- Bambu print lifecycle actions are enabled:
+  - print start uses Bambu cloud upload + print submit APIs, with MQTT fallback when the cloud print-start endpoint is not available for the account/region.
+  - pause/resume/stop use the Bambu cloud MQTT command channel.
+- MQTT command auth resolves username from the current Bambu access-token claims (`user_id`/`uid`/`sub`) at action time.
+- Print start success is verified against Bambu cloud telemetry (`queued`/`printing`) before the action is marked successful.
+- If the upload response does not include a printable `file_url`, print-start fails fast with a validation error (no signed-upload-URL guessing).
+- Runtime action auth reuses the same persisted token store (`~/.printfarmhq/bambu/credentials.json`) and re-initializes auth on token expiry/rejection.
+- If Bambu cloud API paths differ by region/account, override with:
+  - `BAMBU_CLOUD_UPLOAD_PATH` (default `/v1/iot-service/api/user/upload`)
+  - `BAMBU_CLOUD_PRINT_PATH` (default `/v1/iot-service/api/user/print`)
+- To reduce repeated retries on deterministic non-retryable failures, tune:
+  - `ACTION_NON_RETRYABLE_COOLDOWN_MS` (default `180000`)
 - Cloud auth/MFA + cloud print lifecycle rollout is tracked in `backlog/todo/p0.md`.
 
 ## Docs
