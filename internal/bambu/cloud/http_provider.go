@@ -331,9 +331,6 @@ func (p *HTTPProvider) GetUploadURLs(ctx context.Context, accessToken, filename 
 	if strings.TrimSpace(uploadURLs.FileName) == "" {
 		uploadURLs.FileName = trimmedFileName
 	}
-	if strings.TrimSpace(uploadURLs.FileURL) == "" {
-		return CloudUploadURLs{}, errors.New("validation_error: bambu upload response missing file_url")
-	}
 	return uploadURLs, nil
 }
 
@@ -413,16 +410,15 @@ func (p *HTTPProvider) StartPrintJob(ctx context.Context, accessToken string, re
 		return errors.New("validation_error: missing bambu file name")
 	}
 	fileURL := strings.TrimSpace(req.FileURL)
-	if fileURL == "" {
-		return errors.New("validation_error: missing bambu file url")
-	}
 	fileID := strings.TrimSpace(req.FileID)
 
 	payload := map[string]any{
 		"device_id": deviceID,
 		"dev_id":    deviceID,
 		"file_name": fileName,
-		"file_url":  fileURL,
+	}
+	if fileURL != "" {
+		payload["file_url"] = fileURL
 	}
 	if fileID != "" {
 		payload["file_id"] = fileID

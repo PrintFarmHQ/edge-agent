@@ -4083,6 +4083,95 @@ func TestExecuteBambuCloudPrintActionFallsBackToMQTTUsingUploadURLUsername(t *te
 	}
 }
 
+func TestExecuteBambuCloudPrintActionAllowsMissingFileURLOnCloudStart(t *testing.T) {
+	a := newTestAgent(t)
+	artifact := []byte("G1 X50 Y60\n")
+	sum := sha256.Sum256(artifact)
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	mqttPublisher := &fakeBambuMQTTPublisher{}
+	a.bambuMQTTPublish = mqttPublisher
+	startCalled := false
+
+	a.bambuAuthProvider = &fakeBambuCloudActionProvider{
+		getUploadFn: func(_ context.Context, _ string, _ string, _ int64) (bambucloud.CloudUploadURLs, error) {
+			return bambucloud.CloudUploadURLs{
+				UploadFileURL: "https://uploads.local/file",
+				UploadSizeURL: "https://uploads.local/size",
+				FileName:      "plate.gcode",
+				FileID:        "file-2",
+			}, nil
+		},
+		uploadSignedFn: func(_ context.Context, _ bambucloud.CloudUploadURLs, fileBytes []byte) error {
+			if !bytes.Equal(fileBytes, artifact) {
+				t.Fatalf("unexpected upload payload")
+			}
+			return nil
+		},
+		startPrintFn: func(_ context.Context, _ string, req bambucloud.CloudPrintStartRequest) error {
+			startCalled = true
+			if req.FileURL != "" {
+				t.Fatalf("FileURL should be empty when upload response omits file_url")
+			}
+			if req.FileName != "plate.gcode" {
+				t.Fatalf("FileName = %q, want plate.gcode", req.FileName)
+			}
+			if req.FileID != "file-2" {
+				t.Fatalf("FileID = %q, want file-2", req.FileID)
+			}
+			return nil
+		},
+		listDevicesFn: func(_ context.Context, _ string) ([]bambucloud.CloudDevice, error) {
+			return []bambucloud.CloudDevice{
+				{
+					DeviceID:    "printer-1",
+					Online:      true,
+					AccessCode:  "access-code-1",
+					PrintStatus: "running",
+				},
+			}, nil
+		},
+	}
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			IntentVersion:       12,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-2",
+			PlateID:             8,
+			ArtifactURL:         artifactSrv.URL,
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+	binding := edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-1",
+	}
+	a.setBambuAuthState(bambuAuthState{
+		Ready:       true,
+		AccessToken: "opaque-token",
+		ExpiresAt:   time.Now().UTC().Add(1 * time.Hour),
+	})
+
+	if err := a.executeBambuCloudPrintAction(context.Background(), queuedAction, binding, "opaque-token"); err != nil {
+		t.Fatalf("executeBambuCloudPrintAction failed: %v", err)
+	}
+	if !startCalled {
+		t.Fatalf("expected cloud start to be called")
+	}
+	if len(mqttPublisher.requests) != 0 {
+		t.Fatalf("mqtt publish count = %d, want 0", len(mqttPublisher.requests))
+	}
+}
+
 func TestFunctionalSetupClaimViaHTTPEndpoint(t *testing.T) {
 	a := newTestAgent(t)
 

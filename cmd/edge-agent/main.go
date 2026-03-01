@@ -2314,9 +2314,6 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 	})
 
 	fileURL := strings.TrimSpace(uploadURLs.FileURL)
-	if fileURL == "" {
-		return errors.New("validation_error: bambu upload response missing file_url")
-	}
 	fileName := strings.TrimSpace(uploadURLs.FileName)
 	if fileName == "" {
 		fileName = remoteName
@@ -2344,7 +2341,9 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		})
 		mqttParam := map[string]any{
 			"file_name": fileName,
-			"file_url":  fileURL,
+		}
+		if fileURL != "" {
+			mqttParam["file_url"] = fileURL
 		}
 		if fileID := strings.TrimSpace(uploadURLs.FileID); fileID != "" {
 			mqttParam["file_id"] = fileID

@@ -209,7 +209,7 @@ func TestHTTPProviderGetUploadURLsSuccess(t *testing.T) {
 	}
 }
 
-func TestHTTPProviderGetUploadURLsMissingFileURLFails(t *testing.T) {
+func TestHTTPProviderGetUploadURLsAllowsMissingFileURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/iot-service/api/user/upload" {
 			http.NotFound(w, r)
@@ -228,12 +228,15 @@ func TestHTTPProviderGetUploadURLsMissingFileURLFails(t *testing.T) {
 	defer srv.Close()
 
 	provider := NewHTTPProvider(HTTPProviderConfig{AuthBaseURL: srv.URL, Client: &http.Client{Timeout: 2 * time.Second}})
-	_, err := provider.GetUploadURLs(context.Background(), "access-1", "plate.gcode.3mf", 12)
-	if err == nil {
-		t.Fatalf("expected missing file_url validation error")
+	uploadURLs, err := provider.GetUploadURLs(context.Background(), "access-1", "plate.gcode.3mf", 12)
+	if err != nil {
+		t.Fatalf("GetUploadURLs failed: %v", err)
 	}
-	if got := err.Error(); got != "validation_error: bambu upload response missing file_url" {
-		t.Fatalf("error = %q, want validation_error: bambu upload response missing file_url", got)
+	if uploadURLs.UploadFileURL != "https://uploads.local/file" {
+		t.Fatalf("upload file url = %q, want https://uploads.local/file", uploadURLs.UploadFileURL)
+	}
+	if uploadURLs.FileURL != "" {
+		t.Fatalf("file url = %q, want empty", uploadURLs.FileURL)
 	}
 }
 
@@ -377,6 +380,43 @@ func TestHTTPProviderStartPrintJobSuccess(t *testing.T) {
 		DeviceID: "dev-1",
 		FileName: "plate.gcode.3mf",
 		FileURL:  "https://objects.local/plate.gcode.3mf",
+		FileID:   "file-id-1",
+	})
+	if err != nil {
+		t.Fatalf("StartPrintJob failed: %v", err)
+	}
+}
+
+func TestHTTPProviderStartPrintJobAllowsMissingFileURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/iot-service/api/user/print" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode print start payload failed: %v", err)
+		}
+		if payload["device_id"] != "dev-1" {
+			t.Fatalf("device_id = %v, want dev-1", payload["device_id"])
+		}
+		if payload["file_name"] != "plate.gcode.3mf" {
+			t.Fatalf("file_name = %v, want plate.gcode.3mf", payload["file_name"])
+		}
+		if _, exists := payload["file_url"]; exists {
+			t.Fatalf("file_url should be omitted when missing")
+		}
+		if payload["file_id"] != "file-id-1" {
+			t.Fatalf("file_id = %v, want file-id-1", payload["file_id"])
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	provider := NewHTTPProvider(HTTPProviderConfig{AuthBaseURL: srv.URL, Client: &http.Client{Timeout: 2 * time.Second}})
+	err := provider.StartPrintJob(context.Background(), "access-1", CloudPrintStartRequest{
+		DeviceID: "dev-1",
+		FileName: "plate.gcode.3mf",
 		FileID:   "file-id-1",
 	})
 	if err != nil {
