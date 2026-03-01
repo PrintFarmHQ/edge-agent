@@ -2485,11 +2485,6 @@ func (a *agent) publishBambuCloudMQTTCommand(
 }
 
 func (a *agent) resolveBambuMQTTUsername(ctx context.Context, accessToken string) (string, string, error) {
-	tokenUsername, tokenErr := bambuMQTTUsernameFromAccessToken(accessToken)
-	if tokenErr == nil {
-		return tokenUsername, "token_claim", nil
-	}
-
 	authStateUsername := strings.TrimSpace(a.snapshotBambuAuthState().MQTTUsername)
 	if authStateUsername != "" {
 		return authStateUsername, "auth_state", nil
@@ -2507,6 +2502,11 @@ func (a *agent) resolveBambuMQTTUsername(ctx context.Context, accessToken string
 				"error": err.Error(),
 			})
 		}
+	}
+
+	tokenUsername, tokenErr := bambuMQTTUsernameFromAccessToken(accessToken)
+	if tokenErr == nil {
+		return tokenUsername, "token_claim", nil
 	}
 
 	return "", "", fmt.Errorf("validation_error: unable to resolve bambu mqtt username from access token (%v)", tokenErr)

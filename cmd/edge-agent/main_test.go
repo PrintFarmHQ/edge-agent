@@ -830,9 +830,8 @@ func TestBambuMQTTUsernameFromUploadURL(t *testing.T) {
 func TestResolveBambuMQTTUsernameUsesTokenClaimOnly(t *testing.T) {
 	a := newTestAgent(t)
 	a.setBambuAuthState(bambuAuthState{
-		Ready:        true,
-		AccessToken:  "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`)) + ".sig",
-		MQTTUsername: "stale-user",
+		Ready:       true,
+		AccessToken: "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`)) + ".sig",
 	})
 
 	username, source, err := a.resolveBambuMQTTUsername(context.Background(), "header."+base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`))+".sig")
@@ -861,6 +860,26 @@ func TestResolveBambuMQTTUsernameFallsBackToAuthState(t *testing.T) {
 	}
 	if username != "stale-user" {
 		t.Fatalf("username = %q, want stale-user", username)
+	}
+	if source != "auth_state" {
+		t.Fatalf("source = %q, want auth_state", source)
+	}
+}
+
+func TestResolveBambuMQTTUsernamePrefersAuthStateOverTokenClaim(t *testing.T) {
+	a := newTestAgent(t)
+	a.setBambuAuthState(bambuAuthState{
+		Ready:        true,
+		AccessToken:  "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`)) + ".sig",
+		MQTTUsername: "preferred-state-user",
+	})
+
+	username, source, err := a.resolveBambuMQTTUsername(context.Background(), "header."+base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`))+".sig")
+	if err != nil {
+		t.Fatalf("resolveBambuMQTTUsername failed: %v", err)
+	}
+	if username != "preferred-state-user" {
+		t.Fatalf("username = %q, want preferred-state-user", username)
 	}
 	if source != "auth_state" {
 		t.Fatalf("source = %q, want auth_state", source)
@@ -3224,8 +3243,8 @@ func TestExecuteActionBambuPrintFallsBackToMQTTStart(t *testing.T) {
 	if publisher.requests[0].Command != "start" {
 		t.Fatalf("mqtt command = %q, want start", publisher.requests[0].Command)
 	}
-	if publisher.requests[0].Username != "user-1" {
-		t.Fatalf("mqtt username = %q, want user-1", publisher.requests[0].Username)
+	if publisher.requests[0].Username != "3911589060" {
+		t.Fatalf("mqtt username = %q, want 3911589060", publisher.requests[0].Username)
 	}
 	if publisher.requests[0].Password != "dev-access-code" {
 		t.Fatalf("mqtt password = %q, want dev-access-code", publisher.requests[0].Password)
@@ -3300,8 +3319,8 @@ func TestExecuteActionBambuPauseUsesMQTT(t *testing.T) {
 	if publisher.requests[0].Command != "pause" {
 		t.Fatalf("mqtt command = %q, want pause", publisher.requests[0].Command)
 	}
-	if publisher.requests[0].Username != "user-1" {
-		t.Fatalf("mqtt username = %q, want user-1", publisher.requests[0].Username)
+	if publisher.requests[0].Username != "stale-user" {
+		t.Fatalf("mqtt username = %q, want stale-user", publisher.requests[0].Username)
 	}
 	if !strings.Contains(publisher.requests[0].Topic, "printer_1") {
 		t.Fatalf("mqtt topic = %q, want printer_1 topic", publisher.requests[0].Topic)
