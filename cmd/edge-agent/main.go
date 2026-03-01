@@ -2290,6 +2290,16 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 	if err != nil {
 		return err
 	}
+	if inferredMQTTUsername := strings.TrimSpace(bambuMQTTUsernameFromUploadURLs(uploadURLs)); inferredMQTTUsername != "" {
+		a.updateBambuMQTTUsername(ctx, inferredMQTTUsername)
+		a.audit("bambu_mqtt_username_inferred_from_upload_urls", map[string]any{
+			"printer_id":     queuedAction.PrinterID,
+			"job_id":         queuedAction.Target.JobID,
+			"plate_id":       queuedAction.Target.PlateID,
+			"source":         "upload_urls",
+			"adapter_family": "bambu",
+		})
+	}
 	if err := provider.UploadToSignedURLs(ctx, uploadURLs, fileBytes); err != nil {
 		return err
 	}
@@ -2435,7 +2445,7 @@ func (a *agent) publishBambuCloudMQTTCommand(
 		return fmt.Errorf("validation_error: bambu cloud device %q is missing access code", trimmedPrinterID)
 	}
 
-	username, usernameSource, err := a.resolveBambuMQTTUsername(accessToken)
+	username, usernameSource, err := a.resolveBambuMQTTUsername(ctx, accessToken)
 	if err != nil {
 		return err
 	}
@@ -2475,12 +2485,32 @@ func (a *agent) publishBambuCloudMQTTCommand(
 	})
 }
 
-func (a *agent) resolveBambuMQTTUsername(accessToken string) (string, string, error) {
+func (a *agent) resolveBambuMQTTUsername(ctx context.Context, accessToken string) (string, string, error) {
 	tokenUsername, tokenErr := bambuMQTTUsernameFromAccessToken(accessToken)
-	if tokenErr != nil {
-		return "", "", fmt.Errorf("validation_error: unable to resolve bambu mqtt username from access token (%v)", tokenErr)
+	if tokenErr == nil {
+		return tokenUsername, "token_claim", nil
 	}
-	return tokenUsername, "token_claim", nil
+
+	authStateUsername := strings.TrimSpace(a.snapshotBambuAuthState().MQTTUsername)
+	if authStateUsername != "" {
+		return authStateUsername, "auth_state", nil
+	}
+
+	if a.bambuAuthStore != nil {
+		credentials, err := a.bambuAuthStore.Load(ctx)
+		if err == nil {
+			storedUsername := strings.TrimSpace(credentials.MQTTUsername)
+			if storedUsername != "" {
+				return storedUsername, "credentials_store", nil
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			a.audit("bambu_mqtt_username_load_error", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
+
+	return "", "", fmt.Errorf("validation_error: unable to resolve bambu mqtt username from access token (%v)", tokenErr)
 }
 
 func (a *agent) updateBambuMQTTUsername(ctx context.Context, username string) {
@@ -2577,14 +2607,21 @@ func bambuMQTTUsernameFromUploadURL(rawURL string) string {
 	return ""
 }
 
-func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) error {
+func (a *agent) bambuActionVerificationTimeout() time.Duration {
 	timeout := a.cfg.MoonrakerRequestTimeout
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	if timeout < 2*time.Second {
-		timeout = 2 * time.Second
+	// Bambu cloud command dispatch + telemetry propagation can legitimately exceed
+	// Moonraker-like LAN latencies; keep a floor to reduce false timeout failures.
+	if timeout < 20*time.Second {
+		timeout = 20 * time.Second
 	}
+	return timeout
+}
+
+func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) error {
+	timeout := a.bambuActionVerificationTimeout()
 	deadline := time.Now().UTC().Add(timeout)
 	for {
 		if ctx.Err() != nil {
@@ -2608,13 +2645,7 @@ func matchesBambuPrintStartExpectation(printerState string, jobState string) boo
 }
 
 func (a *agent) verifyBambuControlAction(ctx context.Context, printerID string, command string) error {
-	timeout := a.cfg.MoonrakerRequestTimeout
-	if timeout <= 0 {
-		timeout = 8 * time.Second
-	}
-	if timeout < 2*time.Second {
-		timeout = 2 * time.Second
-	}
+	timeout := a.bambuActionVerificationTimeout()
 	deadline := time.Now().UTC().Add(timeout)
 	for {
 		if ctx.Err() != nil {

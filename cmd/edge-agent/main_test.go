@@ -835,7 +835,7 @@ func TestResolveBambuMQTTUsernameUsesTokenClaimOnly(t *testing.T) {
 		MQTTUsername: "stale-user",
 	})
 
-	username, source, err := a.resolveBambuMQTTUsername("header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`)) + ".sig")
+	username, source, err := a.resolveBambuMQTTUsername(context.Background(), "header."+base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"claim-user"}`))+".sig")
 	if err != nil {
 		t.Fatalf("resolveBambuMQTTUsername failed: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestResolveBambuMQTTUsernameUsesTokenClaimOnly(t *testing.T) {
 	}
 }
 
-func TestResolveBambuMQTTUsernameRejectsInvalidToken(t *testing.T) {
+func TestResolveBambuMQTTUsernameFallsBackToAuthState(t *testing.T) {
 	a := newTestAgent(t)
 	a.setBambuAuthState(bambuAuthState{
 		Ready:        true,
@@ -855,12 +855,44 @@ func TestResolveBambuMQTTUsernameRejectsInvalidToken(t *testing.T) {
 		MQTTUsername: "stale-user",
 	})
 
-	_, _, err := a.resolveBambuMQTTUsername("opaque-access-token")
+	username, source, err := a.resolveBambuMQTTUsername(context.Background(), "opaque-access-token")
+	if err != nil {
+		t.Fatalf("resolveBambuMQTTUsername failed: %v", err)
+	}
+	if username != "stale-user" {
+		t.Fatalf("username = %q, want stale-user", username)
+	}
+	if source != "auth_state" {
+		t.Fatalf("source = %q, want auth_state", source)
+	}
+}
+
+func TestResolveBambuMQTTUsernameRejectsInvalidTokenWithoutFallback(t *testing.T) {
+	a := newTestAgent(t)
+	a.setBambuAuthState(bambuAuthState{
+		Ready:       true,
+		AccessToken: "opaque-access-token",
+	})
+
+	_, _, err := a.resolveBambuMQTTUsername(context.Background(), "opaque-access-token")
 	if err == nil {
 		t.Fatalf("expected invalid token error")
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "unable to resolve bambu mqtt username from access token") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBambuActionVerificationTimeoutHasCloudFloor(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.MoonrakerRequestTimeout = 3 * time.Second
+	if got := a.bambuActionVerificationTimeout(); got != 20*time.Second {
+		t.Fatalf("bambuActionVerificationTimeout() = %s, want 20s", got)
+	}
+
+	a.cfg.MoonrakerRequestTimeout = 35 * time.Second
+	if got := a.bambuActionVerificationTimeout(); got != 35*time.Second {
+		t.Fatalf("bambuActionVerificationTimeout() = %s, want 35s", got)
 	}
 }
 
@@ -3954,6 +3986,100 @@ func TestExecuteNextActionDeadLettersOnArtifactFetchError(t *testing.T) {
 	}
 	if current.LastErrorCode != "artifact_fetch_error" {
 		t.Fatalf("last_error_code = %q, want artifact_fetch_error", current.LastErrorCode)
+	}
+}
+
+func TestExecuteBambuCloudPrintActionFallsBackToMQTTUsingUploadURLUsername(t *testing.T) {
+	a := newTestAgent(t)
+	artifact := []byte("G1 X12 Y34\n")
+	sum := sha256.Sum256(artifact)
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	mqttPublisher := &fakeBambuMQTTPublisher{}
+	a.bambuMQTTPublish = mqttPublisher
+
+	a.bambuAuthProvider = &fakeBambuCloudActionProvider{
+		listDevicesFn: func(_ context.Context, _ string) ([]bambucloud.CloudDevice, error) {
+			return []bambucloud.CloudDevice{
+				{
+					DeviceID:    "printer-1",
+					Online:      true,
+					AccessCode:  "access-code-1",
+					PrintStatus: "running",
+				},
+			}, nil
+		},
+		getUploadFn: func(_ context.Context, _ string, _ string, _ int64) (bambucloud.CloudUploadURLs, error) {
+			return bambucloud.CloudUploadURLs{
+				UploadFileURL: "https://s3.us-west-2.amazonaws.com/or-cloud-upload-prod/users/3911589060/filename/20260217183115.027/plate.gcode",
+				UploadSizeURL: "https://s3.us-west-2.amazonaws.com/or-cloud-upload-prod/users/3911589060/filename/20260217183115.027/plate.gcode.size",
+				FileURL:       "https://s3.us-west-2.amazonaws.com/or-cloud-upload-prod/users/3911589060/filename/20260217183115.027/plate.gcode",
+				FileName:      "plate.gcode",
+				FileID:        "file-1",
+			}, nil
+		},
+		uploadSignedFn: func(_ context.Context, _ bambucloud.CloudUploadURLs, fileBytes []byte) error {
+			if !bytes.Equal(fileBytes, artifact) {
+				t.Fatalf("unexpected upload payload")
+			}
+			return nil
+		},
+		startPrintFn: func(_ context.Context, _ string, _ bambucloud.CloudPrintStartRequest) error {
+			return bambucloud.ErrPrintStartUnsupported
+		},
+	}
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			IntentVersion:       11,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-1",
+			PlateID:             7,
+			ArtifactURL:         artifactSrv.URL,
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+	binding := edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-1",
+	}
+	a.setBambuAuthState(bambuAuthState{
+		Ready:       true,
+		AccessToken: "opaque-token",
+		ExpiresAt:   time.Now().UTC().Add(1 * time.Hour),
+	})
+
+	if err := a.executeBambuCloudPrintAction(context.Background(), queuedAction, binding, "opaque-token"); err != nil {
+		t.Fatalf("executeBambuCloudPrintAction failed: %v", err)
+	}
+
+	if len(mqttPublisher.requests) != 1 {
+		t.Fatalf("mqtt publish count = %d, want 1", len(mqttPublisher.requests))
+	}
+	mqttReq := mqttPublisher.requests[0]
+	if mqttReq.Command != "start" {
+		t.Fatalf("mqtt command = %q, want start", mqttReq.Command)
+	}
+	if mqttReq.Username != "3911589060" {
+		t.Fatalf("mqtt username = %q, want 3911589060", mqttReq.Username)
+	}
+	if mqttReq.Param["file_name"] != "plate.gcode" {
+		t.Fatalf("mqtt file_name param = %v, want plate.gcode", mqttReq.Param["file_name"])
+	}
+	if mqttReq.Param["file_id"] != "file-1" {
+		t.Fatalf("mqtt file_id param = %v, want file-1", mqttReq.Param["file_id"])
+	}
+
+	if authState := a.snapshotBambuAuthState(); authState.MQTTUsername != "3911589060" {
+		t.Fatalf("auth mqtt username = %q, want 3911589060", authState.MQTTUsername)
 	}
 }
 
