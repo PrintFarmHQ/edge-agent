@@ -3456,7 +3456,8 @@ func TestFetchMoonrakerSnapshotMapping(t *testing.T) {
 		{name: "printing", rawState: "printing", wantState: "printing", wantJob: "printing"},
 		{name: "paused", rawState: "paused", wantState: "paused", wantJob: "printing"},
 		{name: "canceled", rawState: "cancelled", wantState: "idle", wantJob: "canceled"},
-		{name: "unknown", rawState: "ready", wantState: "idle", wantJob: "pending"},
+		{name: "ready treated as completed", rawState: "ready", wantState: "idle", wantJob: "completed"},
+		{name: "unknown treated as completed", rawState: "mystery", wantState: "idle", wantJob: "completed"},
 	}
 
 	for _, tc := range tests {

@@ -5860,6 +5860,8 @@ func mapMoonrakerPrintStatsState(state string) (printerState string, jobState st
 		return "printing", "printing", nil
 	case "paused":
 		return "paused", "printing", nil
+	case "complete", "completed", "finished", "standby", "ready", "idle":
+		return "idle", "completed", nil
 	case "cancelled", "canceled":
 		return "idle", "canceled", nil
 	case "error":
@@ -5867,7 +5869,7 @@ func mapMoonrakerPrintStatsState(state string) (printerState string, jobState st
 	case "queued":
 		return "queued", "pending", nil
 	default:
-		return "idle", "pending", nil
+		return "idle", "completed", nil
 	}
 }
 
