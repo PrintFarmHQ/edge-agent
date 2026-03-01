@@ -2420,6 +2420,10 @@ func (a *agent) publishBambuCloudMQTTCommand(
 	command string,
 	param map[string]any,
 ) error {
+	type mqttUsernameCandidate struct {
+		Username string
+		Source   string
+	}
 	trimmedPrinterID := strings.TrimSpace(printerID)
 	if trimmedPrinterID == "" {
 		return errors.New("validation_error: missing bambu printer identifier")
@@ -2448,13 +2452,63 @@ func (a *agent) publishBambuCloudMQTTCommand(
 	if err != nil {
 		return err
 	}
+	auditBase := map[string]any{
+		"printer_id":     trimmedPrinterID,
+		"command":        command,
+		"adapter_family": "bambu",
+	}
 	a.audit("bambu_mqtt_username_resolved", map[string]any{
 		"printer_id":     trimmedPrinterID,
 		"command":        command,
 		"source":         usernameSource,
 		"adapter_family": "bambu",
 	})
-	a.updateBambuMQTTUsername(ctx, username)
+
+	candidates := []mqttUsernameCandidate{
+		{Username: username, Source: usernameSource},
+	}
+	authStateUsername := strings.TrimSpace(a.snapshotBambuAuthState().MQTTUsername)
+	if authStateUsername != "" {
+		candidates = append(candidates, mqttUsernameCandidate{Username: authStateUsername, Source: "auth_state"})
+	}
+	if tokenUsername, tokenErr := bambuMQTTUsernameFromAccessToken(accessToken); tokenErr == nil && strings.TrimSpace(tokenUsername) != "" {
+		candidates = append(candidates, mqttUsernameCandidate{Username: strings.TrimSpace(tokenUsername), Source: "token_claim"})
+	}
+	if a.bambuAuthStore != nil {
+		credentials, loadErr := a.bambuAuthStore.Load(ctx)
+		if loadErr == nil {
+			storedUsername := strings.TrimSpace(credentials.MQTTUsername)
+			if storedUsername != "" {
+				candidates = append(candidates, mqttUsernameCandidate{Username: storedUsername, Source: "credentials_store"})
+			}
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			a.audit("bambu_mqtt_username_load_error", map[string]any{
+				"error": loadErr.Error(),
+			})
+		}
+	}
+
+	uniqueCandidates := make([]mqttUsernameCandidate, 0, len(candidates))
+	seenCandidates := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		normalizedUsername := strings.TrimSpace(candidate.Username)
+		if normalizedUsername == "" {
+			continue
+		}
+		key := strings.ToLower(normalizedUsername)
+		if _, exists := seenCandidates[key]; exists {
+			continue
+		}
+		seenCandidates[key] = struct{}{}
+		uniqueCandidates = append(uniqueCandidates, mqttUsernameCandidate{
+			Username: normalizedUsername,
+			Source:   strings.TrimSpace(candidate.Source),
+		})
+	}
+	if len(uniqueCandidates) == 0 {
+		return errors.New("validation_error: unable to resolve bambu mqtt username")
+	}
+
 	topic := strings.TrimSpace(a.cfg.BambuCloudMQTTTopicTemplate)
 	if topic == "" {
 		topic = defaultBambuMQTTTopic
@@ -2474,14 +2528,56 @@ func (a *agent) publishBambuCloudMQTTCommand(
 	if publisher == nil {
 		publisher = defaultBambuPrintCommandPublisher{}
 	}
-	return publisher.PublishPrintCommand(ctx, bambuMQTTCommandRequest{
-		BrokerAddr: brokerAddr,
-		Topic:      topic,
-		Username:   username,
-		Password:   accessCode,
-		Command:    command,
-		Param:      param,
-	})
+
+	var lastErr error
+	for idx, candidate := range uniqueCandidates {
+		if idx > 0 {
+			a.audit("bambu_mqtt_username_retry_attempt", map[string]any{
+				"printer_id":       auditBase["printer_id"],
+				"command":          auditBase["command"],
+				"adapter_family":   auditBase["adapter_family"],
+				"candidate_source": candidate.Source,
+				"attempt_sequence": idx + 1,
+				"total_candidates": len(uniqueCandidates),
+			})
+		}
+
+		publishErr := publisher.PublishPrintCommand(ctx, bambuMQTTCommandRequest{
+			BrokerAddr: brokerAddr,
+			Topic:      topic,
+			Username:   candidate.Username,
+			Password:   accessCode,
+			Command:    command,
+			Param:      param,
+		})
+		if publishErr == nil {
+			a.updateBambuMQTTUsername(ctx, candidate.Username)
+			if idx > 0 {
+				a.audit("bambu_mqtt_username_retry_success", map[string]any{
+					"printer_id":       auditBase["printer_id"],
+					"command":          auditBase["command"],
+					"adapter_family":   auditBase["adapter_family"],
+					"candidate_source": candidate.Source,
+					"attempt_sequence": idx + 1,
+				})
+			}
+			return nil
+		}
+
+		lastErr = publishErr
+		if !isBambuMQTTAuthReject(publishErr) {
+			return publishErr
+		}
+	}
+	return lastErr
+}
+
+func isBambuMQTTAuthReject(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(msg, "bambu mqtt broker rejected connection return_code=")
 }
 
 func (a *agent) resolveBambuMQTTUsername(ctx context.Context, accessToken string) (string, string, error) {
@@ -5933,6 +6029,9 @@ func shouldLogAuditEventToStdout(event string) bool {
 		"action_reenqueue_suppressed",
 		"artifact_downloaded",
 		"artifact_uploaded",
+		"bambu_mqtt_username_resolved",
+		"bambu_mqtt_username_retry_attempt",
+		"bambu_mqtt_username_retry_success",
 		"bambu_print_start_http_unsupported",
 		"bambu_print_start_dispatch_attempt",
 		"bambu_print_start_verified",

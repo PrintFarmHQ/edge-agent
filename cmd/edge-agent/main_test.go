@@ -3327,6 +3327,65 @@ func TestExecuteActionBambuPauseUsesMQTT(t *testing.T) {
 	}
 }
 
+func TestPublishBambuCloudMQTTCommandRetriesAlternateUsernameOnAuthReject(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	provider := &fakeBambuCloudActionProvider{
+		listDevicesFn: func(_ context.Context, _ string) ([]bambucloud.CloudDevice, error) {
+			return []bambucloud.CloudDevice{
+				{
+					DeviceID:    "printer_1",
+					Name:        "P1S",
+					PrintStatus: "PRINTING",
+					Online:      true,
+					AccessCode:  "dev-access-code",
+				},
+			}, nil
+		},
+	}
+	publisher := &fakeBambuMQTTPublisher{
+		publish: func(_ context.Context, req bambuMQTTCommandRequest) error {
+			if req.Username == "bad-user" {
+				return errors.New("bambu mqtt broker rejected connection return_code=5")
+			}
+			return nil
+		},
+	}
+	a.bambuAuthProvider = provider
+	a.bambuMQTTPublish = publisher
+	a.setBambuAuthState(bambuAuthState{
+		Ready:        true,
+		AccessToken:  "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"good-user"}`)) + ".sig",
+		MQTTUsername: "bad-user",
+		ExpiresAt:    time.Now().UTC().Add(1 * time.Hour),
+	})
+
+	err := a.publishBambuCloudMQTTCommand(
+		context.Background(),
+		provider,
+		"header."+base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"good-user"}`))+".sig",
+		"printer_1",
+		"pause",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("publishBambuCloudMQTTCommand failed: %v", err)
+	}
+	if len(publisher.requests) < 2 {
+		t.Fatalf("publish attempts = %d, want at least 2", len(publisher.requests))
+	}
+	if publisher.requests[0].Username != "bad-user" {
+		t.Fatalf("first username = %q, want bad-user", publisher.requests[0].Username)
+	}
+	if publisher.requests[1].Username != "good-user" {
+		t.Fatalf("second username = %q, want good-user", publisher.requests[1].Username)
+	}
+	if authState := a.snapshotBambuAuthState(); authState.MQTTUsername != "good-user" {
+		t.Fatalf("auth mqtt username = %q, want good-user", authState.MQTTUsername)
+	}
+}
+
 func TestFetchBindingSnapshotBambuCloudEnabledWithoutConnectURI(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
