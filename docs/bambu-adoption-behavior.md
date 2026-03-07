@@ -5,7 +5,7 @@
 For Bambu discovery entries:
 
 - `reachable`: adoptable
-- `unreachable`: adoptable
+- `unreachable`: not adoptable
 - `lost`: not adoptable
 
 ## Adoption Outcome
@@ -13,11 +13,38 @@ For Bambu discovery entries:
 When confirming a Bambu discovery entry:
 
 - If inventory status is `reachable`, the adopted printer is initialized as `idle`.
-- If inventory status is `unreachable`, the adopted printer is initialized as `offline`.
+- The operator must provide the printer access code during adoption.
+- SaaS enqueues that access code into a short-lived edge config-command for the owning agent.
+- edge-agent stores the access code locally, keyed by printer serial.
 
-Both are bound as `edge_managed`.
+Reachable entries are bound as `edge_managed`.
 
 ## Why This Behavior
 
-Bambu cloud discovery is account/device based and can return devices that are currently powered off.  
-Those devices are valid adoption targets even when offline at adoption time.
+Bambu onboarding is now LAN-first and serial-based. Discovery comes from the local network, not from a cloud account device list.
+
+Because LAN discovery is subnet-local, an `unreachable` or `lost` Bambu entry is not a safe adoption target:
+
+- the printer may have moved to a different IP or subnet,
+- the device may no longer be present on the LAN,
+- local follow-up control will depend on the edge agent being able to reach the printer directly.
+
+That is why only `reachable` Bambu LAN entries are offered for adoption.
+
+Because Bambu LAN discovery can be intermittent and operators often need a moment to fetch the access code from the printer, SaaS keeps recently seen Bambu rows alive longer before marking them `lost`.
+
+## Secret Boundary
+
+- Discovery does not require the Bambu access code.
+- Adoption requires it because the local Bambu LAN runtime is authenticated.
+- The access code must not be stored on SaaS printer records or binding records.
+- The access code is persisted only on the edge-agent host.
+
+## Access-Code Usage After Adoption
+
+Once the access code is stored on the edge host:
+
+- edge-agent uses it for authenticated local MQTT snapshot reads,
+- edge-agent routes Bambu `pause`, `resume`, and `stop` through local MQTT when credentials are available,
+- edge-agent can start prints unattended over the local LAN when the printer is in `LAN Only + Developer Mode`,
+- unattended LAN start currently requires a `.3mf` artifact and uses a fixed agent-side start profile.

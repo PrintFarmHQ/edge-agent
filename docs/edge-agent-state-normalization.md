@@ -15,6 +15,12 @@ Agent state pushes use only:
 
 These values are provider-agnostic and stable.
 
+Auxiliary state fields can remain provider-specific when they do not affect the canonical
+runtime state machine. `manual_intervention` is one of those fields: it should be sent as a
+lowercase snake_case token such as `canceled`, `stopped`, `hms_alert`, or `print_error`.
+SaaS may assign special behavior to `canceled` and `stopped`, but it must preserve other
+vendor-specific tokens instead of rejecting the whole state batch.
+
 ## Provider Mapping
 
 ### Moonraker / Klipper
@@ -36,6 +42,17 @@ These values are provider-agnostic and stable.
 - `ACTIVE` / `IDLE` / `READY` / `STANDBY` / `COMPLETED` / `FINISHED` -> `idle / completed`
 
 For runtime snapshots, if a Bambu cloud device is offline, the agent returns connectivity failure for that binding so SaaS can project printer offline.
+
+### Bambu LAN MQTT
+
+- `RUNNING` / `PRINTING` -> `printing / printing`
+- `PAUSE` / `PAUSED` -> `paused / printing`
+- `PREPARE` / `PREPARING` / `SLICING` / `DOWNLOADING` -> `queued / pending`
+- `FAILED` / `ERROR` -> `error / failed`, unless the payload also says the printer is otherwise idle (`print_type=idle`, `task_id=0`, empty `gcode_file`, and no HMS/print_error). In that stale-idle case, normalize to `idle / pending`.
+- `FINISH` / `FINISHED` -> `idle / completed`
+- `IDLE` -> `idle / pending`, unless the printer has just transitioned from an active PrintFarm-managed print, in which case edge-agent emits a one-shot `completed` job state so SaaS can activate cleanup confirmation.
+- When edge-agent restarts during an active Bambu print, it rehydrates the active desired job/plate identity onto the resumed `printing` snapshot so SaaS can clear the start watchdog instead of showing a false stalled-start warning.
+- For adopted Bambu printers, edge-agent uses a dedicated short live-runtime timeout for local MQTT snapshots. It tolerates one transient live MQTT runtime miss by falling back to the recent LAN discovery cache. After 2 consecutive live runtime connectivity failures, it stops trusting discovery cache and pushes `connectivity_error` so SaaS can mark the printer unreachable in near real time.
 
 ## Discovery vs Runtime
 

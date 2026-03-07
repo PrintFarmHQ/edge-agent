@@ -48,8 +48,9 @@ func (defaultBambuPrintCommandPublisher) PublishPrintCommand(ctx context.Context
 		dialer.Deadline = deadline
 	}
 	conn, err := tls.DialWithDialer(dialer, "tcp", brokerAddr, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ServerName: strings.TrimSpace(host),
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         strings.TrimSpace(host),
+		InsecureSkipVerify: req.InsecureSkipVerify,
 	})
 	if err != nil {
 		return fmt.Errorf("bambu mqtt connection failed: %w", err)
@@ -183,6 +184,98 @@ func writeMQTTPublish(conn net.Conn, topic string, payload []byte) error {
 		return fmt.Errorf("bambu mqtt publish failed: %w", err)
 	}
 	return nil
+}
+
+func writeMQTTSubscribe(conn net.Conn, topic string, packetID uint16) error {
+	trimmedTopic := strings.TrimSpace(topic)
+	if trimmedTopic == "" {
+		return errors.New("validation_error: missing mqtt topic")
+	}
+	var body bytes.Buffer
+	body.WriteByte(byte(packetID >> 8))
+	body.WriteByte(byte(packetID))
+	body.Write(encodeMQTTUTF8(trimmedTopic))
+	body.WriteByte(0x00)
+
+	packet := []byte{0x82}
+	packet = append(packet, encodeMQTTRemainingLength(body.Len())...)
+	packet = append(packet, body.Bytes()...)
+
+	if _, err := conn.Write(packet); err != nil {
+		return fmt.Errorf("bambu mqtt subscribe failed: %w", err)
+	}
+	return nil
+}
+
+func readMQTTSubAck(conn net.Conn, packetID uint16) error {
+	header, payload, err := readMQTTPacket(conn)
+	if err != nil {
+		return fmt.Errorf("bambu mqtt suback read failed: %w", err)
+	}
+	if header != 0x90 {
+		return fmt.Errorf("bambu mqtt suback invalid header 0x%x", header)
+	}
+	if len(payload) < 3 {
+		return fmt.Errorf("bambu mqtt suback payload too short: %d", len(payload))
+	}
+	gotPacketID := uint16(payload[0])<<8 | uint16(payload[1])
+	if gotPacketID != packetID {
+		return fmt.Errorf("bambu mqtt suback packet id = %d, want %d", gotPacketID, packetID)
+	}
+	if payload[2] == 0x80 {
+		return errors.New("bambu mqtt broker rejected subscription")
+	}
+	return nil
+}
+
+func readMQTTPacket(conn net.Conn) (byte, []byte, error) {
+	header := make([]byte, 1)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return 0, nil, err
+	}
+	remaining, err := readMQTTRemainingLength(conn)
+	if err != nil {
+		return 0, nil, err
+	}
+	payload := make([]byte, remaining)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return 0, nil, err
+	}
+	return header[0], payload, nil
+}
+
+type mqttPublishPacket struct {
+	Topic   string
+	Payload []byte
+}
+
+func decodeMQTTPublishPacket(header byte, packet []byte) (mqttPublishPacket, error) {
+	if header>>4 != 0x03 {
+		return mqttPublishPacket{}, fmt.Errorf("not a publish packet: 0x%x", header)
+	}
+	if len(packet) < 2 {
+		return mqttPublishPacket{}, errors.New("mqtt publish packet too short")
+	}
+	topicLength := int(packet[0])<<8 | int(packet[1])
+	if len(packet) < 2+topicLength {
+		return mqttPublishPacket{}, errors.New("mqtt publish packet missing topic")
+	}
+	topic := string(packet[2 : 2+topicLength])
+	offset := 2 + topicLength
+	qos := (header >> 1) & 0x03
+	if qos > 0 {
+		if len(packet) < offset+2 {
+			return mqttPublishPacket{}, errors.New("mqtt publish packet missing packet identifier")
+		}
+		offset += 2
+	}
+	if len(packet) < offset {
+		return mqttPublishPacket{}, errors.New("mqtt publish packet invalid payload offset")
+	}
+	return mqttPublishPacket{
+		Topic:   topic,
+		Payload: append([]byte(nil), packet[offset:]...),
+	}, nil
 }
 
 func encodeMQTTUTF8(value string) []byte {
