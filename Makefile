@@ -2,6 +2,8 @@
 
 BIN_DIR := $(CURDIR)/bin
 BIN_PATH := $(BIN_DIR)/edge-agent
+WEBUI_DIR := $(CURDIR)/webui
+WEBUI_BUILD_SCRIPT := $(WEBUI_DIR)/build.sh
 EDGE_STATE_DIR ?= $(HOME)/.printfarmhq
 BOOTSTRAP_CONFIG_PATH ?= $(EDGE_STATE_DIR)/bootstrap/config.json
 AUDIT_LOG_PATH ?= $(EDGE_STATE_DIR)/logs/audit.log
@@ -29,15 +31,19 @@ GOMODCACHE ?= $(CURDIR)/.cache/go-mod
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build dev down test
+.PHONY: help webui-build build dev down test
 
 help: ## Show available edge-agent commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\033[36m%-10s\033[0m %s\n", "Command", "Description"} /^[a-zA-Z0-9_.-]+:.*?##/ { printf "\033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 build: ## Build local edge-agent binary (bin/edge-agent)
 	@mkdir -p "$(BIN_DIR)" "$(GOCACHE)" "$(GOMODCACHE)"
+	@$(MAKE) --no-print-directory webui-build
 	@GOCACHE="$(GOCACHE)" GOMODCACHE="$(GOMODCACHE)" CGO_ENABLED=0 go build -o "$(BIN_PATH)" ./cmd/edge-agent
 	@echo "Built native binary: $(BIN_PATH)"
+
+webui-build: ## Refresh embedded local web UI assets
+	@sh "$(WEBUI_BUILD_SCRIPT)"
 
 dev: ## Build and run edge-agent in foreground (Ctrl+C to stop)
 	@$(MAKE) --no-print-directory build
@@ -110,4 +116,5 @@ down: ## Stop all local edge-agent processes by name
 
 test: ## Run edge-agent tests
 	@mkdir -p "$(GOCACHE)" "$(GOMODCACHE)"
+	@$(MAKE) --no-print-directory webui-build
 	@GOCACHE="$(GOCACHE)" GOMODCACHE="$(GOMODCACHE)" go test ./...

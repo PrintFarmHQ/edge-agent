@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PrintFarmHQ Edge Local View</title>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+      <symbol id="icon-printer" viewBox="0 0 32 32">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+          d="M8 12V4h16v8M8 24H4V14h24v10h-4M8 20h16v8H8z"/>
+        <line x1="12" y1="25" x2="20" y2="25" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="icon-printer-bambu" viewBox="0 0 32 32">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+          d="M6 6h20v20H6zM6 10h20M10 6v4M22 6v4M11 16l5 8 5-8"/>
+        <circle cx="16" cy="14" r="1.5" fill="currentColor"/>
+      </symbol>
+    </svg>
+
+    <div class="app-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <h1>PrintFarmHQ Edge Agent</h1>
+          <p class="hero-text" id="hero-text">A clean read-only view of what this edge-agent can currently see on your network.</p>
+        </div>
+        <div class="hero-side">
+          <div class="connection-chip" id="connection-chip" data-status="not_connected">
+            <span id="connection-chip-label">Not connected to SaaS</span>
+          </div>
+          <div class="scan-chip" id="scan-chip" data-running="false">
+            <span class="scan-dot"></span>
+            <span id="scan-chip-label">Waiting for first scan</span>
+          </div>
+          <button class="refresh-button" id="refresh-button" type="button">Refresh scan</button>
+        </div>
+      </header>
+
+      <section class="banner hidden" id="status-banner"></section>
+
+      <section class="connect-panel hidden" id="connect-panel">
+        <div class="connect-panel-copy">
+          <p class="summary-label">Control plane</p>
+          <h2 id="connect-title">Connect edge-agent to PrintFarmHQ SaaS</h2>
+          <p class="connect-text" id="connect-text">Paste a valid API key to continue.</p>
+        </div>
+        <form class="connect-form" id="connect-form">
+          <label class="connect-label" for="api-key-input">API key</label>
+          <input class="connect-input" id="api-key-input" name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="pfh_edge_..." required>
+          <button class="connect-button" id="connect-button" type="submit">Connect</button>
+          <p class="connect-error hidden" id="connect-error"></p>
+        </form>
+      </section>
+
+      <section class="skeleton-grid" id="skeleton-summary">
+        <div class="skeleton-card"><div class="skeleton-line skeleton-line-label"></div><div class="skeleton-line skeleton-line-value"></div></div>
+        <div class="skeleton-card"><div class="skeleton-line skeleton-line-label"></div><div class="skeleton-line skeleton-line-value"></div></div>
+        <div class="skeleton-card"><div class="skeleton-line skeleton-line-label"></div><div class="skeleton-line skeleton-line-value"></div></div>
+        <div class="skeleton-card"><div class="skeleton-line skeleton-line-label"></div><div class="skeleton-line skeleton-line-value"></div></div>
+        <div class="skeleton-card"><div class="skeleton-line skeleton-line-label"></div><div class="skeleton-line skeleton-line-value"></div></div>
+      </section>
+
+      <section class="summary-grid hidden" id="summary-grid">
+        <article class="summary-card">
+          <p class="summary-label">Available</p>
+          <p class="summary-value" id="available-count">0</p>
+        </article>
+        <article class="summary-card summary-card-busy">
+          <p class="summary-label">Busy</p>
+          <p class="summary-value" id="busy-count">0</p>
+        </article>
+        <article class="summary-card summary-card-error">
+          <p class="summary-label">Error</p>
+          <p class="summary-value" id="error-count">0</p>
+        </article>
+        <article class="summary-card summary-card-history">
+          <p class="summary-label">Recently disconnected</p>
+          <p class="summary-value" id="disconnected-count">0</p>
+        </article>
+        <article class="summary-card summary-card-meta">
+          <p class="summary-label">Agent</p>
+          <p class="summary-meta" id="agent-meta">Scanning local network</p>
+          <p class="summary-subtle" id="scan-meta">No scan data yet</p>
+        </article>
+      </section>
+
+      <main class="board hidden" id="board">
+        <section class="group" id="group-available">
+          <div class="group-header">
+            <h2>Available</h2>
+            <p>Reachable printers that are idle and ready.</p>
+          </div>
+          <div class="card-grid" id="available-grid"></div>
+          <div class="empty-group hidden" id="available-empty">No reachable printers yet.</div>
+        </section>
+
+        <section class="group" id="group-busy">
+          <div class="group-header">
+            <h2>Busy</h2>
+            <p>Reachable printers that are printing, calibrating, queued, or paused.</p>
+          </div>
+          <div class="card-grid" id="busy-grid"></div>
+          <div class="empty-group hidden" id="busy-empty">No printers are currently busy.</div>
+        </section>
+
+        <section class="group" id="group-error">
+          <div class="group-header">
+            <h2>Error</h2>
+            <p>Reachable printers reporting an observed error state.</p>
+          </div>
+          <div class="card-grid" id="error-grid"></div>
+          <div class="empty-group hidden" id="error-empty">No reachable printers in error.</div>
+        </section>
+
+        <section class="group" id="group-disconnected">
+          <div class="group-header">
+            <h2>Recently disconnected</h2>
+            <p>Printers seen recently by this process but not reachable right now.</p>
+          </div>
+          <div class="card-grid" id="disconnected-grid"></div>
+          <div class="empty-group hidden" id="disconnected-empty">Nothing has dropped off recently.</div>
+        </section>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <a href="https://app.printfarmhq.io" target="_blank" rel="noopener" class="footer-brand">
+        <img src="/assets/logo.png" alt="PrintFarmHQ" class="footer-logo" width="24" height="24">
+        <span class="footer-name">printfarmhq.io</span>
+      </a>
+    </footer>
+
+    <template id="printer-card-template">
+      <article class="printer-card">
+        <div class="printer-card-top">
+          <div class="printer-card-identity">
+            <svg width="32" height="32" class="printer-icon"><use href="#icon-printer"/></svg>
+            <div>
+              <p class="printer-kicker"></p>
+              <h3 class="printer-name"></h3>
+            </div>
+          </div>
+          <span class="status-pill"></span>
+        </div>
+        <p class="printer-detail"></p>
+        <div class="printer-badges">
+          <span class="badge badge-source"></span>
+          <span class="badge badge-host"></span>
+        </div>
+        <dl class="printer-meta">
+          <div>
+            <dt>Last seen</dt>
+            <dd class="meta-last-seen"></dd>
+          </div>
+          <div>
+            <dt>Observed state</dt>
+            <dd class="meta-state"></dd>
+          </div>
+        </dl>
+      </article>
+    </template>
+
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

@@ -81,7 +81,7 @@ func (defaultBambuPrintCommandPublisher) PublishPrintCommand(ctx context.Context
 	return nil
 }
 
-func buildBambuMQTTPayload(command string, param map[string]any) ([]byte, error) {
+func buildBambuMQTTPayload(command string, param any) ([]byte, error) {
 	trimmed := strings.TrimSpace(command)
 	if trimmed == "" {
 		return nil, errors.New("validation_error: missing bambu mqtt command")
@@ -90,18 +90,26 @@ func buildBambuMQTTPayload(command string, param map[string]any) ([]byte, error)
 		"command":     trimmed,
 		"sequence_id": strconv.FormatInt(time.Now().UnixMilli(), 10),
 	}
-	if len(param) > 0 {
-		cleanParam := make(map[string]any, len(param))
-		for key, value := range param {
-			trimmedKey := strings.TrimSpace(key)
-			if trimmedKey == "" {
-				continue
+	switch typed := param.(type) {
+	case nil:
+	case string:
+		printPayload["param"] = typed
+	case map[string]any:
+		if len(typed) > 0 {
+			cleanParam := make(map[string]any, len(typed))
+			for key, value := range typed {
+				trimmedKey := strings.TrimSpace(key)
+				if trimmedKey == "" {
+					continue
+				}
+				cleanParam[trimmedKey] = value
 			}
-			cleanParam[trimmedKey] = value
+			if len(cleanParam) > 0 {
+				printPayload["param"] = cleanParam
+			}
 		}
-		if len(cleanParam) > 0 {
-			printPayload["param"] = cleanParam
-		}
+	default:
+		printPayload["param"] = typed
 	}
 	payload := map[string]any{
 		"print": printPayload,

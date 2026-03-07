@@ -49,10 +49,7 @@ func (a *agent) executeBambuLANPrintAction(ctx context.Context, queuedAction act
 	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
 	if err != nil {
 		if isBambuLANCredentialsUnavailable(err) {
-			return fmt.Errorf(
-				"validation_error: bambu lan print start requires a locally stored printer access code for %q",
-				strings.TrimSpace(printerID),
-			)
+			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
 		}
 		return err
 	}
@@ -175,6 +172,10 @@ func (a *agent) executeBambuLANPrintAction(ctx context.Context, queuedAction act
 		})
 		return err
 	}
+
+	// Project a queued runtime state immediately so SaaS treats calibration/preparation
+	// as an in-progress start instead of an overdue start that never began.
+	a.markPrintStartInProgress(queuedAction)
 
 	if err := a.verifyBambuPrintStart(ctx, strings.TrimSpace(printerID)); err != nil {
 		return fmt.Errorf("bambu_start_verification_timeout: %w", err)

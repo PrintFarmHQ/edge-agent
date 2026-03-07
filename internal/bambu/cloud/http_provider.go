@@ -23,6 +23,7 @@ const defaultUploadPath = "/v1/iot-service/api/user/upload"
 const defaultPrintPath = "/v1/iot-service/api/user/print"
 
 var ErrPrintStartUnsupported = errors.New("bambu print start endpoint unsupported")
+var ErrPrintStartMetadataUnresolved = errors.New("bambu print start metadata unresolved")
 
 type HTTPProviderConfig struct {
 	AuthBaseURL  string
@@ -95,13 +96,16 @@ type CloudUploadURLs struct {
 	FileURL       string
 	FileName      string
 	FileID        string
+	UploadTicket  string
 }
 
 type CloudPrintStartRequest struct {
-	DeviceID string
-	FileName string
-	FileURL  string
-	FileID   string
+	DeviceID      string
+	FileName      string
+	FileURL       string
+	FileID        string
+	UploadTicket  string
+	UploadFileURL string
 }
 
 type cloudDevicePayload struct {

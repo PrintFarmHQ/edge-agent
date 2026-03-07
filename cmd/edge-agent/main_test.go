@@ -44,22 +44,25 @@ func newTestAgent(t *testing.T) *agent {
 			ArtifactUploadTimeout:      2 * time.Second,
 			ArtifactDownloadTimeout:    2 * time.Second,
 			CircuitBreakerCooldown:     2 * time.Second,
+			LocalUIScanInterval:        15 * time.Second,
 		},
-		client:             &http.Client{Timeout: 2 * time.Second},
-		desiredState:       make(map[int]desiredStateItem),
-		bindings:           make(map[int]edgeBinding),
-		currentState:       make(map[int]currentStateItem),
-		actionQueue:        make(map[int][]action),
-		inflightActions:    make(map[int]action),
-		deadLetters:        make(map[int][]action),
-		queuedSince:        make(map[int]time.Time),
-		recentEnqueue:      make(map[string]time.Time),
-		suppressedUntil:    make(map[string]time.Time),
-		breakerUntil:       make(map[int]time.Time),
-		discoverySeeds:     make(map[string]time.Time),
-		bambuLANRecords:    make(map[string]bambuLANDiscoveryRecord),
-		bambuLANFailures:   make(map[string]int),
-		bambuLANProbeHosts: make(map[string]time.Time),
+		client:                &http.Client{Timeout: 2 * time.Second},
+		desiredState:          make(map[int]desiredStateItem),
+		bindings:              make(map[int]edgeBinding),
+		currentState:          make(map[int]currentStateItem),
+		actionQueue:           make(map[int][]action),
+		inflightActions:       make(map[int]action),
+		deadLetters:           make(map[int][]action),
+		queuedSince:           make(map[int]time.Time),
+		recentEnqueue:         make(map[string]time.Time),
+		suppressedUntil:       make(map[string]time.Time),
+		breakerUntil:          make(map[int]time.Time),
+		discoverySeeds:        make(map[string]time.Time),
+		bambuLANRecords:       make(map[string]bambuLANDiscoveryRecord),
+		bambuLANFailures:      make(map[string]int),
+		bambuLANRecoveryUntil: make(map[int]time.Time),
+		bambuLANProbeHosts:    make(map[string]time.Time),
+		localObservations:     newLocalObservationStore(),
 	}
 }
 
@@ -408,27 +411,8 @@ func TestBambuAuthStartupUsesStoredValidToken(t *testing.T) {
 	if loginCalled || refreshCalled {
 		t.Fatalf("provider should not be called when stored token is still valid")
 	}
-	if store.saveCnt != 1 {
-		t.Fatalf("store save count = %d, want 1 (cloud device id backfill)", store.saveCnt)
-	}
-	if strings.TrimSpace(store.last.CloudDeviceID) == "" {
-		t.Fatalf("saved cloud device id should not be empty")
-	}
-	if !strings.HasPrefix(store.last.CloudDeviceID, "bambu-cloud-client-") {
-		t.Fatalf("saved cloud device id = %q, want bambu-cloud-client-*", store.last.CloudDeviceID)
-	}
-}
-
-func TestResolveBambuCloudClientDeviceIDPrefersStoredValue(t *testing.T) {
-	a := newTestAgent(t)
-	store := &memoryBambuCredentialsStore{
-		loaded: bambustore.BambuCredentials{
-			CloudDeviceID: "pfh-cloud-device-123",
-		},
-	}
-	got := a.resolveBambuCloudClientDeviceID(context.Background(), store)
-	if got != "pfh-cloud-device-123" {
-		t.Fatalf("cloud client device id = %q, want pfh-cloud-device-123", got)
+	if store.saveCnt != 0 {
+		t.Fatalf("store save count = %d, want 0", store.saveCnt)
 	}
 }
 
@@ -820,6 +804,7 @@ func TestMapDesiredToAction(t *testing.T) {
 	}{
 		{name: "start print", current: "idle", desired: "printing", want: "print"},
 		{name: "pause print", current: "printing", desired: "paused", want: "pause"},
+		{name: "wait to pause while queued", current: "queued", desired: "paused", want: "noop"},
 		{name: "resume print", current: "paused", desired: "printing", want: "resume"},
 		{name: "stop print", current: "printing", desired: "idle", want: "stop"},
 		{name: "noop printing", current: "printing", desired: "printing", want: "noop"},
@@ -1179,7 +1164,7 @@ func TestReconcileSkipsEnqueueWhenEquivalentActionInflight(t *testing.T) {
 	}
 }
 
-func TestRefreshCurrentStateFromBindingsBambuLANMissMarksConnectivityError(t *testing.T) {
+func TestRefreshCurrentStateFromBindingsBambuLANMissMarksAuthError(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
 	a.bindings[1] = edgeBinding{
@@ -1197,14 +1182,14 @@ func TestRefreshCurrentStateFromBindingsBambuLANMissMarksConnectivityError(t *te
 	a.refreshCurrentStateFromBindings(context.Background())
 
 	current := a.currentState[1]
-	if current.LastErrorCode != "connectivity_error" {
-		t.Fatalf("last_error_code = %q, want connectivity_error", current.LastErrorCode)
+	if current.LastErrorCode != "auth_error" {
+		t.Fatalf("last_error_code = %q, want auth_error", current.LastErrorCode)
 	}
 	if current.CurrentPrinterState != "idle" {
 		t.Fatalf("current_printer_state = %q, want idle", current.CurrentPrinterState)
 	}
-	if current.CurrentJobState != "completed" {
-		t.Fatalf("current_job_state = %q, want completed", current.CurrentJobState)
+	if !strings.Contains(strings.ToLower(current.LastErrorMessage), "bambu_lan_credentials_missing_local") {
+		t.Fatalf("last_error_message = %q, want bambu_lan_credentials_missing_local", current.LastErrorMessage)
 	}
 }
 
@@ -1322,6 +1307,76 @@ func TestRefreshCurrentStateFromBindingsBambuUsesDiscoveryFallbackOnceBeforeConn
 	}
 	if !strings.Contains(current.LastErrorMessage, "i/o timeout") {
 		t.Fatalf("second failure last_error_message = %q, want timeout", current.LastErrorMessage)
+	}
+}
+
+func TestRefreshCurrentStateFromBindingsBambuInflightPrintSuppressesTransientConnectivityMisses(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-lan-runtime",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-lan-runtime",
+	}
+	a.currentState[1] = currentStateItem{
+		PrinterID:           1,
+		CurrentPrinterState: "idle",
+		CurrentJobState:     "pending",
+		ReportedAt:          time.Now().UTC().Add(-1 * time.Minute),
+	}
+	a.inflightActions[1] = action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-1",
+			PlateID:             7,
+			IntentVersion:       3,
+		},
+	}
+	a.recordBambuLANRuntimeSnapshot("printer-lan-runtime", "192.168.100.172", bindingSnapshot{
+		PrinterState:     "idle",
+		JobState:         "pending",
+		TelemetrySource:  telemetrySourceBambuLANMQTT,
+		RawPrinterStatus: "IDLE",
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		return bindingSnapshot{}, errors.New("bambu lan mqtt read failed: read tcp 192.168.100.157:51394->192.168.100.172:8883: i/o timeout")
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	a.refreshCurrentStateFromBindings(context.Background())
+	a.refreshCurrentStateFromBindings(context.Background())
+	a.refreshCurrentStateFromBindings(context.Background())
+
+	current := a.currentState[1]
+	if current.LastErrorCode != "" {
+		t.Fatalf("suppressed inflight failure last_error_code = %q, want empty", current.LastErrorCode)
+	}
+	if current.CurrentPrinterState != "idle" {
+		t.Fatalf("suppressed inflight failure current_printer_state = %q, want idle", current.CurrentPrinterState)
+	}
+	if got := a.bambuLANFailures["printer-lan-runtime"]; got != 0 {
+		t.Fatalf("failure counter = %d, want 0 while print start is inflight", got)
 	}
 }
 
@@ -1499,6 +1554,66 @@ func TestRefreshCurrentStateFromBindingsHydratesBambuActiveIntentIdentity(t *tes
 	}
 }
 
+func TestRefreshCurrentStateFromBindingsHydratesMoonrakerActiveIntentIdentity(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableKlipper = true
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "moonraker",
+		EndpointURL:   "http://moonraker.local:7125",
+	}
+	a.desiredState[1] = desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       43,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-2",
+		PlateID:             8,
+	}
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/printer/objects/subscribe":
+			_, _ = w.Write([]byte(`{"result":{"status":{"print_stats":{"state":"printing"}}}}`))
+		case "/printer/objects/query":
+			_, _ = w.Write([]byte(`{"result":{"status":{"print_stats":{"state":"printing","filename":"part.gcode","total_duration":1200,"print_duration":600},"display_status":{"progress":0.5}}}}`))
+		case "/server/files/metadata":
+			_, _ = w.Write([]byte(`{"result":{"estimated_time":1200}}`))
+		case "/server/history/totals":
+			_, _ = w.Write([]byte(`{"result":{"job_totals":{"total_print_time":600}}}`))
+		case "/machine/system_info":
+			_, _ = w.Write([]byte(`{"result":{"system_info":{"product_info":{"machine_type":"Voron","device_name":"Forge Moon"}}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "moonraker",
+		EndpointURL:   moonrakerSrv.URL,
+	}
+
+	a.refreshCurrentStateFromBindings(context.Background())
+
+	current := a.currentState[1]
+	if current.CurrentPrinterState != "printing" {
+		t.Fatalf("current_printer_state = %q, want printing", current.CurrentPrinterState)
+	}
+	if current.JobID != "job-2" {
+		t.Fatalf("job_id = %q, want job-2", current.JobID)
+	}
+	if current.PlateID != 8 {
+		t.Fatalf("plate_id = %d, want 8", current.PlateID)
+	}
+	if current.IntentVersionApplied != 43 {
+		t.Fatalf("intent_version_applied = %d, want 43", current.IntentVersionApplied)
+	}
+	if current.ProgressPct == nil || *current.ProgressPct != 50 {
+		t.Fatalf("progress_pct = %v, want 50", current.ProgressPct)
+	}
+}
+
 func TestReconcileQueuedStaleRequestsResync(t *testing.T) {
 	a := newTestAgent(t)
 	a.bindings[1] = edgeBinding{PrinterID: 1, EndpointURL: "http://moonraker:7125"}
@@ -1604,11 +1719,11 @@ func TestClassifyActionError(t *testing.T) {
 		{name: "artifact", err: errors.New("artifact_fetch_error: checksum mismatch"), wantCode: "artifact_fetch_error", wantRetry: false},
 		{name: "bambu start unsupported sentinel", err: fmt.Errorf("wrapped: %w", bambucloud.ErrPrintStartUnsupported), wantCode: "bambu_start_rejected", wantRetry: false},
 		{name: "bambu start rejected tagged", err: errors.New("bambu_start_rejected: cloud start unsupported"), wantCode: "bambu_start_rejected", wantRetry: false},
-		{name: "bambu start metadata unresolved sentinel", err: fmt.Errorf("wrapped: %w", bambucloud.ErrPrintStartMetadataUnresolved), wantCode: "bambu_start_metadata_unresolved", wantRetry: false},
 		{name: "bambu start metadata unresolved tagged", err: errors.New("bambu_start_metadata_unresolved: missing profileId"), wantCode: "bambu_start_metadata_unresolved", wantRetry: false},
 		{name: "bambu auth invalid credentials sentinel", err: fmt.Errorf("wrapped: %w", bambuauth.ErrInvalidCredentials), wantCode: "auth_error", wantRetry: false},
 		{name: "bambu auth rejected token", err: errors.New("bambu print start rejected access token"), wantCode: "auth_error", wantRetry: false},
 		{name: "bambu mqtt auth reject", err: errors.New("bambu mqtt broker rejected connection return_code=5"), wantCode: "auth_error", wantRetry: false},
+		{name: "bambu lan local credentials missing", err: errors.New("bambu_lan_credentials_missing_local: open lan_credentials.json: no such file or directory"), wantCode: "auth_error", wantRetry: false},
 		{name: "bambu connect manual handoff required", err: errors.New("bambu_start_manual_handoff_required: Bambu Connect import dispatched but printer \"abc\" did not enter queued/printing state"), wantCode: "bambu_start_manual_handoff_required", wantRetry: false},
 		{name: "bambu start verification timeout", err: errors.New("bambu_start_verification_timeout: connection error: bambu print start verification timeout after 20s"), wantCode: "bambu_start_verification_timeout", wantRetry: false},
 		{name: "validation", err: errors.New("validation failed"), wantCode: "validation_error", wantRetry: false},
@@ -4492,6 +4607,255 @@ func TestExecuteActionBambuPrintUsesLANStartWhenCredentialsAvailable(t *testing.
 	}
 }
 
+func TestRequestBambuLANCredentialRecoveryUsesAuthenticatedBoundRequest(t *testing.T) {
+	a := newTestAgent(t)
+	var (
+		gotAuthHeader   string
+		gotSchemaHeader string
+		gotPayload      bambuCredentialRecoveryRequest
+		callCount       int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotSchemaHeader = r.Header.Get("X-Agent-Schema-Version")
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/edge/agents/agent-1/bambu-credentials/recover" {
+			t.Fatalf("path = %s, want /edge/agents/agent-1/bambu-credentials/recover", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(bambuCredentialRecoveryResponse{
+			Accepted:       true,
+			RecoveryQueued: true,
+			PrinterID:      22,
+			AgentID:        "agent-1",
+			EndpointURL:    "bambu://serial-1",
+			CommandID:      9,
+		})
+	}))
+	defer srv.Close()
+	a.client = srv.Client()
+	a.mu.Lock()
+	a.claimed = true
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: srv.URL,
+		SaaSAPIKey:      "pfh_edge_test",
+		AgentID:         "agent-1",
+	}
+	a.mu.Unlock()
+
+	queued, err := a.requestBambuLANCredentialRecovery(context.Background(), edgeBinding{
+		PrinterID:     22,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://serial-1",
+	})
+	if err != nil {
+		t.Fatalf("requestBambuLANCredentialRecovery failed: %v", err)
+	}
+	if !queued {
+		t.Fatalf("expected recovery to be queued")
+	}
+	if callCount != 1 {
+		t.Fatalf("call count = %d, want 1", callCount)
+	}
+	if gotAuthHeader != "Bearer pfh_edge_test" {
+		t.Fatalf("Authorization = %q, want bearer api key", gotAuthHeader)
+	}
+	if gotSchemaHeader != schemaVersionHeaderValue() {
+		t.Fatalf("X-Agent-Schema-Version = %q, want %q", gotSchemaHeader, schemaVersionHeaderValue())
+	}
+	if gotPayload.PrinterID != 22 {
+		t.Fatalf("printer_id = %d, want 22", gotPayload.PrinterID)
+	}
+	if gotPayload.EndpointURL != "bambu://serial-1" {
+		t.Fatalf("endpoint_url = %q, want bambu://serial-1", gotPayload.EndpointURL)
+	}
+
+	queued, err = a.requestBambuLANCredentialRecovery(context.Background(), edgeBinding{
+		PrinterID:     22,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://serial-1",
+	})
+	if err != nil {
+		t.Fatalf("second requestBambuLANCredentialRecovery failed: %v", err)
+	}
+	if queued {
+		t.Fatalf("expected second recovery request to be suppressed by cooldown")
+	}
+	if callCount != 1 {
+		t.Fatalf("call count after cooldown suppression = %d, want 1", callCount)
+	}
+}
+
+func TestExecuteActionBambuPrintRequestsCredentialRecoveryWhenLocalCredentialsMissing(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	var callCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if r.URL.Path != "/edge/agents/agent-1/bambu-credentials/recover" {
+			t.Fatalf("path = %s, want /edge/agents/agent-1/bambu-credentials/recover", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(bambuCredentialRecoveryResponse{
+			Accepted:       true,
+			RecoveryQueued: true,
+			PrinterID:      1,
+			AgentID:        "agent-1",
+			EndpointURL:    "bambu://printer_1",
+			CommandID:      11,
+		})
+	}))
+	defer srv.Close()
+	a.client = srv.Client()
+	a.mu.Lock()
+	a.claimed = true
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: srv.URL,
+		SaaSAPIKey:      "pfh_edge_test",
+		AgentID:         "agent-1",
+	}
+	a.mu.Unlock()
+
+	err := a.executeAction(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "print",
+			Target: desiredStateItem{
+				PrinterID:           1,
+				PlateID:             24,
+				IntentVersion:       10,
+				DesiredPrinterState: "printing",
+				DesiredJobState:     "printing",
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err == nil {
+		t.Fatalf("expected missing bambu lan credentials to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "recovery requested") {
+		t.Fatalf("error = %v, want recovery requested guidance", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("recovery request count = %d, want 1", callCount)
+	}
+}
+
+func TestExecuteBambuLANPrintActionMarksQueuedBeforeVerificationCompletes(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifact := []byte("3mf-bytes")
+	sum := sha256.Sum256(artifact)
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	previousUpload := uploadBambuLANArtifact
+	uploadBambuLANArtifact = func(_ context.Context, _ bambustore.BambuLANCredentials, _ string, _ []byte) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		uploadBambuLANArtifact = previousUpload
+	})
+
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, _ bambuLANProjectFileRequest) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	verificationStarted := make(chan struct{}, 1)
+	releaseVerification := make(chan struct{})
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		select {
+		case verificationStarted <- struct{}{}:
+		default:
+		}
+		<-releaseVerification
+		return bindingSnapshot{
+			PrinterState:    "printing",
+			JobState:        "printing",
+			TelemetrySource: telemetrySourceBambuLANMQTT,
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             23,
+			IntentVersion:       9,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-123",
+			ArtifactURL:         artifactSrv.URL + "/plate.3mf",
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.executeBambuLANPrintAction(
+			context.Background(),
+			queuedAction,
+			edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+		)
+	}()
+
+	select {
+	case <-verificationStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for verification to start")
+	}
+
+	current := a.currentState[1]
+	if current.CurrentPrinterState != "queued" {
+		t.Fatalf("current_printer_state = %q, want queued", current.CurrentPrinterState)
+	}
+	if current.CurrentJobState != "pending" {
+		t.Fatalf("current_job_state = %q, want pending", current.CurrentJobState)
+	}
+	if current.JobID != "job-123" {
+		t.Fatalf("job_id = %q, want job-123", current.JobID)
+	}
+	if current.PlateID != 23 {
+		t.Fatalf("plate_id = %d, want 23", current.PlateID)
+	}
+
+	close(releaseVerification)
+	if err := <-errCh; err != nil {
+		t.Fatalf("executeBambuLANPrintAction failed: %v", err)
+	}
+}
+
 func TestExecuteActionBambuPrintRejectsMissingLANCredentials(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
@@ -4514,11 +4878,11 @@ func TestExecuteActionBambuPrintRejectsMissingLANCredentials(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected missing bambu lan credentials to fail")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "validation_error") {
-		t.Fatalf("error = %v, want validation_error", err)
+	if !strings.Contains(strings.ToLower(err.Error()), "bambu_lan_credentials_missing_local") {
+		t.Fatalf("error = %v, want bambu_lan_credentials_missing_local", err)
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "access code") {
-		t.Fatalf("error = %v, want access code guidance", err)
+	if !strings.Contains(strings.ToLower(err.Error()), "recovery") {
+		t.Fatalf("error = %v, want recovery guidance", err)
 	}
 }
 

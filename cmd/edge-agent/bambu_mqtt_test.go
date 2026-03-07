@@ -59,3 +59,22 @@ func TestBuildBambuMQTTPayloadDropsEmptyParamKeys(t *testing.T) {
 		t.Fatalf("expected param to be omitted when keys are empty")
 	}
 }
+
+func TestBuildBambuMQTTPayloadPreservesEmptyStringParam(t *testing.T) {
+	payload, err := buildBambuMQTTPayload("pause", "")
+	if err != nil {
+		t.Fatalf("buildBambuMQTTPayload failed: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode payload failed: %v", err)
+	}
+	printSection, ok := decoded["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing print section: %+v", decoded)
+	}
+	if printSection["param"] != "" {
+		t.Fatalf("param = %v, want empty string", printSection["param"])
+	}
+}

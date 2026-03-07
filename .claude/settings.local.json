@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(sh:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(ls:*)",
+      "Bash(sips:*)"
+    ]
+  }
+}

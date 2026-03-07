@@ -61,6 +61,9 @@ const (
 var agentSupportedSchemaVersions = []int{1, agentSchemaVersion}
 var errEdgeAuthRevoked = errors.New("edge_api_key_revoked")
 var errBambuAuthUnavailable = errors.New("validation_error: bambu auth is not ready")
+
+const bambuLANCredentialRecoveryCooldown = 30 * time.Second
+
 var macAddressPattern = regexp.MustCompile(`([0-9a-f]{1,2}([:-][0-9a-f]{1,2}){5})`)
 var cloudStartStatusPattern = regexp.MustCompile(`status=(\d{3})`)
 var cloudStartMethodEndpointPattern = regexp.MustCompile(`\b(GET|POST|PUT|PATCH|DELETE)\s+(https?://\S+)`)
@@ -151,6 +154,20 @@ type configCommandAckRequest struct {
 
 type configCommandAckResponse struct {
 	Accepted bool `json:"accepted"`
+}
+
+type bambuCredentialRecoveryRequest struct {
+	PrinterID   int    `json:"printer_id"`
+	EndpointURL string `json:"endpoint_url"`
+}
+
+type bambuCredentialRecoveryResponse struct {
+	Accepted       bool   `json:"accepted"`
+	RecoveryQueued bool   `json:"recovery_queued"`
+	PrinterID      int    `json:"printer_id"`
+	AgentID        string `json:"agent_id"`
+	EndpointURL    string `json:"endpoint_url"`
+	CommandID      int    `json:"command_id"`
 }
 
 type bambuLANCredentialsUpsertPayload struct {
@@ -429,6 +446,8 @@ type appConfig struct {
 	DiscoveryPollInterval       time.Duration
 	DiscoveryInventoryInterval  time.Duration
 	DiscoveryManualPollInterval time.Duration
+	LocalUIScanInterval         time.Duration
+	LocalUIBindAddr             string
 	DiscoveryProfileMax         string
 	DiscoveryNetworkMode        string
 	DiscoveryAllowedAdapters    []string
@@ -456,6 +475,10 @@ type agent struct {
 	bambuMQTTPublish  bambuPrintCommandPublisher
 	bambuAuthMu       sync.RWMutex
 	bambuAuth         bambuAuthState
+	controlPlaneMu    sync.RWMutex
+	controlPlane      localControlPlaneState
+	localWebUIMu      sync.RWMutex
+	localWebUIURL     string
 
 	mu              sync.RWMutex
 	bootstrap       bootstrapConfig
@@ -473,16 +496,18 @@ type agent struct {
 	resyncRequested bool
 	breakerUntil    map[int]time.Time
 
-	discoveryStateMu   sync.Mutex
-	discoveryRunning   bool
-	discoverySeedMu    sync.Mutex
-	discoverySeeds     map[string]time.Time
-	bambuLANMu         sync.Mutex
-	bambuLANRecords    map[string]bambuLANDiscoveryRecord
-	bambuLANFailures   map[string]int
-	bambuLANProbeHosts map[string]time.Time
+	discoveryStateMu      sync.Mutex
+	discoveryRunning      bool
+	discoverySeedMu       sync.Mutex
+	discoverySeeds        map[string]time.Time
+	bambuLANMu            sync.Mutex
+	bambuLANRecords       map[string]bambuLANDiscoveryRecord
+	bambuLANFailures      map[string]int
+	bambuLANRecoveryUntil map[int]time.Time
+	bambuLANProbeHosts    map[string]time.Time
 
-	auditMu sync.Mutex
+	localObservations *localObservationStore
+	auditMu           sync.Mutex
 }
 
 func main() {
@@ -494,27 +519,30 @@ func main() {
 	cfg := loadConfig()
 	cfg = applyRuntimeFlags(cfg, flags)
 	app := &agent{
-		cfg:                cfg,
-		client:             &http.Client{Timeout: 15 * time.Second},
-		desiredState:       make(map[int]desiredStateItem),
-		bindings:           make(map[int]edgeBinding),
-		currentState:       make(map[int]currentStateItem),
-		actionQueue:        make(map[int][]action),
-		inflightActions:    make(map[int]action),
-		deadLetters:        make(map[int][]action),
-		queuedSince:        make(map[int]time.Time),
-		recentEnqueue:      make(map[string]time.Time),
-		suppressedUntil:    make(map[string]time.Time),
-		breakerUntil:       make(map[int]time.Time),
-		discoverySeeds:     make(map[string]time.Time),
-		bambuLANRecords:    make(map[string]bambuLANDiscoveryRecord),
-		bambuLANFailures:   make(map[string]int),
-		bambuLANProbeHosts: make(map[string]time.Time),
+		cfg:                   cfg,
+		client:                &http.Client{Timeout: 15 * time.Second},
+		desiredState:          make(map[int]desiredStateItem),
+		bindings:              make(map[int]edgeBinding),
+		currentState:          make(map[int]currentStateItem),
+		actionQueue:           make(map[int][]action),
+		inflightActions:       make(map[int]action),
+		deadLetters:           make(map[int][]action),
+		queuedSince:           make(map[int]time.Time),
+		recentEnqueue:         make(map[string]time.Time),
+		suppressedUntil:       make(map[string]time.Time),
+		breakerUntil:          make(map[int]time.Time),
+		discoverySeeds:        make(map[string]time.Time),
+		bambuLANRecords:       make(map[string]bambuLANDiscoveryRecord),
+		bambuLANFailures:      make(map[string]int),
+		bambuLANRecoveryUntil: make(map[int]time.Time),
+		bambuLANProbeHosts:    make(map[string]time.Time),
+		localObservations:     newLocalObservationStore(),
 	}
+	bambuLANStoreWarning := ""
 	if cfg.EnableBambu {
 		lanStore, storeErr := bambustore.NewDefaultBambuLANCredentialsFileStore()
 		if storeErr != nil {
-			log.Printf("warning: failed to initialize bambu LAN credentials store: %v", storeErr)
+			bambuLANStoreWarning = storeErr.Error()
 		} else {
 			app.bambuLANStore = lanStore
 		}
@@ -523,17 +551,12 @@ func main() {
 	if err := app.loadBootstrapConfig(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Fatalf("failed to load bootstrap config: %v", err)
 	}
-	if err := app.cleanupStagedArtifacts(); err != nil {
-		log.Printf("artifact cleanup on startup failed: %v", err)
-	}
-	if err := app.bootstrapFromStartupCredentials(context.Background()); err != nil {
-		log.Fatalf("failed to bootstrap from startup credentials: %v", err)
+	if strings.TrimSpace(app.snapshotBootstrap().SaaSAPIKey) != "" {
+		app.recordControlPlaneAPIKeySeen()
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", app.handleHealth)
-	mux.HandleFunc("/setup/status", app.handleSetupStatus)
-	mux.HandleFunc("/setup/claim", app.handleSetupClaim)
+	app.registerRoutes(mux)
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -542,12 +565,65 @@ func main() {
 	defer signal.Stop(signalEvents)
 
 	// Attempt one bootstrap sync when restarting with persisted claim.
+	setupListener, err := net.Listen("tcp", cfg.SetupBindAddr)
+	if err != nil {
+		log.Fatalf("http server failed: %v", err)
+	}
+	server := &http.Server{Handler: mux}
+	go func() {
+		if err := server.Serve(setupListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http server failed: %v", err)
+		}
+	}()
+
+	var localUIServer *http.Server
+	localUIURL := ""
+	localUIPort := ""
+	localUIStartWarning := ""
+	if startedServer, uiURL, uiPort, err := app.startLocalWebUIServer(); err != nil {
+		localUIStartWarning = err.Error()
+	} else {
+		localUIServer = startedServer
+		app.setLocalWebUIURL(uiURL)
+		localUIURL = uiURL
+		localUIPort = uiPort
+	}
+
+	printStartupBanner(startupBannerInfo{
+		DashboardURL:    localUIURL,
+		DashboardPort:   localUIPort,
+		SetupURL:        "http://" + setupListener.Addr().String() + "/",
+		ControlPlaneURL: app.currentControlPlaneURL(),
+		EnabledAdapters: enabledDiscoveryAdapters(cfg.EnableKlipper, cfg.EnableBambu),
+		ShowAlertOnly:   !app.isClaimed() && strings.TrimSpace(cfg.StartupSaaSAPIKey) == "",
+		AlertMessage:    "Edge agent is NOT connected to control plane SaaS. Paste a valid API key in the dashboard.",
+	})
+	if bambuLANStoreWarning != "" {
+		log.Printf("warning: failed to initialize bambu LAN credentials store: %v", bambuLANStoreWarning)
+	}
+	if localUIStartWarning != "" {
+		log.Printf("warning: local web ui unavailable: %v", localUIStartWarning)
+	}
+	if err := app.cleanupStagedArtifacts(); err != nil {
+		log.Printf("warning: artifact cleanup on startup failed: %v", err)
+	}
+	if err := app.bootstrapFromStartupCredentials(context.Background()); err != nil {
+		log.Printf("warning: startup claim unavailable: %v", err)
+	}
+
+	// Attempt one bootstrap sync when restarting with persisted claim.
 	if app.isClaimed() {
 		app.bootstrapSync(rootCtx)
 	}
+	if localUIURL != "" {
+		status, _, _, _ := app.localControlPlaneSnapshot(time.Now().UTC())
+		if !isControlPlaneConnectedStatus(status) {
+			app.openBrowserForLocalDashboard(localUIURL)
+		}
+	}
 
 	var wg sync.WaitGroup
-	wg.Add(10)
+	wg.Add(11)
 	go app.bindingsPollLoop(rootCtx, &wg)
 	go app.configCommandsPollLoop(rootCtx, &wg)
 	go app.desiredStatePollLoop(rootCtx, &wg)
@@ -558,17 +634,7 @@ func main() {
 	go app.discoveryPollLoop(rootCtx, &wg)
 	go app.discoveryInventoryLoop(rootCtx, &wg)
 	go app.discoveryManualTriggerLoop(rootCtx, &wg)
-
-	server := &http.Server{
-		Addr:    cfg.SetupBindAddr,
-		Handler: mux,
-	}
-	go func() {
-		log.Printf("edge-agent listening on %s", cfg.SetupBindAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server failed: %v", err)
-		}
-	}()
+	go app.localObservationScanLoop(rootCtx, &wg)
 
 	<-rootCtx.Done()
 	receivedSignal := "unknown"
@@ -591,6 +657,9 @@ func main() {
 		app.audit("shutdown_notify_error", map[string]any{"error": err.Error()})
 	}
 	_ = server.Shutdown(shutdownCtx)
+	if localUIServer != nil {
+		_ = localUIServer.Shutdown(shutdownCtx)
+	}
 	wg.Wait()
 }
 
@@ -616,6 +685,7 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 	if apiKey == "" {
 		return nil
 	}
+	a.recordControlPlaneAPIKeySeen()
 
 	controlPlaneURL := strings.TrimSpace(a.cfg.StartupControlPlaneURL)
 	if controlPlaneURL == "" {
@@ -623,6 +693,8 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 		controlPlaneURL = strings.TrimSpace(existing.ControlPlaneURL)
 	}
 	if controlPlaneURL == "" {
+		a.clearClaimedState(controlPlaneURL)
+		a.recordControlPlaneFailure("Control plane URL is missing. Paste a valid API key and reconnect from the dashboard.")
 		return errors.New("control-plane-url is required when api key is provided")
 	}
 
@@ -633,16 +705,36 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 		return nil
 	}
 
-	claim, err := a.claimWithSaaS(controlPlaneURL, apiKey)
+	claim, err := a.applyClaim(ctx, controlPlaneURL, apiKey)
 	if err != nil {
 		a.audit("claim_failed", map[string]any{"error": err.Error()})
+		a.clearClaimedState(controlPlaneURL)
+		a.recordControlPlaneClaimFailure(err)
 		return fmt.Errorf("startup claim failed: %w", err)
+	}
+
+	a.audit("claimed", map[string]any{
+		"agent_id":       claim.AgentID,
+		"org_id":         claim.OrgID,
+		"schema_version": claim.SchemaVersion,
+		"source":         "startup_credentials",
+	})
+	return nil
+}
+
+func (a *agent) applyClaim(ctx context.Context, controlPlaneURL string, apiKey string) (claimResponse, error) {
+	normalizedControlPlaneURL := strings.TrimSpace(controlPlaneURL)
+	normalizedAPIKey := strings.TrimSpace(apiKey)
+
+	claim, err := a.claimWithSaaS(normalizedControlPlaneURL, normalizedAPIKey)
+	if err != nil {
+		return claimResponse{}, err
 	}
 
 	a.mu.Lock()
 	a.bootstrap = bootstrapConfig{
-		ControlPlaneURL: controlPlaneURL,
-		SaaSAPIKey:      apiKey,
+		ControlPlaneURL: normalizedControlPlaneURL,
+		SaaSAPIKey:      normalizedAPIKey,
 		AgentID:         claim.AgentID,
 		OrgID:           claim.OrgID,
 		ClaimedAt:       time.Now().UTC(),
@@ -653,7 +745,7 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 
 	if err := a.saveBootstrapConfig(); err != nil {
 		a.audit("bootstrap_persist_error", map[string]any{"error": err.Error()})
-		log.Printf("warning: failed to persist bootstrap config: %v", err)
+		return claimResponse{}, fmt.Errorf("failed to persist bootstrap config: %w", err)
 	}
 	if err := a.pollBindingsOnce(ctx); err != nil {
 		a.audit("bindings_initial_fetch_error", map[string]any{"error": err.Error()})
@@ -664,14 +756,28 @@ func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {
 	if err := a.pollDesiredStateOnce(ctx); err != nil {
 		a.audit("desired_state_initial_fetch_error", map[string]any{"error": err.Error()})
 	}
+	return claim, nil
+}
 
-	a.audit("claimed", map[string]any{
-		"agent_id":       claim.AgentID,
-		"org_id":         claim.OrgID,
-		"schema_version": claim.SchemaVersion,
-		"source":         "startup_credentials",
-	})
-	return nil
+func (a *agent) clearClaimedState(controlPlaneURL string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.claimed = false
+	a.lastETag = ""
+	a.bootstrap.ControlPlaneURL = firstNonEmpty(strings.TrimSpace(controlPlaneURL), strings.TrimSpace(a.bootstrap.ControlPlaneURL))
+	a.bootstrap.SaaSAPIKey = ""
+	a.bootstrap.AgentID = ""
+	a.bootstrap.OrgID = 0
+	a.bootstrap.ClaimedAt = time.Time{}
+	a.desiredState = make(map[int]desiredStateItem)
+	a.bindings = make(map[int]edgeBinding)
+	a.actionQueue = make(map[int][]action)
+	a.inflightActions = make(map[int]action)
+	a.deadLetters = make(map[int][]action)
+	a.queuedSince = make(map[int]time.Time)
+	a.recentEnqueue = make(map[string]time.Time)
+	a.suppressedUntil = make(map[string]time.Time)
+	a.breakerUntil = make(map[int]time.Time)
 }
 
 func (a *agent) initializeBambuAuth(ctx context.Context) error {
@@ -700,15 +806,13 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		a.bambuAuthStore = credentialsStore
 	}
 
-	cloudClientDeviceID := a.resolveBambuCloudClientDeviceID(ctx, credentialsStore)
 	provider := a.bambuAuthProvider
 	if provider == nil {
 		provider = bambucloud.NewHTTPProvider(bambucloud.HTTPProviderConfig{
-			AuthBaseURL:    strings.TrimSpace(a.cfg.BambuCloudAuthBaseURL),
-			Client:         a.client,
-			UploadPath:     strings.TrimSpace(a.cfg.BambuCloudUploadPath),
-			PrintPath:      strings.TrimSpace(a.cfg.BambuCloudPrintPath),
-			ClientDeviceID: cloudClientDeviceID,
+			AuthBaseURL: strings.TrimSpace(a.cfg.BambuCloudAuthBaseURL),
+			Client:      a.client,
+			UploadPath:  strings.TrimSpace(a.cfg.BambuCloudUploadPath),
+			PrintPath:   strings.TrimSpace(a.cfg.BambuCloudPrintPath),
 		})
 		a.bambuAuthProvider = provider
 	}
@@ -721,20 +825,12 @@ func (a *agent) initializeBambuAuth(ctx context.Context) error {
 		return err
 	}
 
-	if !shouldPersist {
-		storedCredentials, loadErr := credentialsStore.Load(ctx)
-		if loadErr == nil && strings.TrimSpace(storedCredentials.CloudDeviceID) == "" {
-			shouldPersist = true
-		}
-	}
-
 	if shouldPersist {
 		credentials := bambustore.BambuCredentials{
 			Username:           strings.TrimSpace(username),
 			AccessToken:        session.AccessToken,
 			RefreshToken:       session.RefreshToken,
 			ExpiresAt:          session.ExpiresAt.UTC(),
-			CloudDeviceID:      cloudClientDeviceID,
 			MaskedEmail:        session.MaskedEmail,
 			MaskedPhone:        session.MaskedPhone,
 			AccountDisplayName: session.AccountDisplayName,
@@ -789,7 +885,7 @@ type bambuMQTTCommandRequest struct {
 	Username           string
 	Password           string
 	Command            string
-	Param              map[string]any
+	Param              any
 	InsecureSkipVerify bool
 }
 
@@ -1076,23 +1172,11 @@ func sessionFromStoredBambuCredentials(credentials bambustore.BambuCredentials) 
 	}
 }
 
-func (a *agent) resolveBambuCloudClientDeviceID(ctx context.Context, store bambustore.BambuCredentialsStore) string {
-	if store != nil {
-		credentials, err := store.Load(ctx)
-		if err == nil {
-			if storedID := strings.TrimSpace(credentials.CloudDeviceID); storedID != "" {
-				return storedID
-			}
-		}
-	}
-	return randomKey("bambu-cloud-client")
-}
-
 func loadConfig() appConfig {
 	defaultStateDir := defaultEdgeStateDir()
 	bambuCloudAuthBaseURL := getEnvOrDefault("BAMBU_CLOUD_AUTH_BASE_URL", "https://api.bambulab.com")
 	return appConfig{
-		SetupBindAddr:               getEnvOrDefault("SETUP_BIND_ADDR", "0.0.0.0:8090"),
+		SetupBindAddr:               getEnvOrDefault("SETUP_BIND_ADDR", "127.0.0.1:18090"),
 		BootstrapConfigPath:         getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", filepath.Join(defaultStateDir, "bootstrap", "config.json")),
 		AuditLogPath:                getEnvOrDefault("AUDIT_LOG_PATH", filepath.Join(defaultStateDir, "logs", "audit.log")),
 		ArtifactStageDir:            getEnvOrDefault("ARTIFACT_STAGE_DIR", filepath.Join(defaultStateDir, "artifacts")),
@@ -1124,6 +1208,8 @@ func loadConfig() appConfig {
 		DiscoveryPollInterval:       parseDurationMS("DISCOVERY_POLL_INTERVAL_MS", 4000),
 		DiscoveryInventoryInterval:  parseDurationMS("DISCOVERY_INVENTORY_INTERVAL_MS", 30000),
 		DiscoveryManualPollInterval: parseDurationMS("DISCOVERY_MANUAL_POLL_INTERVAL_MS", 5000),
+		LocalUIScanInterval:         parseDurationMS("LOCAL_UI_SCAN_INTERVAL_MS", 15000),
+		LocalUIBindAddr:             getEnvOrDefault("LOCAL_UI_BIND_ADDR", ""),
 		DiscoveryProfileMax:         parseDiscoveryProfile(getEnvOrDefault("DISCOVERY_PROFILE_MAX", "hybrid")),
 		// Binary runtime should scan host LAN by default. Bridge mode remains opt-in.
 		DiscoveryNetworkMode:     parseDiscoveryNetworkMode(getEnvOrDefault("DISCOVERY_NETWORK_MODE", "host")),
@@ -1397,6 +1483,8 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version":               agentVersion,
 		"claimed":               claimed,
 		"agent_id":              bootstrap.AgentID,
+		"local_web_ui_url":      a.localWebUIURLSnapshot(),
+		"local_web_ui_port":     localWebUIPortFromURL(a.localWebUIURLSnapshot()),
 		"desired_count":         desiredCount,
 		"current_count":         currentCount,
 		"queue_depth":           queueDepth,
@@ -1420,8 +1508,10 @@ func (a *agent) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"claimed":           a.isClaimed(),
 		"agent_id":          bootstrap.AgentID,
 		"org_id":            bootstrap.OrgID,
-		"control_plane_url": bootstrap.ControlPlaneURL,
+		"control_plane_url": a.currentControlPlaneURL(),
 		"claimed_at":        bootstrap.ClaimedAt,
+		"local_web_ui_url":  a.localWebUIURLSnapshot(),
+		"local_web_ui_port": localWebUIPortFromURL(a.localWebUIURLSnapshot()),
 	})
 }
 
@@ -1442,35 +1532,15 @@ func (a *agent) handleSetupClaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "control_plane_url and saas_api_key are required", http.StatusBadRequest)
 		return
 	}
+	a.recordControlPlaneAPIKeySeen()
 
-	claim, err := a.claimWithSaaS(req.ControlPlaneURL, req.SaaSAPIKey)
+	claim, err := a.applyClaim(r.Context(), req.ControlPlaneURL, req.SaaSAPIKey)
 	if err != nil {
 		a.audit("claim_failed", map[string]any{"error": err.Error()})
+		a.clearClaimedState(req.ControlPlaneURL)
+		a.recordControlPlaneClaimFailure(err)
 		http.Error(w, fmt.Sprintf("claim failed: %v", err), http.StatusBadGateway)
 		return
-	}
-
-	a.mu.Lock()
-	a.bootstrap = bootstrapConfig{
-		ControlPlaneURL: req.ControlPlaneURL,
-		SaaSAPIKey:      req.SaaSAPIKey,
-		AgentID:         claim.AgentID,
-		OrgID:           claim.OrgID,
-		ClaimedAt:       time.Now().UTC(),
-	}
-	a.claimed = true
-	a.lastETag = ""
-	a.mu.Unlock()
-
-	if err := a.saveBootstrapConfig(); err != nil {
-		http.Error(w, fmt.Sprintf("failed to persist bootstrap config: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if err := a.pollBindingsOnce(r.Context()); err != nil {
-		a.audit("bindings_initial_fetch_error", map[string]any{"error": err.Error()})
-	}
-	if err := a.pollDesiredStateOnce(r.Context()); err != nil {
-		a.audit("desired_state_initial_fetch_error", map[string]any{"error": err.Error()})
 	}
 
 	a.audit("claimed", map[string]any{
@@ -1478,6 +1548,7 @@ func (a *agent) handleSetupClaim(w http.ResponseWriter, r *http.Request) {
 		"org_id":         claim.OrgID,
 		"schema_version": claim.SchemaVersion,
 	})
+	a.bootstrapSync(r.Context())
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                    "claimed",
@@ -1501,6 +1572,7 @@ func (a *agent) claimWithSaaS(controlPlaneURL, apiKey string) (claimResponse, er
 	if err := doJSONRequest(a.client, http.MethodPost, endpoint, apiKey, "", payload, &out, map[string]string{
 		"X-Agent-Schema-Version": schemaVersionHeaderValue(),
 	}); err != nil {
+		a.recordControlPlaneClaimFailure(err)
 		return claimResponse{}, err
 	}
 	if out.AgentID == "" {
@@ -1526,6 +1598,7 @@ func (a *agent) claimWithSaaS(controlPlaneURL, apiKey string) (claimResponse, er
 			out.SupportedSchemaVersions,
 		)
 	}
+	a.recordControlPlaneSuccess()
 	return out, nil
 }
 
@@ -1595,6 +1668,7 @@ func (a *agent) pollBindingsOnce(ctx context.Context) error {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		a.recordControlPlaneFailure(err.Error())
 		return err
 	}
 	defer resp.Body.Close()
@@ -1605,11 +1679,13 @@ func (a *agent) pollBindingsOnce(ctx context.Context) error {
 			a.handleControlPlaneAuthFailure("bindings", resp.StatusCode, string(body))
 			return fmt.Errorf("%w: bindings returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
 		}
+		a.recordControlPlaneFailure(string(body))
 		return fmt.Errorf("bindings returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var payload bindingsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		a.recordControlPlaneFailure(err.Error())
 		return err
 	}
 
@@ -1634,6 +1710,7 @@ func (a *agent) pollBindingsOnce(ctx context.Context) error {
 	a.mu.Unlock()
 
 	a.audit("bindings_updated", map[string]any{"binding_count": len(payload.Bindings)})
+	a.recordControlPlaneSuccess()
 	return nil
 }
 
@@ -1806,7 +1883,99 @@ func (a *agent) applyBambuLANCredentialsCommand(ctx context.Context, command con
 		"serial": serial,
 		"host":   host,
 	})
+	if printerID := a.printerIDForEndpointNormalized(command.TargetEndpointNormalized); printerID != 0 {
+		a.clearBambuLANCredentialRecoveryCooldown(printerID)
+	}
 	return nil
+}
+
+func (a *agent) printerIDForEndpointNormalized(endpointURL string) int {
+	normalized := strings.TrimSpace(endpointURL)
+	if normalized == "" {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for printerID, binding := range a.bindings {
+		if strings.EqualFold(strings.TrimSpace(binding.EndpointURL), normalized) {
+			return printerID
+		}
+	}
+	return 0
+}
+
+func (a *agent) clearBambuLANCredentialRecoveryCooldown(printerID int) {
+	if printerID == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.bambuLANRecoveryUntil, printerID)
+}
+
+func (a *agent) requestBambuLANCredentialRecovery(ctx context.Context, binding edgeBinding) (bool, error) {
+	if binding.PrinterID == 0 {
+		return false, errors.New("bambu_lan_credentials_missing_local: missing printer binding id")
+	}
+	if !a.isClaimed() {
+		return false, errors.New("bambu_lan_credentials_missing_local: edge agent is not claimed")
+	}
+
+	now := time.Now().UTC()
+	a.mu.Lock()
+	if until, ok := a.bambuLANRecoveryUntil[binding.PrinterID]; ok && now.Before(until) {
+		a.mu.Unlock()
+		return false, nil
+	}
+	a.bambuLANRecoveryUntil[binding.PrinterID] = now.Add(bambuLANCredentialRecoveryCooldown)
+	a.mu.Unlock()
+
+	bootstrap := a.snapshotBootstrap()
+	endpoint := fmt.Sprintf(
+		"%s/edge/agents/%s/bambu-credentials/recover",
+		strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"),
+		bootstrap.AgentID,
+	)
+	reqBody := bambuCredentialRecoveryRequest{
+		PrinterID:   binding.PrinterID,
+		EndpointURL: strings.TrimSpace(binding.EndpointURL),
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		return false, fmt.Errorf("bambu_lan_credentials_missing_local: marshal recovery request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return false, fmt.Errorf("bambu_lan_credentials_missing_local: build recovery request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("bambu_lan_credentials_missing_local: recovery request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("bambu_credentials_recover", resp.StatusCode, string(body))
+		}
+		return false, fmt.Errorf("bambu_lan_credentials_missing_local: recovery request returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var payload bambuCredentialRecoveryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, fmt.Errorf("bambu_lan_credentials_missing_local: decode recovery response: %w", err)
+	}
+	a.audit("bambu_lan_credentials_recovery_requested", map[string]any{
+		"printer_id":      binding.PrinterID,
+		"endpoint_url":    strings.TrimSpace(binding.EndpointURL),
+		"recovery_queued": payload.RecoveryQueued,
+		"command_id":      payload.CommandID,
+	})
+	return payload.RecoveryQueued, nil
 }
 
 func (a *agent) acknowledgeConfigCommand(
@@ -2121,6 +2290,8 @@ func mapDesiredToAction(current, desired string) string {
 		switch current {
 		case "printing":
 			return "pause"
+		case "queued":
+			return "noop"
 		case "paused":
 			return "noop"
 		default:
@@ -2888,7 +3059,6 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		"plate_id":        queuedAction.Target.PlateID,
 		"filename":        remoteName,
 		"file_id":         strings.TrimSpace(uploadURLs.FileID),
-		"upload_ticket":   strings.TrimSpace(uploadURLs.UploadTicket),
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
 	})
@@ -2908,23 +3078,20 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		fileName = remoteName
 	}
 	startReq := bambucloud.CloudPrintStartRequest{
-		DeviceID:      strings.TrimSpace(printerID),
-		FileName:      fileName,
-		FileURL:       fileURL,
-		FileID:        strings.TrimSpace(uploadURLs.FileID),
-		UploadTicket:  strings.TrimSpace(uploadURLs.UploadTicket),
-		UploadFileURL: strings.TrimSpace(uploadURLs.UploadFileURL),
+		DeviceID: strings.TrimSpace(printerID),
+		FileName: fileName,
+		FileURL:  fileURL,
+		FileID:   strings.TrimSpace(uploadURLs.FileID),
 	}
 	a.audit("bambu_print_start_dispatch_attempt", map[string]any{
-		"printer_id":        queuedAction.PrinterID,
-		"job_id":            queuedAction.Target.JobID,
-		"plate_id":          queuedAction.Target.PlateID,
-		"filename":          fileName,
-		"transport":         "cloud_http_task",
-		"adapter_family":    "bambu",
-		"has_file_url":      strings.TrimSpace(startReq.FileURL) != "",
-		"has_file_id":       strings.TrimSpace(startReq.FileID) != "",
-		"has_upload_ticket": strings.TrimSpace(startReq.UploadTicket) != "",
+		"printer_id":     queuedAction.PrinterID,
+		"job_id":         queuedAction.Target.JobID,
+		"plate_id":       queuedAction.Target.PlateID,
+		"filename":       fileName,
+		"transport":      "cloud_http_task",
+		"adapter_family": "bambu",
+		"has_file_url":   strings.TrimSpace(startReq.FileURL) != "",
+		"has_file_id":    strings.TrimSpace(startReq.FileID) != "",
 	})
 	if err := provider.StartPrintJob(ctx, accessToken, startReq); err != nil {
 		details := summarizeBambuCloudStartDispatchError(err)
@@ -2976,7 +3143,7 @@ func (a *agent) executeBambuCloudControlAction(
 	if err != nil {
 		return err
 	}
-	if err := a.publishBambuCloudMQTTCommand(ctx, provider, accessToken, strings.TrimSpace(printerID), command, nil); err != nil {
+	if err := a.publishBambuCloudMQTTCommand(ctx, provider, accessToken, strings.TrimSpace(printerID), command, ""); err != nil {
 		return err
 	}
 	return a.verifyBambuControlAction(ctx, strings.TrimSpace(printerID), command)
@@ -2988,7 +3155,7 @@ func (a *agent) publishBambuCloudMQTTCommand(
 	accessToken string,
 	printerID string,
 	command string,
-	param map[string]any,
+	param any,
 ) error {
 	type mqttUsernameCandidate struct {
 		Username string
@@ -3910,6 +4077,38 @@ func (a *agent) markActionSuccess(queuedAction action) {
 	})
 }
 
+func (a *agent) markPrintStartInProgress(queuedAction action) {
+	now := time.Now().UTC()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	current := a.currentState[queuedAction.PrinterID]
+	current.PrinterID = queuedAction.PrinterID
+	current.CurrentPrinterState = "queued"
+	current.CurrentJobState = "pending"
+	current.JobID = queuedAction.Target.JobID
+	current.PlateID = queuedAction.Target.PlateID
+	current.IntentVersionApplied = queuedAction.Target.IntentVersion
+	current.IsPaused = false
+	current.IsCanceled = false
+	current.LastErrorCode = ""
+	current.LastErrorMessage = ""
+	current.ManualIntervention = ""
+	current.ReportedAt = now
+	a.currentState[queuedAction.PrinterID] = current
+	if _, exists := a.queuedSince[queuedAction.PrinterID]; !exists {
+		a.queuedSince[queuedAction.PrinterID] = now
+	}
+
+	a.audit("print_start_in_progress", map[string]any{
+		"printer_id":     queuedAction.PrinterID,
+		"intent_version": queuedAction.Target.IntentVersion,
+		"job_id":         queuedAction.Target.JobID,
+		"plate_id":       queuedAction.Target.PlateID,
+		"reported_state": "queued",
+	})
+}
+
 func (a *agent) markActionFailure(queuedAction action, errorCode, message string) {
 	now := time.Now().UTC()
 	a.mu.Lock()
@@ -3990,6 +4189,9 @@ func classifyActionError(err error) (code string, retryable bool) {
 			return "connectivity_error", true
 		}
 		return "bambu_lan_upload_failed", false
+	case strings.Contains(msg, "bambu_lan_credentials_missing_local"),
+		strings.Contains(msg, "bambu_lan_credentials_store_unavailable"):
+		return "auth_error", false
 	case errors.Is(err, bambucloud.ErrPrintStartUnsupported), strings.Contains(msg, "bambu_start_rejected"):
 		return "bambu_start_rejected", false
 	case errors.Is(err, bambuauth.ErrInvalidCredentials),
@@ -3999,7 +4201,7 @@ func classifyActionError(err error) (code string, retryable bool) {
 		strings.Contains(msg, "bambu ftps auth rejected"),
 		strings.Contains(msg, "bambu mqtt broker rejected connection return_code=5"):
 		return "auth_error", false
-	case errors.Is(err, bambucloud.ErrPrintStartMetadataUnresolved), strings.Contains(msg, "bambu_start_metadata_unresolved"):
+	case strings.Contains(msg, "bambu_start_metadata_unresolved"):
 		return "bambu_start_metadata_unresolved", false
 	case strings.Contains(msg, "bambu_start_manual_handoff_required"):
 		return "bambu_start_manual_handoff_required", false
@@ -4480,65 +4682,33 @@ func (a *agent) runAndSubmitDiscoveryInventoryScan(
 	defer a.endDiscoveryRun()
 
 	startedAt := time.Now().UTC()
-	job := discoveryJobItem{
-		JobID:         randomKey("scan"),
-		Profile:       parseDiscoveryProfile(a.cfg.DiscoveryProfileMax),
-		Adapters:      append([]string(nil), a.cfg.DiscoveryAllowedAdapters...),
-		EndpointHints: append([]string(nil), a.cfg.DiscoveryEndpointHints...),
-		CIDRAllowlist: append([]string(nil), a.cfg.DiscoveryCIDRAllowlist...),
-		RequestedAt:   edgeTimestamp{Time: startedAt},
-		ExpiresAt:     edgeTimestamp{Time: startedAt.Add(30 * time.Second)},
-	}
-	a.audit("discovery_scan_started", map[string]any{
-		"scan_mode":     scanMode,
-		"trigger_token": manualTriggerToken,
-		"adapters":      job.Adapters,
-		"profile":       job.Profile,
-	})
+	scanSource := scanSourceForMode(scanMode)
+	a.localObservations.markScanStarted(scanSource, startedAt)
+	var runErr error
+	defer func() {
+		a.localObservations.markScanFinished(scanSource, time.Now().UTC(), runErr)
+	}()
+
 	emitManualScanEvent("started", startedAt, "")
-	result := a.executeDiscoveryJob(ctx, job)
-	sourceBreakdown := discoveryCandidateSourceBreakdown(result.Candidates)
-	entries := a.buildDiscoveryInventoryEntries(result.Candidates)
-	a.audit("discovery_scan_completed", map[string]any{
-		"scan_mode":         scanMode,
-		"trigger_token":     manualTriggerToken,
-		"job_status":        result.JobStatus,
-		"hosts_scanned":     result.Summary.HostsScanned,
-		"hosts_reachable":   result.Summary.HostsReachable,
-		"candidates":        result.Summary.CandidatesFound,
-		"raw_candidates":    len(result.Candidates),
-		"inventory_entries": len(entries),
-		"errors":            result.Summary.ErrorsCount,
-		"source_breakdown":  sourceBreakdown,
-	})
-	if result.Summary.CandidatesFound == 0 {
-		a.audit("discovery_scan_zero_candidates", map[string]any{
-			"scan_mode":         scanMode,
-			"trigger_token":     manualTriggerToken,
-			"hosts_scanned":     result.Summary.HostsScanned,
-			"hosts_reachable":   result.Summary.HostsReachable,
-			"raw_candidates":    len(result.Candidates),
-			"inventory_entries": len(entries),
-			"errors":            result.Summary.ErrorsCount,
-			"source_breakdown":  sourceBreakdown,
-		})
-	}
+	completed := a.executeDiscoveryScanLocked(ctx, scanMode, manualTriggerToken, startedAt)
+	a.localObservations.upsertDiscoveryCandidates(completed.Result.Candidates, completed.Result.FinishedAt)
 	scanID := randomKey("scan")
 	payload := discoveryInventoryReportRequest{
 		ScanID:       scanID,
 		ScanMode:     scanMode,
 		TriggerToken: manualTriggerToken,
-		StartedAt:    result.StartedAt,
-		FinishedAt:   result.FinishedAt,
+		StartedAt:    completed.Result.StartedAt,
+		FinishedAt:   completed.Result.FinishedAt,
 		Summary: discoveryInventorySummary{
-			HostsScanned:   result.Summary.HostsScanned,
-			HostsReachable: result.Summary.HostsReachable,
-			EntriesCount:   len(entries),
-			ErrorsCount:    result.Summary.ErrorsCount,
+			HostsScanned:   completed.Result.Summary.HostsScanned,
+			HostsReachable: completed.Result.Summary.HostsReachable,
+			EntriesCount:   len(completed.Entries),
+			ErrorsCount:    completed.Result.Summary.ErrorsCount,
 		},
-		Entries: entries,
+		Entries: completed.Entries,
 	}
 	if err := a.submitDiscoveryInventory(ctx, bootstrap, payload); err != nil {
+		runErr = err
 		a.audit("discovery_inventory_submit_error", map[string]any{
 			"scan_id":       scanID,
 			"scan_mode":     scanMode,
@@ -4552,24 +4722,24 @@ func (a *agent) runAndSubmitDiscoveryInventoryScan(
 		"scan_id":       scanID,
 		"scan_mode":     scanMode,
 		"trigger_token": manualTriggerToken,
-		"entries":       len(entries),
+		"entries":       len(completed.Entries),
 	})
 	a.audit("discovery_inventory_submitted", map[string]any{
 		"scan_id":         scanID,
 		"scan_mode":       scanMode,
 		"trigger_token":   manualTriggerToken,
-		"entries":         len(entries),
-		"hosts_scanned":   result.Summary.HostsScanned,
-		"hosts_reachable": result.Summary.HostsReachable,
-		"errors":          result.Summary.ErrorsCount,
+		"entries":         len(completed.Entries),
+		"hosts_scanned":   completed.Result.Summary.HostsScanned,
+		"hosts_reachable": completed.Result.Summary.HostsReachable,
+		"errors":          completed.Result.Summary.ErrorsCount,
 	})
 	completionStatus := "completed"
 	completionError := ""
-	if result.JobStatus == "failed" {
+	if completed.Result.JobStatus == "failed" {
 		completionStatus = "failed"
 		completionError = "discovery_scan_failed"
 	}
-	emitManualScanEvent(completionStatus, result.FinishedAt, completionError)
+	emitManualScanEvent(completionStatus, completed.Result.FinishedAt, completionError)
 	return nil
 }
 
@@ -5941,6 +6111,8 @@ func incrementIPv4(ip net.IP) {
 }
 
 func (a *agent) handleControlPlaneAuthFailure(endpoint string, statusCode int, responseBody string) {
+	a.recordControlPlaneAuthRevoked(strings.TrimSpace(responseBody))
+
 	a.mu.Lock()
 	wasClaimed := a.claimed
 	a.claimed = false
@@ -6021,6 +6193,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 	for _, item := range bindings {
 		snapshot, err := a.fetchBindingSnapshotDetailed(ctx, item.binding)
 		if err != nil {
+			observedAt := time.Now().UTC()
 			a.mu.Lock()
 			current := a.currentState[item.printerID]
 			current.PrinterID = item.printerID
@@ -6031,9 +6204,27 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 				}
 				current.LastErrorCode = "auth_error"
 				current.LastErrorMessage = err.Error()
-				current.ReportedAt = time.Now().UTC()
+				current.ReportedAt = observedAt
 				a.currentState[item.printerID] = current
 				a.mu.Unlock()
+				a.localObservations.upsertRuntimeFailure(item.binding, current, observedAt)
+				continue
+			}
+			if isBambuLANCredentialsUnavailable(err) {
+				if current.CurrentPrinterState == "" {
+					current.CurrentPrinterState = "error"
+				}
+				current.LastErrorCode = "auth_error"
+				current.LastErrorMessage = err.Error()
+				current.TotalPrintSeconds = nil
+				current.ProgressPct = nil
+				current.RemainingSeconds = nil
+				current.TelemetrySource = ""
+				current.ManualIntervention = ""
+				current.ReportedAt = observedAt
+				a.currentState[item.printerID] = current
+				a.mu.Unlock()
+				a.localObservations.upsertRuntimeFailure(item.binding, current, observedAt)
 				continue
 			}
 			if current.CurrentPrinterState == "" {
@@ -6046,12 +6237,14 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 			current.RemainingSeconds = nil
 			current.TelemetrySource = ""
 			current.ManualIntervention = ""
-			current.ReportedAt = time.Now().UTC()
+			current.ReportedAt = observedAt
 			a.currentState[item.printerID] = current
 			a.mu.Unlock()
+			a.localObservations.upsertRuntimeFailure(item.binding, current, observedAt)
 			continue
 		}
 
+		observedAt := time.Now().UTC()
 		a.mu.Lock()
 		current := a.currentState[item.printerID]
 		prevState := current.CurrentPrinterState
@@ -6059,7 +6252,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.PrinterID = item.printerID
 		current.CurrentPrinterState = snapshot.PrinterState
 		current.CurrentJobState = snapshot.JobState
-		hydrateBambuActiveIntentIdentity(item.binding, desired, &current, snapshot)
+		hydrateActiveIntentIdentity(desired, &current, snapshot)
 		if shouldMarkBambuIdleTransitionCompleted(item.binding, prevState, current, snapshot) {
 			current.CurrentJobState = "completed"
 		}
@@ -6071,7 +6264,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.TelemetrySource = snapshot.TelemetrySource
 		current.ManualIntervention = snapshot.ManualIntervention
 		current.IsCanceled = snapshot.JobState == "canceled"
-		current.ReportedAt = time.Now().UTC()
+		current.ReportedAt = observedAt
 		if snapshot.PrinterState == "queued" {
 			if prevState != "queued" {
 				a.queuedSince[item.printerID] = current.ReportedAt
@@ -6084,19 +6277,12 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		}
 		a.currentState[item.printerID] = current
 		a.mu.Unlock()
+		a.localObservations.upsertRuntimeSuccess(item.binding, snapshot, current, observedAt)
 	}
 }
 
-func hydrateBambuActiveIntentIdentity(
-	binding edgeBinding,
-	desired desiredStateItem,
-	current *currentStateItem,
-	snapshot bindingSnapshot,
-) {
+func hydrateActiveIntentIdentity(desired desiredStateItem, current *currentStateItem, snapshot bindingSnapshot) {
 	if current == nil {
-		return
-	}
-	if normalizeAdapterFamily(binding.AdapterFamily) != "bambu" {
 		return
 	}
 	if snapshot.PrinterState != "queued" && snapshot.PrinterState != "printing" && snapshot.PrinterState != "paused" {
@@ -6201,14 +6387,28 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 			a.clearBambuLANRuntimeFailure(printerID)
 			return runtimeSnapshot, nil
 		}
+		decoratedRuntimeErr := runtimeErr
+		if isBambuLANCredentialsUnavailable(runtimeErr) {
+			decoratedRuntimeErr = a.decorateBambuLANCredentialsUnavailable(ctx, binding, runtimeErr)
+		}
 		runtimeFailureThresholdReached := false
+		suppressRuntimeConnectivityFailure := a.shouldSuppressBambuRuntimeConnectivityFailure(binding.PrinterID, runtimeErr)
 		if !isBambuLANCredentialsUnavailable(runtimeErr) {
 			a.audit("bambu_lan_runtime_snapshot_error", map[string]any{
 				"endpoint_url": binding.EndpointURL,
 				"printer_id":   printerID,
 				"error":        runtimeErr.Error(),
 			})
-			runtimeFailureThresholdReached = a.recordBambuLANRuntimeFailure(printerID, runtimeErr)
+			if suppressRuntimeConnectivityFailure {
+				a.clearBambuLANRuntimeFailure(printerID)
+				a.audit("bambu_lan_runtime_snapshot_error_suppressed", map[string]any{
+					"endpoint_url": binding.EndpointURL,
+					"printer_id":   printerID,
+					"reason":       "inflight_bambu_print_start",
+				})
+			} else {
+				runtimeFailureThresholdReached = a.recordBambuLANRuntimeFailure(printerID, runtimeErr)
+			}
 		}
 		lanSnapshot, lanErr := a.fetchBambuLANSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if lanErr == nil && !runtimeFailureThresholdReached {
@@ -6237,10 +6437,64 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if !isBambuLANCredentialsUnavailable(runtimeErr) {
 			return bindingSnapshot{}, runtimeErr
 		}
-		return bindingSnapshot{}, lanErr
+		return bindingSnapshot{}, firstNonNilError(decoratedRuntimeErr, lanErr)
 	default:
 		return bindingSnapshot{}, fmt.Errorf("validation_error: unsupported adapter_family: %s", family)
 	}
+}
+
+func firstNonNilError(primary error, fallback error) error {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}
+
+func (a *agent) decorateBambuLANCredentialsUnavailable(ctx context.Context, binding edgeBinding, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	recoveryQueued, recoveryErr := a.requestBambuLANCredentialRecovery(ctx, binding)
+	if recoveryErr != nil {
+		a.audit("bambu_lan_credentials_recovery_error", map[string]any{
+			"printer_id":   binding.PrinterID,
+			"endpoint_url": strings.TrimSpace(binding.EndpointURL),
+			"error":        recoveryErr.Error(),
+		})
+		return fmt.Errorf(
+			"bambu_lan_credentials_missing_local: local Bambu access code missing on edge-agent and recovery failed: %v: %w",
+			recoveryErr,
+			cause,
+		)
+	}
+	if recoveryQueued {
+		return fmt.Errorf(
+			"bambu_lan_credentials_missing_local: local Bambu access code missing on edge-agent; recovery requested from control plane: %w",
+			cause,
+		)
+	}
+	return fmt.Errorf(
+		"bambu_lan_credentials_missing_local: local Bambu access code missing on edge-agent; recovery request already pending or cooling down: %w",
+		cause,
+	)
+}
+
+func (a *agent) shouldSuppressBambuRuntimeConnectivityFailure(printerID int, runtimeErr error) bool {
+	if runtimeErr == nil {
+		return false
+	}
+	code, _ := classifyActionError(runtimeErr)
+	if code != "connectivity_error" {
+		return false
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	inflight, ok := a.inflightActions[printerID]
+	if !ok {
+		return false
+	}
+	return inflight.Kind == "print" && inflight.Target.DesiredPrinterState == "printing"
 }
 
 func (a *agent) fetchBambuCloudSnapshotFromEndpoint(ctx context.Context, endpointURL string) (bindingSnapshot, error) {

@@ -37,8 +37,10 @@ Because Bambu LAN discovery can be intermittent and operators often need a momen
 
 - Discovery does not require the Bambu access code.
 - Adoption requires it because the local Bambu LAN runtime is authenticated.
-- The access code must not be stored on SaaS printer records or binding records.
-- The access code is persisted only on the edge-agent host.
+- The access code must not be stored on ordinary SaaS printer records or binding records.
+- The access code is persisted locally on the edge-agent host for runtime use.
+- SaaS keeps a control-plane recovery copy only while the printer remains actively adopted and edge-managed.
+- If the printer is removed or switched away from edge-managed control, SaaS deletes the stored access code and forgets it.
 
 ## Access-Code Usage After Adoption
 
@@ -48,3 +50,9 @@ Once the access code is stored on the edge host:
 - edge-agent routes Bambu `pause`, `resume`, and `stop` through local MQTT when credentials are available,
 - edge-agent can start prints unattended over the local LAN when the printer is in `LAN Only + Developer Mode`,
 - unattended LAN start currently requires a `.3mf` artifact and uses a fixed agent-side start profile.
+
+If the local edge state is lost while the printer is still adopted:
+
+- edge-agent can request a fresh `bambu_lan_credentials_upsert` from SaaS control plane,
+- SaaS will reissue the access code only while that printer is still actively adopted,
+- removed/unadopted printers are not recoverable and require fresh operator re-entry on the next adoption.

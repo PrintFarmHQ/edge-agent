@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,9 @@ func (a *agent) executeBambuLANControlAction(
 	}
 	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
 	if err != nil {
+		if isBambuLANCredentialsUnavailable(err) {
+			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
+		}
 		return err
 	}
 
@@ -84,6 +88,7 @@ func (a *agent) executeBambuLANControlAction(
 		Username:           bambuLANMQTTUsername,
 		Password:           strings.TrimSpace(credentials.AccessCode),
 		Command:            strings.TrimSpace(command),
+		Param:              "",
 		InsecureSkipVerify: true,
 	}); err != nil {
 		return err
@@ -97,14 +102,14 @@ func (a *agent) resolveBambuLANRuntimeCredentials(ctx context.Context, printerID
 		return bambustore.BambuLANCredentials{}, errors.New("validation_error: missing bambu printer identifier")
 	}
 	if a.bambuLANStore == nil {
-		return bambustore.BambuLANCredentials{}, fmt.Errorf(
-			"%w: bambu lan credentials store is not configured",
-			bambustore.ErrBambuLANCredentialsNotFound,
-		)
+		return bambustore.BambuLANCredentials{}, errors.New("bambu_lan_credentials_store_unavailable: bambu lan credentials store is not configured")
 	}
 
 	credentials, err := a.bambuLANStore.Get(ctx, normalizedPrinterID)
 	if err != nil {
+		if errors.Is(err, bambustore.ErrBambuLANCredentialsNotFound) || errors.Is(err, os.ErrNotExist) {
+			return bambustore.BambuLANCredentials{}, fmt.Errorf("bambu_lan_credentials_missing_local: %w", err)
+		}
 		return bambustore.BambuLANCredentials{}, err
 	}
 	if record, ok := a.currentBambuLANDiscoveryRecord(normalizedPrinterID); ok {
@@ -137,8 +142,12 @@ func isBambuLANCredentialsUnavailable(err error) bool {
 	if errors.Is(err, bambustore.ErrBambuLANCredentialsNotFound) {
 		return true
 	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(msg, "bambu lan credentials store is not configured")
+	return strings.Contains(msg, "bambu lan credentials store is not configured") ||
+		strings.Contains(msg, "bambu_lan_credentials_missing_local")
 }
 
 func (a *agent) currentBambuLANDiscoveryRecord(printerID string) (bambuLANDiscoveryRecord, bool) {

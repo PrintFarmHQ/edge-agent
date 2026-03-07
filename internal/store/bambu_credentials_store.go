@@ -16,6 +16,7 @@ type BambuCredentials struct {
 	AccessToken        string    `json:"access_token"`
 	RefreshToken       string    `json:"refresh_token,omitempty"`
 	ExpiresAt          time.Time `json:"expires_at"`
+	CloudDeviceID      string    `json:"cloud_device_id,omitempty"`
 	MaskedEmail        string    `json:"masked_email,omitempty"`
 	MaskedPhone        string    `json:"masked_phone,omitempty"`
 	AccountDisplayName string    `json:"account_display_name,omitempty"`
