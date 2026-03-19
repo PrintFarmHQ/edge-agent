@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -180,6 +181,69 @@ func (f *fakeBambuMQTTPublisher) PublishPrintCommand(ctx context.Context, req ba
 		return nil
 	}
 	return f.publish(ctx, req)
+}
+
+type fakeBambuLANArtifactClient struct {
+	loginErr             error
+	setBinaryModeErr     error
+	deleteErr            error
+	sizeErr              error
+	retrieveErr          error
+	quitErr              error
+	closeErr             error
+	retrieveData         []byte
+	sizeValue            int64
+	storeErrs            []error
+	storedRemoteNames    []string
+	deletedRemoteNames   []string
+	retrievedRemoteNames []string
+}
+
+func (f *fakeBambuLANArtifactClient) login(_ string, _ string) error {
+	return f.loginErr
+}
+
+func (f *fakeBambuLANArtifactClient) setBinaryMode() error {
+	return f.setBinaryModeErr
+}
+
+func (f *fakeBambuLANArtifactClient) store(remoteName string, _ []byte) error {
+	f.storedRemoteNames = append(f.storedRemoteNames, remoteName)
+	if len(f.storeErrs) == 0 {
+		return nil
+	}
+	err := f.storeErrs[0]
+	f.storeErrs = f.storeErrs[1:]
+	return err
+}
+
+func (f *fakeBambuLANArtifactClient) delete(remoteName string) error {
+	f.deletedRemoteNames = append(f.deletedRemoteNames, remoteName)
+	return f.deleteErr
+}
+
+func (f *fakeBambuLANArtifactClient) size(_ string) (int64, error) {
+	if f.sizeErr != nil {
+		return 0, f.sizeErr
+	}
+	return f.sizeValue, nil
+}
+
+func (f *fakeBambuLANArtifactClient) retrieve(remoteName string, writer io.Writer) (int64, error) {
+	f.retrievedRemoteNames = append(f.retrievedRemoteNames, remoteName)
+	if f.retrieveErr != nil {
+		return 0, f.retrieveErr
+	}
+	written, err := writer.Write(f.retrieveData)
+	return int64(written), err
+}
+
+func (f *fakeBambuLANArtifactClient) quit() error {
+	return f.quitErr
+}
+
+func (f *fakeBambuLANArtifactClient) close() error {
+	return f.closeErr
 }
 
 type memoryBambuCredentialsStore struct {
@@ -3005,6 +3069,246 @@ func TestPollConfigCommandsOnceAcknowledgesFailedApply(t *testing.T) {
 	}
 }
 
+func TestFetchMoonrakerCommandCapabilitiesDetectsPrimaryLightAndFilamentMacros(t *testing.T) {
+	a := newTestAgent(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine/device_power/devices":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"devices": []map[string]any{
+						{"device": "chamber_light", "status": "off"},
+						{"device": "psu", "status": "on"},
+					},
+				},
+			})
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{
+						"print_stats",
+						"gcode_macro LOAD_FILAMENT",
+						"gcode_macro UNLOAD_FILAMENT",
+						"filament_switch_sensor toolhead_sensor",
+					},
+				},
+			})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"filament_switch_sensor toolhead_sensor": map[string]any{
+							"filament_detected": true,
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	capabilities, err := a.fetchMoonrakerCommandCapabilities(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("fetchMoonrakerCommandCapabilities failed: %v", err)
+	}
+
+	led, ok := capabilities["led"].(map[string]any)
+	if !ok || led["supported"] != true || led["state"] != "off" {
+		t.Fatalf("led capability = %#v, want supported off state", capabilities["led"])
+	}
+	load, ok := capabilities["load_filament"].(map[string]any)
+	if !ok || load["supported"] != true {
+		t.Fatalf("load capability = %#v, want supported", capabilities["load_filament"])
+	}
+	unload, ok := capabilities["unload_filament"].(map[string]any)
+	if !ok || unload["supported"] != true {
+		t.Fatalf("unload capability = %#v, want supported", capabilities["unload_filament"])
+	}
+	filament, ok := capabilities["filament"].(map[string]any)
+	if !ok || filament["state"] != "loaded" || filament["action_state"] != filamentActionStateIdle || filament["sensor_present"] != true {
+		t.Fatalf("filament capability = %#v, want loaded idle with sensor", capabilities["filament"])
+	}
+}
+
+func TestFetchMoonrakerCommandCapabilitiesTreatsMissingDevicePowerEndpointAsUnsupportedNotError(t *testing.T) {
+	a := newTestAgent(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine/device_power/devices":
+			http.NotFound(w, r)
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{
+						"gcode_macro LOAD_FILAMENT",
+						"gcode_macro UNLOAD_FILAMENT",
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	capabilities, err := a.fetchMoonrakerCommandCapabilities(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("fetchMoonrakerCommandCapabilities should not fail on missing device_power endpoint: %v", err)
+	}
+	led, ok := capabilities["led"].(map[string]any)
+	if !ok || led["supported"] != false {
+		t.Fatalf("led capability = %#v, want unsupported", capabilities["led"])
+	}
+	load, ok := capabilities["load_filament"].(map[string]any)
+	if !ok || load["supported"] != true {
+		t.Fatalf("load capability = %#v, want supported", capabilities["load_filament"])
+	}
+}
+
+func TestPollPrinterCommandsOnceQueuesCommandAction(t *testing.T) {
+	a := newTestAgent(t)
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: "http://localhost:8000",
+		SaaSAPIKey:      "edge_key",
+		AgentID:         "edge_1",
+		OrgID:           1,
+	}
+	a.claimed = true
+
+	saasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Agent-Schema-Version"); got != schemaVersionHeaderValue() {
+			t.Fatalf("unexpected schema header: %q", got)
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/edge/agents/edge_1/printer-commands"):
+			writeJSON(w, http.StatusOK, printerCommandsResponse{
+				Commands: []printerCommandItem{
+					{
+						CommandID:  77,
+						PrinterID:  1,
+						CommandKey: "load_filament",
+						Payload:    json.RawMessage(`{}`),
+						CreatedAt:  edgeTimestamp{Time: time.Now().UTC()},
+						ExpiresAt:  edgeTimestamp{Time: time.Now().UTC().Add(5 * time.Minute)},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer saasSrv.Close()
+
+	a.mu.Lock()
+	a.bootstrap.ControlPlaneURL = saasSrv.URL
+	a.mu.Unlock()
+
+	if err := a.pollPrinterCommandsOnce(context.Background()); err != nil {
+		t.Fatalf("pollPrinterCommandsOnce failed: %v", err)
+	}
+
+	queue := a.actionQueue[1]
+	if len(queue) != 1 {
+		t.Fatalf("queued action count = %d, want 1", len(queue))
+	}
+	if queue[0].Kind != "load_filament" {
+		t.Fatalf("queued kind = %q, want load_filament", queue[0].Kind)
+	}
+	if queue[0].CommandRequestID != 77 {
+		t.Fatalf("queued command request id = %d, want 77", queue[0].CommandRequestID)
+	}
+}
+
+func TestExecuteNextActionAcknowledgesSuccessfulPrinterCommand(t *testing.T) {
+	a := newTestAgent(t)
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: "http://localhost:8000",
+		SaaSAPIKey:      "edge_key",
+		AgentID:         "edge_1",
+		OrgID:           1,
+	}
+	a.claimed = true
+
+	var ackStatuses []printerCommandAckRequest
+	saasSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/edge/agents/edge_1/printer-commands/55/ack"):
+			var ack printerCommandAckRequest
+			if err := json.NewDecoder(r.Body).Decode(&ack); err != nil {
+				t.Fatalf("decode printer command ack failed: %v", err)
+			}
+			ackStatuses = append(ackStatuses, ack)
+			writeJSON(w, http.StatusOK, printerCommandAckResponse{Accepted: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer saasSrv.Close()
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine/device_power/devices":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"devices": []map[string]any{
+						{"device": "chamber_light", "status": "off"},
+					},
+				},
+			})
+		case "/machine/device_power/device":
+			if r.URL.Query().Get("device") != "chamber_light" {
+				t.Fatalf("device query = %q, want chamber_light", r.URL.Query().Get("device"))
+			}
+			if r.URL.Query().Get("action") != "on" {
+				t.Fatalf("action query = %q, want on", r.URL.Query().Get("action"))
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	a.mu.Lock()
+	a.bootstrap.ControlPlaneURL = saasSrv.URL
+	a.bindings[1] = edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: moonrakerSrv.URL}
+	a.currentState[1] = currentStateItem{
+		PrinterID:           1,
+		CurrentPrinterState: "idle",
+		CurrentJobState:     "pending",
+		CommandCapabilities: map[string]any{
+			"led": map[string]any{"supported": true, "state": "off"},
+		},
+	}
+	a.actionQueue[1] = []action{
+		{
+			PrinterID:        1,
+			Kind:             "light_on",
+			Reason:           "printer command light_on",
+			CommandRequestID: 55,
+			EnqueuedAt:       time.Now().UTC(),
+			NextAttempt:      time.Now().UTC(),
+		},
+	}
+	a.mu.Unlock()
+
+	if err := a.executeNextAction(context.Background()); err != nil {
+		t.Fatalf("executeNextAction failed: %v", err)
+	}
+	if len(ackStatuses) != 1 {
+		t.Fatalf("ack count = %d, want 1", len(ackStatuses))
+	}
+	if ackStatuses[0].Status != "acknowledged" {
+		t.Fatalf("ack status = %q, want acknowledged", ackStatuses[0].Status)
+	}
+	led, ok := a.currentState[1].CommandCapabilities["led"].(map[string]any)
+	if !ok || led["state"] != "on" {
+		t.Fatalf("led capability after success = %#v, want state on", a.currentState[1].CommandCapabilities["led"])
+	}
+}
+
 func TestParseBambuLANMQTTSnapshotPayloadMapsPushStatus(t *testing.T) {
 	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
 		"print": {
@@ -3107,6 +3411,356 @@ func TestParseBambuLANMQTTSnapshotPayloadTreatsFinishedAsCompleted(t *testing.T)
 	}
 	if snapshot.JobState != "completed" {
 		t.Fatalf("job state = %q, want completed", snapshot.JobState)
+	}
+}
+
+func TestParseBambuLANMQTTSnapshotPayloadCapturesLightCapabilities(t *testing.T) {
+	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
+		"print": {
+			"gcode_state": "IDLE",
+			"print_type": "idle",
+			"lights_report": [{"node":"chamber_light","mode":"on"}],
+			"ams": {"tray_now":"254"},
+			"vt_tray": {"tray_type":"PLA","tray_info_idx":"GFL99"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parseBambuLANMQTTSnapshotPayload failed: %v", err)
+	}
+	led, ok := snapshot.CommandCapabilities["led"].(map[string]any)
+	if !ok || led["supported"] != true || led["state"] != "on" {
+		t.Fatalf("led capability = %#v, want supported on", snapshot.CommandCapabilities["led"])
+	}
+	load, ok := snapshot.CommandCapabilities["load_filament"].(map[string]any)
+	if !ok || load["supported"] != true {
+		t.Fatalf("load capability = %#v, want supported", snapshot.CommandCapabilities["load_filament"])
+	}
+	filament, ok := snapshot.CommandCapabilities["filament"].(map[string]any)
+	if !ok || filament["state"] != "loaded" || filament["state_source"] != filamentStateSourceBambuActiveSource || filament["source_kind"] != filamentSourceKindExternalSpool {
+		t.Fatalf("filament capability = %#v, want loaded external spool", snapshot.CommandCapabilities["filament"])
+	}
+	if _, exists := filament["action_state"]; exists {
+		t.Fatalf("filament action_state = %#v, want omitted when idle", filament["action_state"])
+	}
+}
+
+func TestParseBambuLANMQTTSnapshotPayloadDoesNotTreatVTTrayMetadataAloneAsLoaded(t *testing.T) {
+	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
+		"print": {
+			"gcode_state": "IDLE",
+			"print_type": "idle",
+			"vt_tray": {"tray_type":"PLA","tray_info_idx":"GFL99"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parseBambuLANMQTTSnapshotPayload failed: %v", err)
+	}
+	filament, ok := snapshot.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["state"] != "unknown" {
+		t.Fatalf("filament state = %v, want unknown", filament["state"])
+	}
+	if filament["source_kind"] != filamentSourceKindUnknown {
+		t.Fatalf("filament source_kind = %v, want unknown", filament["source_kind"])
+	}
+}
+
+func TestParseBambuLANMQTTSnapshotPayloadReportsAMSActiveSource(t *testing.T) {
+	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
+		"print": {
+			"gcode_state": "IDLE",
+			"print_type": "idle",
+			"ams": {"tray_now":"0"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parseBambuLANMQTTSnapshotPayload failed: %v", err)
+	}
+	filament, ok := snapshot.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["state"] != "loaded" {
+		t.Fatalf("filament state = %v, want loaded", filament["state"])
+	}
+	if filament["source_kind"] != filamentSourceKindAMS {
+		t.Fatalf("filament source_kind = %v, want ams", filament["source_kind"])
+	}
+	if filament["source_label"] != "AMS 1 / Tray 1" {
+		t.Fatalf("filament source_label = %v, want AMS 1 / Tray 1", filament["source_label"])
+	}
+}
+
+func TestMarkActionSuccessForFilamentCommandSetsActionStateNotFinalState(t *testing.T) {
+	a := newTestAgent(t)
+	a.currentState[1] = currentStateItem{
+		PrinterID:           1,
+		CurrentPrinterState: "idle",
+		CommandCapabilities: map[string]any{},
+	}
+
+	a.markActionSuccess(action{PrinterID: 1, Kind: "load_filament", CommandRequestID: 10})
+	filament, ok := a.currentState[1].CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability after success")
+	}
+	if filament["state"] != "unknown" {
+		t.Fatalf("filament state = %v, want unknown", filament["state"])
+	}
+	if filament["action_state"] != filamentActionStateLoading {
+		t.Fatalf("filament action_state = %v, want loading", filament["action_state"])
+	}
+}
+
+func TestResolveRuntimeFilamentCapabilityMarksBambuUnloadCompleteWhenSourceClears(t *testing.T) {
+	now := time.Now().UTC()
+	previous := currentStateItem{
+		PrinterID:  1,
+		ReportedAt: now.Add(-2 * time.Second),
+		CommandCapabilities: map[string]any{
+			"filament": map[string]any{
+				"state":             "unknown",
+				"action_state":      filamentActionStateUnloading,
+				"state_source":      filamentStateSourceCommandFallback,
+				"confidence":        filamentConfidenceHeuristic,
+				"source_kind":       filamentSourceKindExternalSpool,
+				"source_label":      "External spool",
+				"action_started_at": now.Add(-5 * time.Second).Format(time.RFC3339Nano),
+			},
+		},
+	}
+	current := previous
+	current.CommandCapabilities = mergeCommandCapabilities(previous.CommandCapabilities, map[string]any{
+		"filament": map[string]any{
+			"state":        "unknown",
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+			"source_kind":  filamentSourceKindNone,
+		},
+	})
+
+	resolveRuntimeFilamentCapability(edgeBinding{AdapterFamily: "bambu"}, &current, previous, bindingSnapshot{}, now)
+
+	filament, ok := current.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["state"] != "unloaded" {
+		t.Fatalf("filament state = %v, want unloaded", filament["state"])
+	}
+	if filament["action_state"] != filamentActionStateIdle {
+		t.Fatalf("filament action_state = %v, want idle", filament["action_state"])
+	}
+	if filament["source_kind"] != filamentSourceKindExternalSpool {
+		t.Fatalf("filament source_kind = %v, want external_spool", filament["source_kind"])
+	}
+}
+
+func TestResolveRuntimeFilamentCapabilityKeepsBambuLoadRunningUntilSourceReturns(t *testing.T) {
+	now := time.Now().UTC()
+	previous := currentStateItem{
+		PrinterID:  1,
+		ReportedAt: now.Add(-2 * time.Second),
+		CommandCapabilities: map[string]any{
+			"filament": map[string]any{
+				"state":             "unknown",
+				"action_state":      filamentActionStateLoading,
+				"state_source":      filamentStateSourceCommandFallback,
+				"confidence":        filamentConfidenceHeuristic,
+				"source_kind":       filamentSourceKindExternalSpool,
+				"source_label":      "External spool",
+				"action_started_at": now.Add(-5 * time.Second).Format(time.RFC3339Nano),
+			},
+		},
+	}
+	current := previous
+	current.CommandCapabilities = mergeCommandCapabilities(previous.CommandCapabilities, map[string]any{
+		"filament": map[string]any{
+			"state":        "unknown",
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+			"source_kind":  filamentSourceKindNone,
+		},
+	})
+
+	resolveRuntimeFilamentCapability(edgeBinding{AdapterFamily: "bambu"}, &current, previous, bindingSnapshot{}, now)
+
+	filament, ok := current.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["action_state"] != filamentActionStateLoading {
+		t.Fatalf("filament action_state = %v, want loading", filament["action_state"])
+	}
+	if filament["source_kind"] != filamentSourceKindExternalSpool {
+		t.Fatalf("filament source_kind = %v, want external_spool", filament["source_kind"])
+	}
+}
+
+func TestResolveRuntimeFilamentCapabilityMarksBambuLoadConfirmationRequiredAfterTimeout(t *testing.T) {
+	now := time.Now().UTC()
+	previous := currentStateItem{
+		PrinterID:  1,
+		ReportedAt: now.Add(-1 * time.Second),
+		CommandCapabilities: map[string]any{
+			"filament": map[string]any{
+				"state":             "unknown",
+				"action_state":      filamentActionStateLoading,
+				"state_source":      filamentStateSourceCommandFallback,
+				"confidence":        filamentConfidenceHeuristic,
+				"source_kind":       filamentSourceKindExternalSpool,
+				"source_label":      "External spool",
+				"action_started_at": now.Add(-bambuFilamentActionTimeout - time.Second).Format(time.RFC3339Nano),
+			},
+		},
+	}
+	current := previous
+	current.CommandCapabilities = mergeCommandCapabilities(previous.CommandCapabilities, map[string]any{
+		"filament": map[string]any{
+			"state":        "unknown",
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+			"source_kind":  filamentSourceKindNone,
+		},
+	})
+
+	resolveRuntimeFilamentCapability(edgeBinding{AdapterFamily: "bambu"}, &current, previous, bindingSnapshot{}, now)
+
+	filament, ok := current.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["action_state"] != filamentActionStateNeedsUserConfirmation {
+		t.Fatalf("filament action_state = %v, want needs_user_confirmation", filament["action_state"])
+	}
+	if filament["source_kind"] != filamentSourceKindExternalSpool {
+		t.Fatalf("filament source_kind = %v, want external_spool", filament["source_kind"])
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandLightOnPublishesSystemLEDPayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, brokerAddr, topic, username, password string, payload []byte, insecureSkipVerify bool) error {
+		if brokerAddr != "192.168.100.172:8883" {
+			t.Fatalf("brokerAddr = %q, want 192.168.100.172:8883", brokerAddr)
+		}
+		if topic != "device/printer_1/request" {
+			t.Fatalf("topic = %q, want device/printer_1/request", topic)
+		}
+		if username != "bblp" || password != "12345678" || !insecureSkipVerify {
+			t.Fatalf("unexpected mqtt auth payload")
+		}
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{
+			PrinterState: "idle",
+			JobState:     "pending",
+			CommandCapabilities: map[string]any{
+				"led": map[string]any{"supported": true, "state": "on"},
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "light_on"},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(light_on) failed: %v", err)
+	}
+	if _, ok := capturedPayload["system"]; !ok {
+		t.Fatalf("payload = %#v, want system envelope", capturedPayload)
+	}
+	systemPayload := capturedPayload["system"].(map[string]any)
+	if systemPayload["command"] != "ledctrl" {
+		t.Fatalf("command = %v, want ledctrl", systemPayload["command"])
+	}
+	if systemPayload["led_node"] != "chamber_light" {
+		t.Fatalf("led_node = %v, want chamber_light", systemPayload["led_node"])
+	}
+	if systemPayload["led_mode"] != "on" {
+		t.Fatalf("led_mode = %v, want on", systemPayload["led_mode"])
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandLoadFilamentPublishesChangeFilamentPayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "load_filament"},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(load_filament) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "ams_change_filament" {
+		t.Fatalf("command = %v, want ams_change_filament", printPayload["command"])
+	}
+	if printPayload["target"] != float64(255) {
+		t.Fatalf("target = %v, want 255", printPayload["target"])
 	}
 }
 
@@ -4002,7 +4656,7 @@ func TestDownloadArtifactChecksumMismatch(t *testing.T) {
 	srv := newFileServer(t, artifactPath)
 	defer srv.Close()
 
-	_, _, err := a.downloadArtifact(context.Background(), desiredStateItem{
+	_, err := a.downloadArtifact(context.Background(), desiredStateItem{
 		PrinterID:      1,
 		PlateID:        99,
 		ArtifactURL:    srv.URL,
@@ -4033,7 +4687,7 @@ func TestDownloadArtifactHonorsTimeoutBudget(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := a.downloadArtifact(context.Background(), desiredStateItem{
+	_, err := a.downloadArtifact(context.Background(), desiredStateItem{
 		PrinterID:      1,
 		PlateID:        1,
 		ArtifactURL:    srv.URL,
@@ -4058,7 +4712,7 @@ func TestDownloadArtifactSucceedsWithoutChecksum(t *testing.T) {
 	srv := newFileServer(t, artifactPath)
 	defer srv.Close()
 
-	readyPath, _, err := a.downloadArtifact(context.Background(), desiredStateItem{
+	artifact, err := a.downloadArtifact(context.Background(), desiredStateItem{
 		PrinterID:      1,
 		PlateID:        99,
 		ArtifactURL:    srv.URL,
@@ -4067,9 +4721,9 @@ func TestDownloadArtifactSucceedsWithoutChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected download to succeed without checksum, got: %v", err)
 	}
-	defer a.cleanupArtifact(readyPath)
+	defer a.cleanupArtifact(artifact.LocalPath)
 
-	data, readErr := os.ReadFile(readyPath)
+	data, readErr := os.ReadFile(artifact.LocalPath)
 	if readErr != nil {
 		t.Fatalf("failed to read staged artifact: %v", readErr)
 	}
@@ -4142,7 +4796,7 @@ func TestDownloadArtifactUsesContentDispositionExtension(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	readyPath, remoteName, err := a.downloadArtifact(context.Background(), desiredStateItem{
+	artifact, err := a.downloadArtifact(context.Background(), desiredStateItem{
 		PrinterID:      1,
 		PlateID:        99,
 		ArtifactURL:    srv.URL,
@@ -4151,13 +4805,20 @@ func TestDownloadArtifactUsesContentDispositionExtension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("downloadArtifact failed: %v", err)
 	}
-	defer a.cleanupArtifact(readyPath)
+	defer a.cleanupArtifact(artifact.LocalPath)
 
-	if !strings.HasSuffix(remoteName, ".gcode.3mf") {
-		t.Fatalf("remoteName = %q, want .gcode.3mf suffix", remoteName)
+	if artifact.SourceFilename != "plate.gcode.3mf" {
+		t.Fatalf("source filename = %q, want plate.gcode.3mf", artifact.SourceFilename)
 	}
-	if !strings.HasSuffix(filepath.Base(readyPath), ".gcode.3mf.ready") {
-		t.Fatalf("readyPath = %q, want .gcode.3mf.ready suffix", readyPath)
+	if artifact.NormalizedExtension != ".gcode.3mf" {
+		t.Fatalf("normalized extension = %q, want .gcode.3mf", artifact.NormalizedExtension)
+	}
+	wantRemoteName := "pfh-" + hex.EncodeToString(sum[:]) + ".gcode.3mf"
+	if artifact.RemoteName != wantRemoteName {
+		t.Fatalf("remoteName = %q, want %q", artifact.RemoteName, wantRemoteName)
+	}
+	if !strings.HasSuffix(filepath.Base(artifact.LocalPath), ".gcode.3mf.ready") {
+		t.Fatalf("readyPath = %q, want .gcode.3mf.ready suffix", artifact.LocalPath)
 	}
 }
 
@@ -4188,7 +4849,7 @@ func TestDownloadArtifactResolvesRelativeURLWithControlPlaneAuth(t *testing.T) {
 	a.claimed = true
 	a.mu.Unlock()
 
-	readyPath, _, err := a.downloadArtifact(context.Background(), desiredStateItem{
+	artifact, err := a.downloadArtifact(context.Background(), desiredStateItem{
 		PrinterID:      1,
 		PlateID:        42,
 		ArtifactURL:    "/edge/artifacts/plates/42",
@@ -4197,9 +4858,9 @@ func TestDownloadArtifactResolvesRelativeURLWithControlPlaneAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("downloadArtifact failed: %v", err)
 	}
-	defer a.cleanupArtifact(readyPath)
+	defer a.cleanupArtifact(artifact.LocalPath)
 
-	data, readErr := os.ReadFile(readyPath)
+	data, readErr := os.ReadFile(artifact.LocalPath)
 	if readErr != nil {
 		t.Fatalf("read staged artifact failed: %v", readErr)
 	}
@@ -4259,10 +4920,12 @@ func TestExecutePrintActionUploadsAndStarts(t *testing.T) {
 	defer artifactSrv.Close()
 
 	var (
-		mu           sync.Mutex
-		uploadCalls  int
-		startCalls   int
-		uploadedData []byte
+		mu               sync.Mutex
+		uploadCalls      int
+		startCalls       int
+		uploadedData     []byte
+		uploadedChecksum string
+		uploadedFilename string
 	)
 	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -4271,7 +4934,7 @@ func TestExecutePrintActionUploadsAndStarts(t *testing.T) {
 			if err := r.ParseMultipartForm(2 << 20); err != nil {
 				t.Fatalf("parse multipart form failed: %v", err)
 			}
-			file, _, err := r.FormFile("file")
+			file, header, err := r.FormFile("file")
 			if err != nil {
 				t.Fatalf("missing file form field: %v", err)
 			}
@@ -4282,6 +4945,8 @@ func TestExecutePrintActionUploadsAndStarts(t *testing.T) {
 			}
 			mu.Lock()
 			uploadedData = body
+			uploadedChecksum = r.FormValue("checksum")
+			uploadedFilename = header.Filename
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		case "/printer/print/start":
@@ -4321,6 +4986,190 @@ func TestExecutePrintActionUploadsAndStarts(t *testing.T) {
 	defer mu.Unlock()
 	if string(uploadedData) != string(artifact) {
 		t.Fatalf("uploaded artifact mismatch: got %q want %q", string(uploadedData), string(artifact))
+	}
+	if uploadedChecksum != hex.EncodeToString(checksum[:]) {
+		t.Fatalf("uploaded checksum = %q, want %q", uploadedChecksum, hex.EncodeToString(checksum[:]))
+	}
+	if uploadedFilename != "pfh-"+hex.EncodeToString(checksum[:])+".gcode" {
+		t.Fatalf("uploaded filename = %q, want canonical checksum filename", uploadedFilename)
+	}
+}
+
+func TestExecutePrintActionReusesExistingMoonrakerArtifact(t *testing.T) {
+	a := newTestAgent(t)
+	artifact := []byte("G1 X20 Y20\n")
+	checksum := sha256.Sum256(artifact)
+	expectedRemoteName := "pfh-" + hex.EncodeToString(checksum[:]) + ".gcode"
+
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	var (
+		metadataCalls int
+		downloadCalls int
+		uploadCalls   int
+		startCalls    int
+	)
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			metadataCalls++
+			if got := r.URL.Query().Get("filename"); got != expectedRemoteName {
+				t.Fatalf("metadata filename = %q, want %q", got, expectedRemoteName)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"size": len(artifact)}})
+		case "/server/files/gcodes/" + expectedRemoteName:
+			downloadCalls++
+			_, _ = w.Write(artifact)
+		case "/server/files/upload":
+			uploadCalls++
+			t.Fatalf("moonraker upload should be skipped when remote artifact matches")
+		case "/printer/print/start":
+			startCalls++
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode print start payload failed: %v", err)
+			}
+			if payload["filename"] != expectedRemoteName {
+				t.Fatalf("start filename = %q, want %q", payload["filename"], expectedRemoteName)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	act := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             8,
+			IntentVersion:       10,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			ArtifactURL:         artifactSrv.URL + "/plate.gcode",
+			ChecksumSHA256:      hex.EncodeToString(checksum[:]),
+		},
+	}
+
+	if err := a.executeAction(context.Background(), act, edgeBinding{PrinterID: 1, EndpointURL: moonrakerSrv.URL}); err != nil {
+		t.Fatalf("executeAction(print) failed: %v", err)
+	}
+	if metadataCalls != 1 {
+		t.Fatalf("metadata calls = %d, want 1", metadataCalls)
+	}
+	if downloadCalls != 1 {
+		t.Fatalf("download calls = %d, want 1", downloadCalls)
+	}
+	if uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want 0", uploadCalls)
+	}
+	if startCalls != 1 {
+		t.Fatalf("start calls = %d, want 1", startCalls)
+	}
+}
+
+func TestExecutePrintActionUploadsWhenMoonrakerRemoteArtifactDiffers(t *testing.T) {
+	a := newTestAgent(t)
+	localArtifact := []byte("G1 X30 Y30\n")
+	remoteArtifact := []byte("G1 X99 Y99\n")
+	checksum := sha256.Sum256(localArtifact)
+	expectedRemoteName := "pfh-" + hex.EncodeToString(checksum[:]) + ".gcode"
+
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(localArtifact)
+	}))
+	defer artifactSrv.Close()
+
+	var uploadCalls int
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"size": len(localArtifact)}})
+		case "/server/files/gcodes/" + expectedRemoteName:
+			_, _ = w.Write(remoteArtifact)
+		case "/server/files/upload":
+			uploadCalls++
+			w.WriteHeader(http.StatusOK)
+		case "/printer/print/start":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	act := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             9,
+			IntentVersion:       11,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			ArtifactURL:         artifactSrv.URL + "/plate.gcode",
+			ChecksumSHA256:      hex.EncodeToString(checksum[:]),
+		},
+	}
+
+	if err := a.executeAction(context.Background(), act, edgeBinding{PrinterID: 1, EndpointURL: moonrakerSrv.URL}); err != nil {
+		t.Fatalf("executeAction(print) failed: %v", err)
+	}
+	if uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", uploadCalls)
+	}
+}
+
+func TestExecutePrintActionFallsBackToUploadWhenMoonrakerProbeFails(t *testing.T) {
+	a := newTestAgent(t)
+	artifact := []byte("G1 X40 Y40\n")
+	checksum := sha256.Sum256(artifact)
+
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	var uploadCalls int
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/server/files/upload":
+			uploadCalls++
+			w.WriteHeader(http.StatusOK)
+		case "/printer/print/start":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	act := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             10,
+			IntentVersion:       12,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			ArtifactURL:         artifactSrv.URL + "/plate.gcode",
+			ChecksumSHA256:      hex.EncodeToString(checksum[:]),
+		},
+	}
+
+	if err := a.executeAction(context.Background(), act, edgeBinding{PrinterID: 1, EndpointURL: moonrakerSrv.URL}); err != nil {
+		t.Fatalf("executeAction(print) failed: %v", err)
+	}
+	if uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", uploadCalls)
 	}
 }
 
@@ -4853,6 +5702,360 @@ func TestExecuteBambuLANPrintActionMarksQueuedBeforeVerificationCompletes(t *tes
 	close(releaseVerification)
 	if err := <-errCh; err != nil {
 		t.Fatalf("executeBambuLANPrintAction failed: %v", err)
+	}
+}
+
+func TestDefaultProbeBambuLANArtifactReusesMatchingRemoteFile(t *testing.T) {
+	artifactBytes := []byte("3mf-bytes")
+	md5Sum := md5.Sum(artifactBytes)
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:    int64(len(artifactBytes)),
+		retrieveData: artifactBytes,
+	}
+
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	reused, reason, err := defaultProbeBambuLANArtifact(
+		context.Background(),
+		bambustore.BambuLANCredentials{Host: "192.168.0.10", AccessCode: "12345678"},
+		"pfh-test.gcode.3mf",
+		stagedArtifact{
+			SizeBytes: int64(len(artifactBytes)),
+			MD5:       hex.EncodeToString(md5Sum[:]),
+		},
+	)
+	if err != nil {
+		t.Fatalf("defaultProbeBambuLANArtifact failed: %v", err)
+	}
+	if !reused {
+		t.Fatalf("expected probe to reuse matching remote artifact")
+	}
+	if reason != "md5_match" {
+		t.Fatalf("reason = %q, want md5_match", reason)
+	}
+	if len(fakeClient.retrievedRemoteNames) != 1 || fakeClient.retrievedRemoteNames[0] != "pfh-test.gcode.3mf" {
+		t.Fatalf("retrieved remote names = %#v, want probe target", fakeClient.retrievedRemoteNames)
+	}
+}
+
+func TestDefaultUploadBambuLANArtifactDeletesThenRetriesOnOverwrite(t *testing.T) {
+	fakeClient := &fakeBambuLANArtifactClient{
+		storeErrs: []error{
+			&bambuLANFTPSResponseError{Command: "STOR pfh-test.gcode.3mf", Code: 553, Message: "file exists"},
+		},
+	}
+
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	err := defaultUploadBambuLANArtifact(
+		context.Background(),
+		bambustore.BambuLANCredentials{Host: "192.168.0.10", AccessCode: "12345678"},
+		"pfh-test.gcode.3mf",
+		[]byte("3mf-bytes"),
+	)
+	if err != nil {
+		t.Fatalf("defaultUploadBambuLANArtifact failed: %v", err)
+	}
+	if len(fakeClient.storedRemoteNames) != 2 {
+		t.Fatalf("store calls = %d, want 2", len(fakeClient.storedRemoteNames))
+	}
+	if len(fakeClient.deletedRemoteNames) != 1 || fakeClient.deletedRemoteNames[0] != "pfh-test.gcode.3mf" {
+		t.Fatalf("deleted remote names = %#v, want overwrite delete", fakeClient.deletedRemoteNames)
+	}
+}
+
+func TestExecuteBambuLANPrintActionReusesExistingArtifact(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifact := []byte("3mf-bytes")
+	sum := sha256.Sum256(artifact)
+	md5Sum := md5.Sum(artifact)
+	expectedRemoteName := "pfh-" + hex.EncodeToString(sum[:]) + ".gcode.3mf"
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	previousProbe := probeBambuLANArtifact
+	probeBambuLANArtifact = func(_ context.Context, _ bambustore.BambuLANCredentials, remoteName string, artifact stagedArtifact) (bool, string, error) {
+		if remoteName != expectedRemoteName {
+			t.Fatalf("probe remoteName = %q, want %q", remoteName, expectedRemoteName)
+		}
+		if artifact.MD5 != hex.EncodeToString(md5Sum[:]) {
+			t.Fatalf("artifact md5 = %q, want %q", artifact.MD5, hex.EncodeToString(md5Sum[:]))
+		}
+		return true, "md5_match", nil
+	}
+	t.Cleanup(func() {
+		probeBambuLANArtifact = previousProbe
+	})
+
+	var uploadCalls int
+	previousUpload := uploadBambuLANArtifact
+	uploadBambuLANArtifact = func(_ context.Context, _ bambustore.BambuLANCredentials, _ string, _ []byte) error {
+		uploadCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		uploadBambuLANArtifact = previousUpload
+	})
+
+	var dispatched bambuLANProjectFileRequest
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, req bambuLANProjectFileRequest) error {
+		dispatched = req
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{
+			PrinterState:    "printing",
+			JobState:        "printing",
+			TelemetrySource: telemetrySourceBambuLANMQTT,
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             26,
+			IntentVersion:       12,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-456",
+			ArtifactURL:         artifactSrv.URL + "/plate.3mf",
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+
+	if err := a.executeBambuLANPrintAction(
+		context.Background(),
+		queuedAction,
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	); err != nil {
+		t.Fatalf("executeBambuLANPrintAction failed: %v", err)
+	}
+	if uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want 0", uploadCalls)
+	}
+	if dispatched.RemoteName != expectedRemoteName {
+		t.Fatalf("dispatch remote name = %q, want %q", dispatched.RemoteName, expectedRemoteName)
+	}
+	if dispatched.FileMD5 != strings.ToUpper(hex.EncodeToString(md5Sum[:])) {
+		t.Fatalf("dispatch file md5 = %q, want uppercase MD5", dispatched.FileMD5)
+	}
+}
+
+func TestExecuteBambuLANPrintActionUploadsOnProbeMismatch(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifact := []byte("3mf-bytes")
+	sum := sha256.Sum256(artifact)
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	previousProbe := probeBambuLANArtifact
+	probeBambuLANArtifact = func(context.Context, bambustore.BambuLANCredentials, string, stagedArtifact) (bool, string, error) {
+		return false, "md5_mismatch", nil
+	}
+	t.Cleanup(func() {
+		probeBambuLANArtifact = previousProbe
+	})
+
+	var uploadCalls int
+	previousUpload := uploadBambuLANArtifact
+	uploadBambuLANArtifact = func(_ context.Context, _ bambustore.BambuLANCredentials, _ string, _ []byte) error {
+		uploadCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		uploadBambuLANArtifact = previousUpload
+	})
+
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, _ bambuLANProjectFileRequest) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{
+			PrinterState:    "printing",
+			JobState:        "printing",
+			TelemetrySource: telemetrySourceBambuLANMQTT,
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             27,
+			IntentVersion:       13,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-789",
+			ArtifactURL:         artifactSrv.URL + "/plate.3mf",
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+
+	if err := a.executeBambuLANPrintAction(
+		context.Background(),
+		queuedAction,
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	); err != nil {
+		t.Fatalf("executeBambuLANPrintAction failed: %v", err)
+	}
+	if uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", uploadCalls)
+	}
+}
+
+func TestExecuteBambuLANPrintActionFallsBackToUploadOnProbeError(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifact := []byte("3mf-bytes")
+	sum := sha256.Sum256(artifact)
+	artifactSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(artifact)
+	}))
+	defer artifactSrv.Close()
+
+	previousProbe := probeBambuLANArtifact
+	probeBambuLANArtifact = func(context.Context, bambustore.BambuLANCredentials, string, stagedArtifact) (bool, string, error) {
+		return false, "size_probe_error", errors.New("probe timeout")
+	}
+	t.Cleanup(func() {
+		probeBambuLANArtifact = previousProbe
+	})
+
+	var uploadCalls int
+	previousUpload := uploadBambuLANArtifact
+	uploadBambuLANArtifact = func(_ context.Context, _ bambustore.BambuLANCredentials, _ string, _ []byte) error {
+		uploadCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		uploadBambuLANArtifact = previousUpload
+	})
+
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, _ bambuLANProjectFileRequest) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{
+			PrinterState:    "printing",
+			JobState:        "printing",
+			TelemetrySource: telemetrySourceBambuLANMQTT,
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	queuedAction := action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			PlateID:             28,
+			IntentVersion:       14,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-999",
+			ArtifactURL:         artifactSrv.URL + "/plate.3mf",
+			ChecksumSHA256:      hex.EncodeToString(sum[:]),
+		},
+	}
+
+	if err := a.executeBambuLANPrintAction(
+		context.Background(),
+		queuedAction,
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	); err != nil {
+		t.Fatalf("executeBambuLANPrintAction failed: %v", err)
+	}
+	if uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", uploadCalls)
 	}
 }
 

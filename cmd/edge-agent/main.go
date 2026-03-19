@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -117,6 +119,31 @@ type desiredStateItem struct {
 	ChecksumSHA256      string `json:"checksum_sha256"`
 }
 
+type stagedArtifact struct {
+	LocalPath           string
+	SourceFilename      string
+	NormalizedExtension string
+	SizeBytes           int64
+	SHA256              string
+	MD5                 string
+	RemoteName          string
+}
+
+func (a stagedArtifact) preferredSourceName() string {
+	if source := strings.TrimSpace(a.SourceFilename); source != "" {
+		return source
+	}
+	return strings.TrimSpace(a.RemoteName)
+}
+
+func (a stagedArtifact) moonrakerRemoteName() string {
+	return strings.TrimSpace(a.RemoteName)
+}
+
+func (a stagedArtifact) bambuLANRemoteName() string {
+	return normalizeBambuLANRemoteStartFilename(strings.TrimSpace(a.RemoteName))
+}
+
 type desiredStateResponse struct {
 	SchemaVersion int                `json:"schema_version"`
 	States        []desiredStateItem `json:"states"`
@@ -147,12 +174,51 @@ type configCommandsResponse struct {
 	Commands []configCommandItem `json:"commands"`
 }
 
+type printerCommandItem struct {
+	CommandID  int             `json:"command_id"`
+	PrinterID  int             `json:"printer_id"`
+	CommandKey string          `json:"command_key"`
+	Payload    json.RawMessage `json:"payload"`
+	CreatedAt  edgeTimestamp   `json:"created_at"`
+	ExpiresAt  edgeTimestamp   `json:"expires_at"`
+}
+
+type printerCommandsResponse struct {
+	Commands []printerCommandItem `json:"commands"`
+}
+
+type cameraSessionItem struct {
+	SessionID     string `json:"session_id"`
+	PrinterID     int    `json:"printer_id"`
+	AdapterFamily string `json:"adapter_family"`
+	IngestURL     string `json:"ingest_url"`
+	CloseURL      string `json:"close_url"`
+}
+
+type cameraSessionsResponse struct {
+	Sessions []cameraSessionItem `json:"sessions"`
+}
+
+type cameraSessionCloseRequest struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
 type configCommandAckRequest struct {
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }
 
 type configCommandAckResponse struct {
+	Accepted bool `json:"accepted"`
+}
+
+type printerCommandAckRequest struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+type printerCommandAckResponse struct {
 	Accepted bool `json:"accepted"`
 }
 
@@ -179,23 +245,57 @@ type bambuLANCredentialsUpsertPayload struct {
 }
 
 type currentStateItem struct {
-	PrinterID            int       `json:"printer_id"`
-	CurrentPrinterState  string    `json:"current_printer_state"`
-	CurrentJobState      string    `json:"current_job_state,omitempty"`
-	JobID                string    `json:"job_id,omitempty"`
-	PlateID              int       `json:"plate_id,omitempty"`
-	IntentVersionApplied int       `json:"intent_version_applied,omitempty"`
-	IsPaused             bool      `json:"is_paused"`
-	IsCanceled           bool      `json:"is_canceled"`
-	LastErrorCode        string    `json:"last_error_code,omitempty"`
-	LastErrorMessage     string    `json:"last_error_message,omitempty"`
-	TotalPrintSeconds    *float64  `json:"total_print_seconds,omitempty"`
-	ProgressPct          *float64  `json:"progress_pct,omitempty"`
-	RemainingSeconds     *float64  `json:"remaining_seconds,omitempty"`
-	TelemetrySource      string    `json:"telemetry_source,omitempty"`
-	ManualIntervention   string    `json:"manual_intervention,omitempty"`
-	ReportedAt           time.Time `json:"reported_at"`
+	PrinterID            int            `json:"printer_id"`
+	CurrentPrinterState  string         `json:"current_printer_state"`
+	CurrentJobState      string         `json:"current_job_state,omitempty"`
+	JobID                string         `json:"job_id,omitempty"`
+	PlateID              int            `json:"plate_id,omitempty"`
+	IntentVersionApplied int            `json:"intent_version_applied,omitempty"`
+	IsPaused             bool           `json:"is_paused"`
+	IsCanceled           bool           `json:"is_canceled"`
+	LastErrorCode        string         `json:"last_error_code,omitempty"`
+	LastErrorMessage     string         `json:"last_error_message,omitempty"`
+	TotalPrintSeconds    *float64       `json:"total_print_seconds,omitempty"`
+	ProgressPct          *float64       `json:"progress_pct,omitempty"`
+	RemainingSeconds     *float64       `json:"remaining_seconds,omitempty"`
+	TelemetrySource      string         `json:"telemetry_source,omitempty"`
+	ManualIntervention   string         `json:"manual_intervention,omitempty"`
+	CommandCapabilities  map[string]any `json:"command_capabilities,omitempty"`
+	ReportedAt           time.Time      `json:"reported_at"`
 }
+
+const (
+	filamentActionStateIdle                  = "idle"
+	filamentActionStateLoading               = "loading"
+	filamentActionStateUnloading             = "unloading"
+	filamentActionStateNeedsUserConfirmation = "needs_user_confirmation"
+)
+
+const (
+	filamentStateSourceMoonrakerSensor    = "moonraker_sensor"
+	filamentStateSourceBambuActiveSource  = "bambu_active_source"
+	filamentStateSourceBambuCommandMemory = "bambu_command_memory"
+	filamentStateSourceCommandFallback    = "command_fallback"
+	filamentStateSourceUnknown            = "unknown"
+)
+
+const (
+	filamentSourceKindExternalSpool = "external_spool"
+	filamentSourceKindAMS           = "ams"
+	filamentSourceKindNone          = "none"
+	filamentSourceKindUnknown       = "unknown"
+)
+
+const (
+	filamentConfidenceConfirmed = "confirmed"
+	filamentConfidenceHeuristic = "heuristic"
+)
+
+const (
+	moonrakerFilamentActionTimeout = 20 * time.Second
+	bambuFilamentActionTimeout     = 45 * time.Second
+	bambuFilamentMemoryGrace       = 10 * time.Second
+)
 
 type pushStateRequest struct {
 	States []currentStateItem `json:"states"`
@@ -378,26 +478,28 @@ type setupClaimRequest struct {
 }
 
 type action struct {
-	PrinterID   int              `json:"printer_id"`
-	Kind        string           `json:"kind"`
-	Reason      string           `json:"reason"`
-	Target      desiredStateItem `json:"target"`
-	EnqueuedAt  time.Time        `json:"enqueued_at"`
-	Attempts    int              `json:"attempts"`
-	NextAttempt time.Time        `json:"next_attempt"`
+	PrinterID        int              `json:"printer_id"`
+	Kind             string           `json:"kind"`
+	Reason           string           `json:"reason"`
+	Target           desiredStateItem `json:"target"`
+	CommandRequestID int              `json:"command_request_id,omitempty"`
+	EnqueuedAt       time.Time        `json:"enqueued_at"`
+	Attempts         int              `json:"attempts"`
+	NextAttempt      time.Time        `json:"next_attempt"`
 }
 
 type bindingSnapshot struct {
-	PrinterState       string
-	JobState           string
-	TotalPrintSeconds  *float64
-	ProgressPct        *float64
-	RemainingSeconds   *float64
-	TelemetrySource    string
-	RawPrinterStatus   string
-	ManualIntervention string
-	DetectedName       string
-	DetectedModelHint  string
+	PrinterState        string
+	JobState            string
+	TotalPrintSeconds   *float64
+	ProgressPct         *float64
+	RemainingSeconds    *float64
+	TelemetrySource     string
+	RawPrinterStatus    string
+	ManualIntervention  string
+	CommandCapabilities map[string]any
+	DetectedName        string
+	DetectedModelHint   string
 }
 
 type bambuAuthState struct {
@@ -428,6 +530,7 @@ type appConfig struct {
 	BambuCloudMQTTBroker        string
 	BambuCloudMQTTTopicTemplate string
 	BambuConnectURI             string
+	BambuCameraHelperMJPEGURLTemplate string
 	BindingsPollInterval        time.Duration
 	ConfigCommandsPollInterval  time.Duration
 	DesiredStatePollInterval    time.Duration
@@ -506,8 +609,9 @@ type agent struct {
 	bambuLANRecoveryUntil map[int]time.Time
 	bambuLANProbeHosts    map[string]time.Time
 
-	localObservations *localObservationStore
-	auditMu           sync.Mutex
+	localObservations    *localObservationStore
+	activeCameraSessions map[string]context.CancelFunc
+	auditMu              sync.Mutex
 }
 
 func main() {
@@ -537,6 +641,7 @@ func main() {
 		bambuLANRecoveryUntil: make(map[int]time.Time),
 		bambuLANProbeHosts:    make(map[string]time.Time),
 		localObservations:     newLocalObservationStore(),
+		activeCameraSessions:  make(map[string]context.CancelFunc),
 	}
 	bambuLANStoreWarning := ""
 	if cfg.EnableBambu {
@@ -623,9 +728,11 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(11)
+	wg.Add(13)
 	go app.bindingsPollLoop(rootCtx, &wg)
 	go app.configCommandsPollLoop(rootCtx, &wg)
+	go app.printerCommandsPollLoop(rootCtx, &wg)
+	go app.cameraSessionsPollLoop(rootCtx, &wg)
 	go app.desiredStatePollLoop(rootCtx, &wg)
 	go app.convergenceLoop(rootCtx, &wg)
 	go app.actionExecLoop(rootCtx, &wg)
@@ -1190,6 +1297,7 @@ func loadConfig() appConfig {
 		BambuCloudMQTTBroker:        getEnvOrDefault("BAMBU_CLOUD_MQTT_BROKER", defaultBambuCloudMQTTBroker(bambuCloudAuthBaseURL)),
 		BambuCloudMQTTTopicTemplate: getEnvOrDefault("BAMBU_CLOUD_MQTT_TOPIC_TEMPLATE", defaultBambuMQTTTopic),
 		BambuConnectURI:             getEnvOrDefault("BAMBU_CONNECT_URI", ""),
+		BambuCameraHelperMJPEGURLTemplate: getEnvOrDefault("BAMBU_CAMERA_HELPER_MJPEG_URL_TEMPLATE", "http://127.0.0.1:1984/api/stream.mjpeg?src=p1s"),
 		BindingsPollInterval:        parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
 		ConfigCommandsPollInterval:  parseDurationMS("CONFIG_COMMANDS_POLL_INTERVAL_MS", 5000),
 		DesiredStatePollInterval:    parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
@@ -1609,6 +1717,9 @@ func (a *agent) buildClaimCapabilities() map[string]string {
 	}
 	enabledAdapters := strings.Join(discoveryAllowedAdapters, ",")
 	bambuAuthReady := a.isBambuAuthReady()
+	localWebUIURL := strings.TrimSpace(a.localWebUIURLSnapshot())
+	localWebUIPort := localWebUIPortFromURL(localWebUIURL)
+	_, ffmpegErr := exec.LookPath("ffmpeg")
 	return map[string]string{
 		"adapter_family":             "klipper",
 		"discovery_profile_max":      parseDiscoveryProfile(a.cfg.DiscoveryProfileMax),
@@ -1617,6 +1728,9 @@ func (a *agent) buildClaimCapabilities() map[string]string {
 		"enabled_adapters":           enabledAdapters,
 		"bambu_enabled":              strconv.FormatBool(a.cfg.EnableBambu),
 		"bambu_auth_ready":           strconv.FormatBool(bambuAuthReady),
+		"local_web_ui_url":           localWebUIURL,
+		"local_web_ui_port":          localWebUIPort,
+		"ffmpeg_available":           strconv.FormatBool(ffmpegErr == nil),
 	}
 }
 
@@ -2034,6 +2148,708 @@ func (a *agent) acknowledgeConfigCommand(
 	return nil
 }
 
+func (a *agent) printerCommandsPollLoop(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	interval := a.cfg.ConfigCommandsPollInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !a.isClaimed() {
+				continue
+			}
+			if err := a.pollPrinterCommandsOnce(ctx); err != nil {
+				a.audit("printer_commands_poll_error", map[string]any{"error": err.Error()})
+			}
+		}
+	}
+}
+
+func (a *agent) pollPrinterCommandsOnce(ctx context.Context) error {
+	bootstrap := a.snapshotBootstrap()
+	if bootstrap.AgentID == "" {
+		return nil
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/edge/agents/%s/printer-commands",
+		strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"),
+		bootstrap.AgentID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		a.audit("printer_commands_schema_mismatch", map[string]any{
+			"status_code": resp.StatusCode,
+			"body":        strings.TrimSpace(string(body)),
+		})
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("printer_commands", resp.StatusCode, string(body))
+			return fmt.Errorf("%w: printer-commands returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("printer-commands returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var payload printerCommandsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return err
+	}
+	if len(payload.Commands) == 0 {
+		return nil
+	}
+
+	queuedCount := 0
+	var firstErr error
+	for _, command := range payload.Commands {
+		if err := a.enqueuePrinterCommand(command); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			a.audit("printer_command_enqueue_error", map[string]any{
+				"command_id":  command.CommandID,
+				"printer_id":  command.PrinterID,
+				"command_key": strings.TrimSpace(command.CommandKey),
+				"error":       err.Error(),
+			})
+			if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, command.CommandID, "failed", err.Error()); ackErr != nil && firstErr == nil {
+				firstErr = ackErr
+			}
+			continue
+		}
+		queuedCount++
+	}
+	a.audit("printer_commands_updated", map[string]any{
+		"command_count": len(payload.Commands),
+		"queued_count":  queuedCount,
+	})
+	return firstErr
+}
+
+func (a *agent) enqueuePrinterCommand(command printerCommandItem) error {
+	commandKey := strings.TrimSpace(command.CommandKey)
+	if command.CommandID == 0 {
+		return errors.New("validation_error: printer command is missing command_id")
+	}
+	if command.PrinterID == 0 {
+		return errors.New("validation_error: printer command is missing printer_id")
+	}
+	switch commandKey {
+	case "light_on", "light_off", "load_filament", "unload_filament":
+	default:
+		return fmt.Errorf("validation_error: unsupported printer command key %q", commandKey)
+	}
+
+	now := time.Now().UTC()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if hasQueuedPrinterCommandLocked(a.actionQueue[command.PrinterID], command.CommandID) {
+		return nil
+	}
+	if inflight, ok := a.inflightActions[command.PrinterID]; ok && inflight.CommandRequestID == command.CommandID {
+		return nil
+	}
+	a.actionQueue[command.PrinterID] = append(a.actionQueue[command.PrinterID], action{
+		PrinterID:        command.PrinterID,
+		Kind:             commandKey,
+		Reason:           fmt.Sprintf("printer command %s", commandKey),
+		CommandRequestID: command.CommandID,
+		EnqueuedAt:       now,
+		Attempts:         0,
+		NextAttempt:      now,
+	})
+	return nil
+}
+
+func hasQueuedPrinterCommandLocked(queue []action, commandRequestID int) bool {
+	for _, item := range queue {
+		if item.CommandRequestID == commandRequestID && commandRequestID != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *agent) acknowledgePrinterCommand(
+	ctx context.Context,
+	bootstrap bootstrapConfig,
+	commandID int,
+	statusValue string,
+	errorValue string,
+) error {
+	endpoint := fmt.Sprintf(
+		"%s/edge/agents/%s/printer-commands/%d/ack",
+		strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"),
+		bootstrap.AgentID,
+		commandID,
+	)
+
+	reqBody := printerCommandAckRequest{
+		Status: strings.TrimSpace(statusValue),
+		Error:  strings.TrimSpace(errorValue),
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("printer_command_ack", resp.StatusCode, string(body))
+			return fmt.Errorf("%w: printer command ack returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("printer command ack returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var ackResp printerCommandAckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ackResp); err != nil {
+		return err
+	}
+	if !ackResp.Accepted {
+		return errors.New("printer command ack not accepted")
+	}
+	return nil
+}
+
+func (a *agent) cameraSessionsPollLoop(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !a.isClaimed() {
+				continue
+			}
+			if err := a.pollCameraSessionsOnce(ctx); err != nil {
+				a.audit("camera_sessions_poll_error", map[string]any{"error": err.Error()})
+			}
+		}
+	}
+}
+
+func (a *agent) pollCameraSessionsOnce(ctx context.Context) error {
+	bootstrap := a.snapshotBootstrap()
+	if bootstrap.AgentID == "" {
+		return nil
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/edge/agents/%s/camera-sessions",
+		strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"),
+		bootstrap.AgentID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		a.syncCameraSessionWorkers(ctx, bootstrap, nil)
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("camera_sessions", resp.StatusCode, string(body))
+			return fmt.Errorf("%w: camera-sessions returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("camera-sessions returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var payload cameraSessionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return err
+	}
+	a.syncCameraSessionWorkers(ctx, bootstrap, payload.Sessions)
+	return nil
+}
+
+func (a *agent) syncCameraSessionWorkers(ctx context.Context, bootstrap bootstrapConfig, sessions []cameraSessionItem) {
+	wanted := make(map[string]cameraSessionItem, len(sessions))
+	for _, session := range sessions {
+		if session.SessionID == "" || session.PrinterID == 0 {
+			continue
+		}
+		wanted[session.SessionID] = session
+	}
+
+	type workerStart struct {
+		session cameraSessionItem
+		ctx     context.Context
+	}
+	toStart := make([]workerStart, 0)
+
+	a.mu.Lock()
+	for sessionID, cancel := range a.activeCameraSessions {
+		if _, ok := wanted[sessionID]; ok {
+			continue
+		}
+		cancel()
+		delete(a.activeCameraSessions, sessionID)
+	}
+	for sessionID, session := range wanted {
+		if _, ok := a.activeCameraSessions[sessionID]; ok {
+			continue
+		}
+		workerCtx, cancel := context.WithCancel(ctx)
+		a.activeCameraSessions[sessionID] = cancel
+		toStart = append(toStart, workerStart{session: session, ctx: workerCtx})
+	}
+	a.mu.Unlock()
+
+	for _, item := range toStart {
+		go a.runCameraSessionWorker(item.ctx, bootstrap, item.session)
+	}
+}
+
+func (a *agent) runCameraSessionWorker(ctx context.Context, bootstrap bootstrapConfig, session cameraSessionItem) {
+	defer a.finishCameraSessionWorker(session.SessionID)
+
+	binding, ok := a.snapshotBinding(session.PrinterID)
+	if !ok {
+		_ = a.closeCameraSessionRemote(ctx, bootstrap, session, "error", "missing printer binding for camera session")
+		return
+	}
+
+	reader, contentType, err := a.openCameraSessionReader(ctx, binding)
+	if err != nil {
+		_ = a.closeCameraSessionRemote(ctx, bootstrap, session, "error", err.Error())
+		return
+	}
+	defer reader.Close()
+
+	if err := a.ingestCameraSession(ctx, bootstrap, session, contentType, reader); err != nil {
+		if ctx.Err() == nil {
+			_ = a.closeCameraSessionRemote(ctx, bootstrap, session, "error", err.Error())
+		}
+		return
+	}
+	if ctx.Err() == nil {
+		_ = a.closeCameraSessionRemote(ctx, bootstrap, session, "closed", "")
+	}
+}
+
+func (a *agent) finishCameraSessionWorker(sessionID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.activeCameraSessions[sessionID]; ok {
+		delete(a.activeCameraSessions, sessionID)
+	}
+}
+
+func (a *agent) openCameraSessionReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
+	switch normalizeAdapterFamily(binding.AdapterFamily) {
+	case "moonraker":
+		return a.openMoonrakerCameraReader(ctx, binding)
+	case "bambu":
+		return a.openBambuCameraReader(ctx, binding)
+	default:
+		return nil, "", fmt.Errorf("camera unsupported for adapter %s", strings.TrimSpace(binding.AdapterFamily))
+	}
+}
+
+func (a *agent) openMoonrakerCameraReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
+	webcam, err := a.fetchMoonrakerPrimaryWebcam(ctx, binding.EndpointURL)
+	if err != nil {
+		return nil, "", err
+	}
+	if strings.TrimSpace(webcam.StreamURL) != "" {
+		client := a.cameraStreamHTTPClient()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(webcam.StreamURL), nil)
+		if err != nil {
+			return nil, "", err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, "", err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return nil, "", fmt.Errorf("moonraker camera stream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if contentType == "" {
+			contentType = "multipart/x-mixed-replace"
+		}
+		return resp.Body, contentType, nil
+	}
+	if strings.TrimSpace(webcam.SnapshotURL) != "" {
+		return a.openSnapshotLoopReader(ctx, strings.TrimSpace(webcam.SnapshotURL))
+	}
+	return nil, "", errors.New("moonraker camera has neither stream_url nor snapshot_url")
+}
+
+func (a *agent) openSnapshotLoopReader(ctx context.Context, snapshotURL string) (io.ReadCloser, string, error) {
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		defer pipeWriter.Close()
+		for {
+			requestURL := strings.ReplaceAll(snapshotURL, "{ts}", strconv.FormatInt(time.Now().UnixMilli(), 10))
+			snapshotBytes, err := a.fetchCameraSnapshotBytes(ctx, requestURL)
+			if err != nil {
+				_ = pipeWriter.CloseWithError(err)
+				return
+			}
+			frameHeader := fmt.Sprintf(
+				"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
+				len(snapshotBytes),
+			)
+			if _, err := pipeWriter.Write([]byte(frameHeader)); err != nil {
+				return
+			}
+			if _, err := pipeWriter.Write(snapshotBytes); err != nil {
+				return
+			}
+			if _, err := pipeWriter.Write([]byte("\r\n")); err != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return pipeReader, "multipart/x-mixed-replace;boundary=frame", nil
+}
+
+func (a *agent) fetchCameraSnapshotBytes(ctx context.Context, snapshotURL string) ([]byte, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, snapshotURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("camera snapshot returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+}
+
+func (a *agent) openBambuCameraReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
+	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	if err != nil {
+		return nil, "", err
+	}
+	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
+	if err != nil {
+		return nil, "", err
+	}
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return nil, "", errors.New("ffmpeg is required on the edge host for bambu camera streaming")
+	}
+	if helperURL := a.bambuCameraHelperMJPEGURL(credentials); helperURL != "" {
+		if err := probeBambuCameraHelper(ctx, helperURL); err == nil {
+			client := a.cameraStreamHTTPClient()
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, helperURL, nil)
+			if reqErr == nil {
+				resp, doErr := client.Do(req)
+				if doErr == nil {
+					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+						contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+						if contentType == "" {
+							contentType = "multipart/x-mixed-replace;boundary=frame"
+						}
+						return resp.Body, contentType, nil
+					}
+					body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+					resp.Body.Close()
+					return nil, "", fmt.Errorf("bambu camera helper returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+				}
+			}
+		}
+	}
+	streamURL, err := resolveBambuCameraStreamURL(ctx, credentials)
+	if err != nil {
+		return nil, "", err
+	}
+
+	pipeReader, pipeWriter := io.Pipe()
+	cmd := exec.CommandContext(
+		ctx,
+		ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-rtsp_transport", "tcp",
+		"-i", streamURL,
+		"-f", "mpjpeg",
+		"-boundary_tag", "frame",
+		"-q:v", "6",
+		"-r", "5",
+		"pipe:1",
+	)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		pipeReader.Close()
+		pipeWriter.Close()
+		return nil, "", err
+	}
+	cmd.Stdout = pipeWriter
+	if err := cmd.Start(); err != nil {
+		pipeReader.Close()
+		pipeWriter.Close()
+		return nil, "", err
+	}
+	go func() {
+		errMsg, _ := io.ReadAll(io.LimitReader(stderr, 4096))
+		runErr := cmd.Wait()
+		if runErr != nil {
+			if trimmed := strings.TrimSpace(string(errMsg)); trimmed != "" {
+				_ = pipeWriter.CloseWithError(fmt.Errorf("bambu ffmpeg stream failed: %s", trimmed))
+				return
+			}
+			_ = pipeWriter.CloseWithError(runErr)
+			return
+		}
+		_ = pipeWriter.Close()
+	}()
+	return pipeReader, "multipart/x-mixed-replace;boundary=frame", nil
+}
+
+func resolveBambuCameraStreamURL(ctx context.Context, credentials bambustore.BambuLANCredentials) (string, error) {
+	candidates, err := bambuCameraRTSPCandidates(credentials)
+	if err != nil {
+		return "", err
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		if err := probeBambuCameraCandidate(ctx, candidate); err == nil {
+			return candidate, nil
+		} else {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("bambu camera source probe failed: %w", lastErr)
+	}
+	return "", errors.New("bambu camera source probe failed")
+}
+
+func (a *agent) bambuCameraHelperMJPEGURL(credentials bambustore.BambuLANCredentials) string {
+	template := strings.TrimSpace(a.cfg.BambuCameraHelperMJPEGURLTemplate)
+	if template == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"{host}", strings.TrimSpace(credentials.Host),
+		"{serial}", strings.TrimSpace(credentials.Serial),
+		"{name}", url.QueryEscape(strings.TrimSpace(credentials.Name)),
+		"{model}", url.QueryEscape(strings.TrimSpace(credentials.Model)),
+	)
+	return replacer.Replace(template)
+}
+
+func probeBambuCameraHelper(ctx context.Context, helperURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(helperURL))
+	if err != nil {
+		return err
+	}
+	address := strings.TrimSpace(parsed.Host)
+	if address == "" {
+		return errors.New("bambu camera helper probe missing host")
+	}
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func bambuCameraRTSPCandidates(credentials bambustore.BambuLANCredentials) ([]string, error) {
+	host := strings.TrimSpace(credentials.Host)
+	accessCode := strings.TrimSpace(credentials.AccessCode)
+	if host == "" {
+		return nil, errors.New("bambu camera unavailable: missing bambu host")
+	}
+	if accessCode == "" {
+		return nil, errors.New("bambu camera unavailable: missing bambu access code")
+	}
+
+	type candidateShape struct {
+		scheme string
+		port   string
+		path   string
+	}
+	shapes := []candidateShape{
+		{scheme: "rtsp", port: "6000", path: "/streaming/live/1"},
+		{scheme: "rtsp", port: "6000", path: "/live"},
+		{scheme: "rtsps", port: "6000", path: "/streaming/live/1"},
+		{scheme: "rtsp", port: "322", path: "/streaming/live/1"},
+		{scheme: "rtsps", port: "322", path: "/streaming/live/1"},
+	}
+
+	out := make([]string, 0, len(shapes))
+	seen := make(map[string]struct{}, len(shapes))
+	for _, shape := range shapes {
+		candidate := (&url.URL{
+			Scheme: shape.scheme,
+			User:   url.UserPassword("bblp", accessCode),
+			Host:   net.JoinHostPort(host, shape.port),
+			Path:   shape.path,
+		}).String()
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		out = append(out, candidate)
+	}
+	return out, nil
+}
+
+func probeBambuCameraCandidate(ctx context.Context, candidate string) error {
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err == nil {
+		requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(
+			requestCtx,
+			ffprobePath,
+			"-v", "error",
+			"-rtsp_transport", "tcp",
+			"-rw_timeout", "3000000",
+			"-i", candidate,
+			"-show_streams",
+			"-of", "compact",
+		)
+		output, probeErr := cmd.CombinedOutput()
+		if probeErr == nil {
+			return nil
+		}
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed != "" {
+			return errors.New(trimmed)
+		}
+		return probeErr
+	}
+
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return err
+	}
+	address := strings.TrimSpace(parsed.Host)
+	if address == "" {
+		return errors.New("bambu camera candidate missing host")
+	}
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func (a *agent) ingestCameraSession(ctx context.Context, bootstrap bootstrapConfig, session cameraSessionItem, contentType string, body io.ReadCloser) error {
+	defer body.Close()
+	endpoint := resolveURL(strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"), session.IngestURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	client := a.cameraStreamHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("camera_ingest", resp.StatusCode, string(body))
+			return fmt.Errorf("%w: camera ingest returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("camera ingest returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func (a *agent) closeCameraSessionRemote(ctx context.Context, bootstrap bootstrapConfig, session cameraSessionItem, statusValue string, errorValue string) error {
+	if strings.TrimSpace(session.CloseURL) == "" {
+		return nil
+	}
+	endpoint := resolveURL(strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"), session.CloseURL)
+	return doJSONRequest(
+		a.client,
+		http.MethodPost,
+		endpoint,
+		bootstrap.SaaSAPIKey,
+		"",
+		cameraSessionCloseRequest{Status: strings.TrimSpace(statusValue), Error: strings.TrimSpace(errorValue)},
+		nil,
+		map[string]string{"X-Agent-Schema-Version": schemaVersionHeaderValue()},
+	)
+}
+
+func (a *agent) cameraStreamHTTPClient() *http.Client {
+	transport := http.DefaultTransport
+	if a.client != nil && a.client.Transport != nil {
+		transport = a.client.Transport
+	}
+	return &http.Client{Transport: transport}
+}
+
 func (a *agent) desiredStatePollLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(a.cfg.DesiredStatePollInterval)
@@ -2163,7 +2979,18 @@ func (a *agent) reconcileOnce() {
 		if _, exists := a.desiredState[printerID]; exists {
 			continue
 		}
-		delete(a.actionQueue, printerID)
+		queue := a.actionQueue[printerID]
+		kept := make([]action, 0, len(queue))
+		for _, item := range queue {
+			if isPrinterRuntimeCommandKind(item.Kind) {
+				kept = append(kept, item)
+			}
+		}
+		if len(kept) == 0 {
+			delete(a.actionQueue, printerID)
+		} else {
+			a.actionQueue[printerID] = kept
+		}
 		delete(a.queuedSince, printerID)
 	}
 
@@ -2309,8 +3136,20 @@ func mapDesiredToAction(current, desired string) string {
 	}
 }
 
+func isPrinterRuntimeCommandKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "light_on", "light_off", "load_filament", "unload_filament":
+		return true
+	default:
+		return false
+	}
+}
+
 func hasQueuedActionLocked(queue []action, kind string, intentVersion int) bool {
 	for _, item := range queue {
+		if isPrinterRuntimeCommandKind(item.Kind) {
+			continue
+		}
 		if item.Kind == kind && item.Target.IntentVersion == intentVersion {
 			return true
 		}
@@ -2321,6 +3160,9 @@ func hasQueuedActionLocked(queue []action, kind string, intentVersion int) bool 
 func actionIdentityMatches(item action, printerID int, kind string, desired desiredStateItem) bool {
 	if item.PrinterID != printerID || item.Kind != kind {
 		return false
+	}
+	if isPrinterRuntimeCommandKind(kind) {
+		return item.CommandRequestID != 0 && item.CommandRequestID == desired.IntentVersion
 	}
 	if item.Target.IntentVersion != desired.IntentVersion {
 		return false
@@ -2364,6 +3206,10 @@ func pruneQueueForIntentLocked(queue []action, minIntentVersion int) []action {
 	}
 	next := make([]action, 0, len(queue))
 	for _, item := range queue {
+		if isPrinterRuntimeCommandKind(item.Kind) {
+			next = append(next, item)
+			continue
+		}
 		if item.Target.IntentVersion >= minIntentVersion {
 			next = append(next, item)
 		}
@@ -2372,6 +3218,9 @@ func pruneQueueForIntentLocked(queue []action, minIntentVersion int) []action {
 }
 
 func actionThrottleKey(printerID int, kind string, desired desiredStateItem) string {
+	if isPrinterRuntimeCommandKind(kind) {
+		return fmt.Sprintf("%d:%s:%d", printerID, kind, desired.IntentVersion)
+	}
 	return fmt.Sprintf("%d:%s:%d:%s:%d", printerID, kind, desired.IntentVersion, desired.JobID, desired.PlateID)
 }
 
@@ -2448,6 +3297,7 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
+	bootstrap := a.snapshotBootstrap()
 	a.mu.Lock()
 	a.inflightActions[queuedAction.PrinterID] = queuedAction
 	a.mu.Unlock()
@@ -2466,13 +3316,29 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 		code, retryable := classifyActionError(err)
 		if code == "connectivity_error" {
 			if a.tryRecoverUncertainConnectivityAction(ctx, queuedAction, binding) {
+				if queuedAction.CommandRequestID != 0 {
+					if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "acknowledged", ""); ackErr != nil {
+						return ackErr
+					}
+				}
 				return nil
 			}
 		}
+		terminalFailure := !retryable || queuedAction.Attempts >= a.cfg.ActionMaxAttempts
 		a.handleActionFailure(queuedAction, code, err.Error(), retryable)
+		if queuedAction.CommandRequestID != 0 && terminalFailure {
+			if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "failed", err.Error()); ackErr != nil {
+				return ackErr
+			}
+		}
 		return nil
 	}
 	a.markActionSuccess(queuedAction)
+	if queuedAction.CommandRequestID != 0 {
+		if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "acknowledged", ""); ackErr != nil {
+			return ackErr
+		}
+	}
 	return nil
 }
 
@@ -2787,6 +3653,12 @@ func (a *agent) executeMoonrakerAction(ctx context.Context, queuedAction action,
 		return a.callMoonrakerPost(ctx, binding.EndpointURL, "/printer/print/resume", nil)
 	case "stop":
 		return a.callMoonrakerPost(ctx, binding.EndpointURL, "/printer/print/cancel", nil)
+	case "light_on", "light_off":
+		return a.executeMoonrakerLightAction(ctx, binding.EndpointURL, queuedAction.Kind)
+	case "load_filament":
+		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "LOAD_FILAMENT")
+	case "unload_filament":
+		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "UNLOAD_FILAMENT")
 	default:
 		return fmt.Errorf("unsupported action kind: %s", queuedAction.Kind)
 	}
@@ -2804,6 +3676,8 @@ func (a *agent) executeBambuAction(ctx context.Context, queuedAction action, bin
 			return err
 		}
 		return a.executeBambuCloudAction(ctx, queuedAction, binding)
+	case "light_on", "light_off", "load_filament", "unload_filament":
+		return a.executeBambuLANPrinterCommand(ctx, queuedAction, binding)
 	default:
 		return fmt.Errorf("unsupported action kind: %s", queuedAction.Kind)
 	}
@@ -2851,13 +3725,14 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		}
 	}
 
-	localPath, remoteName, err := a.downloadArtifact(ctx, queuedAction.Target)
+	artifact, err := a.downloadArtifact(ctx, queuedAction.Target)
 	if err != nil {
 		return err
 	}
-	importPath, err := prepareBambuConnectImportPath(localPath, remoteName)
+	importDisplayName := artifact.preferredSourceName()
+	importPath, err := prepareBambuConnectImportPath(artifact.LocalPath, importDisplayName)
 	if err != nil {
-		a.cleanupArtifact(localPath)
+		a.cleanupArtifact(artifact.LocalPath)
 		return err
 	}
 	defer a.cleanupArtifact(importPath)
@@ -2866,17 +3741,17 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"printer_id":      queuedAction.PrinterID,
 		"job_id":          queuedAction.Target.JobID,
 		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
+		"filename":        importDisplayName,
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
 	})
 
-	dispatchURI := buildBambuConnectImportURI(importPath, remoteName)
+	dispatchURI := buildBambuConnectImportURI(importPath, importDisplayName)
 	a.audit("bambu_connect_start_dispatch_attempt", map[string]any{
 		"printer_id":     queuedAction.PrinterID,
 		"job_id":         queuedAction.Target.JobID,
 		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteName,
+		"filename":       importDisplayName,
 		"dispatch_uri":   dispatchURI,
 		"transport":      "bambu_connect_uri",
 		"adapter_family": "bambu",
@@ -2886,7 +3761,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"printer_id":     queuedAction.PrinterID,
 		"job_id":         queuedAction.Target.JobID,
 		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteName,
+		"filename":       importDisplayName,
 		"transport":      "bambu_connect_uri",
 		"adapter_family": "bambu",
 	})
@@ -2895,7 +3770,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 			"printer_id":     queuedAction.PrinterID,
 			"job_id":         queuedAction.Target.JobID,
 			"plate_id":       queuedAction.Target.PlateID,
-			"filename":       remoteName,
+			"filename":       importDisplayName,
 			"transport":      "bambu_connect_uri",
 			"adapter_family": "bambu",
 			"error":          err.Error(),
@@ -2906,7 +3781,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"printer_id":     queuedAction.PrinterID,
 		"job_id":         queuedAction.Target.JobID,
 		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteName,
+		"filename":       importDisplayName,
 		"transport":      "bambu_connect_uri",
 		"adapter_family": "bambu",
 	})
@@ -2924,7 +3799,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"printer_id":     queuedAction.PrinterID,
 		"job_id":         queuedAction.Target.JobID,
 		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteName,
+		"filename":       importDisplayName,
 		"transport":      "bambu_connect_uri",
 		"adapter_family": "bambu",
 	})
@@ -2933,7 +3808,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"printer_id":      queuedAction.PrinterID,
 		"job_id":          queuedAction.Target.JobID,
 		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
+		"filename":        importDisplayName,
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
 		"transport":       "bambu_connect_uri",
@@ -3013,27 +3888,28 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		return err
 	}
 
-	localPath, remoteName, err := a.downloadArtifact(ctx, queuedAction.Target)
+	artifact, err := a.downloadArtifact(ctx, queuedAction.Target)
 	if err != nil {
 		return err
 	}
-	defer a.cleanupArtifact(localPath)
+	defer a.cleanupArtifact(artifact.LocalPath)
 
-	fileBytes, err := os.ReadFile(localPath)
+	fileBytes, err := os.ReadFile(artifact.LocalPath)
 	if err != nil {
 		return err
 	}
+	uploadName := artifact.preferredSourceName()
 
 	a.audit("artifact_downloaded", map[string]any{
 		"printer_id":      queuedAction.PrinterID,
 		"job_id":          queuedAction.Target.JobID,
 		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
+		"filename":        uploadName,
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
 	})
 
-	uploadURLs, err := provider.GetUploadURLs(ctx, accessToken, remoteName, int64(len(fileBytes)))
+	uploadURLs, err := provider.GetUploadURLs(ctx, accessToken, uploadName, int64(len(fileBytes)))
 	if err != nil {
 		return err
 	}
@@ -3057,7 +3933,7 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		"printer_id":      queuedAction.PrinterID,
 		"job_id":          queuedAction.Target.JobID,
 		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
+		"filename":        uploadName,
 		"file_id":         strings.TrimSpace(uploadURLs.FileID),
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
@@ -3067,7 +3943,7 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		"printer_id":      queuedAction.PrinterID,
 		"job_id":          queuedAction.Target.JobID,
 		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
+		"filename":        uploadName,
 		"adapter_family":  "bambu",
 		"desired_printer": queuedAction.Target.DesiredPrinterState,
 	})
@@ -3075,7 +3951,7 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 	fileURL := strings.TrimSpace(uploadURLs.FileURL)
 	fileName := strings.TrimSpace(uploadURLs.FileName)
 	if fileName == "" {
-		fileName = remoteName
+		fileName = uploadName
 	}
 	startReq := bambucloud.CloudPrintStartRequest{
 		DeviceID: strings.TrimSpace(printerID),
@@ -3626,6 +4502,33 @@ func (a *agent) verifyBambuControlAction(ctx context.Context, printerID string, 
 	}
 }
 
+func (a *agent) verifyBambuLEDState(ctx context.Context, printerID string, expectedState string) error {
+	timeout := a.bambuActionVerificationTimeout()
+	deadline := time.Now().UTC().Add(timeout)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().UTC().After(deadline) {
+			return fmt.Errorf("bambu led verification timeout after %s", timeout)
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, timeout)
+		snapshot, err := a.fetchBambuVerificationSnapshotByPrinterID(requestCtx, printerID)
+		cancel()
+		if err == nil {
+			if capabilities := cloneCommandCapabilities(snapshot.CommandCapabilities); capabilities != nil {
+				if led, ok := capabilities["led"].(map[string]any); ok {
+					state := strings.ToLower(strings.TrimSpace(fmt.Sprint(led["state"])))
+					if state == strings.ToLower(strings.TrimSpace(expectedState)) {
+						return nil
+					}
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func matchesBambuControlExpectation(printerState string, jobState string, command string) bool {
 	switch strings.ToLower(strings.TrimSpace(command)) {
 	case "pause":
@@ -3709,44 +4612,77 @@ func claimValueToString(value any) string {
 	}
 }
 
+func artifactAuditFields(queuedAction action, adapterFamily, filename string) map[string]any {
+	return map[string]any{
+		"printer_id":      queuedAction.PrinterID,
+		"job_id":          queuedAction.Target.JobID,
+		"plate_id":        queuedAction.Target.PlateID,
+		"filename":        filename,
+		"adapter_family":  adapterFamily,
+		"desired_printer": queuedAction.Target.DesiredPrinterState,
+	}
+}
+
+func mergedAuditFields(base map[string]any, extra map[string]any) map[string]any {
+	merged := make(map[string]any, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+	return merged
+}
+
 func (a *agent) executePrintAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	localPath, remoteName, err := a.downloadArtifact(ctx, queuedAction.Target)
+	artifact, err := a.downloadArtifact(ctx, queuedAction.Target)
 	if err != nil {
 		return err
 	}
-	defer a.cleanupArtifact(localPath)
-	a.audit("artifact_downloaded", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
-		"adapter_family":  "moonraker",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-	})
+	defer a.cleanupArtifact(artifact.LocalPath)
+	remoteName := artifact.moonrakerRemoteName()
+	baseAuditFields := artifactAuditFields(queuedAction, "moonraker", remoteName)
+	a.audit("artifact_downloaded", mergedAuditFields(baseAuditFields, map[string]any{
+		"source_filename": artifact.preferredSourceName(),
+		"size_bytes":      artifact.SizeBytes,
+	}))
+	a.audit("artifact_reuse_probe_attempt", mergedAuditFields(baseAuditFields, map[string]any{
+		"transport": "moonraker_file_manager",
+	}))
 
-	if err := a.uploadArtifact(ctx, binding.EndpointURL, localPath, remoteName); err != nil {
-		return err
+	reused, reason, probeErr := a.probeMoonrakerArtifactReuse(ctx, binding.EndpointURL, artifact)
+	switch {
+	case probeErr != nil:
+		a.audit("artifact_reuse_probe_fallback_upload", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "moonraker_file_manager",
+			"reason":    reason,
+			"error":     probeErr.Error(),
+		}))
+	case reused:
+		a.audit("artifact_reused", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "moonraker_file_manager",
+			"reason":    reason,
+		}))
+	case reason != "" && reason != "absent":
+		a.audit("artifact_reuse_probe_mismatch", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "moonraker_file_manager",
+			"reason":    reason,
+		}))
 	}
-	a.audit("artifact_uploaded", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
-		"adapter_family":  "moonraker",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-	})
+
+	if !reused {
+		if err := a.uploadArtifact(ctx, binding.EndpointURL, artifact); err != nil {
+			return err
+		}
+		a.audit("artifact_uploaded", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "moonraker_file_manager",
+		}))
+	}
 	startPayload := map[string]string{"filename": remoteName}
 	if err := a.callMoonrakerPost(ctx, binding.EndpointURL, "/printer/print/start", startPayload); err != nil {
 		return err
 	}
-	a.audit("print_start_requested", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
-		"adapter_family":  "moonraker",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-	})
+	a.audit("print_start_requested", baseAuditFields)
 	return nil
 }
 
@@ -3780,8 +4716,864 @@ func (a *agent) callMoonrakerPost(ctx context.Context, endpointURL, path string,
 	return nil
 }
 
-func (a *agent) uploadArtifact(ctx context.Context, endpointURL, localPath, remoteName string) error {
-	f, err := os.Open(localPath)
+type moonrakerPowerDevice struct {
+	Device string
+	Status string
+}
+
+func (a *agent) executeMoonrakerLightAction(ctx context.Context, endpointURL, commandKey string) error {
+	devices, err := a.fetchMoonrakerDevicePowerDevices(ctx, endpointURL)
+	if err != nil {
+		return err
+	}
+	deviceName, _, ok := resolveMoonrakerPrimaryLightDevice(devices)
+	if !ok {
+		return errors.New("validation_error: moonraker primary light device is not configured")
+	}
+	action := "on"
+	if strings.TrimSpace(commandKey) == "light_off" {
+		action = "off"
+	}
+	return a.callMoonrakerPost(
+		ctx,
+		endpointURL,
+		"/machine/device_power/device?device="+url.QueryEscape(deviceName)+"&action="+url.QueryEscape(action),
+		nil,
+	)
+}
+
+func (a *agent) executeMoonrakerGCodeMacroAction(ctx context.Context, endpointURL, macroName string) error {
+	return a.callMoonrakerPost(
+		ctx,
+		endpointURL,
+		"/printer/gcode/script",
+		map[string]string{"script": strings.TrimSpace(macroName)},
+	)
+}
+
+func (a *agent) fetchMoonrakerCommandCapabilities(ctx context.Context, endpointURL string) (map[string]any, error) {
+	capabilities := map[string]any{
+		"led":             map[string]any{"supported": false},
+		"load_filament":   map[string]any{"supported": false},
+		"unload_filament": map[string]any{"supported": false},
+	}
+	var errs []string
+
+	devices, err := a.fetchMoonrakerDevicePowerDevices(ctx, endpointURL)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if deviceName, ledState, ok := resolveMoonrakerPrimaryLightDevice(devices); ok {
+		capabilities["led"] = map[string]any{
+			"supported": true,
+			"device":    deviceName,
+			"state":     normalizeMoonrakerPowerState(ledState),
+		}
+	}
+
+	objects, err := a.fetchMoonrakerObjectList(ctx, endpointURL)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else {
+		sensorObjects := moonrakerFilamentSensorObjects(objects)
+		filamentState, filamentErr := a.fetchMoonrakerFilamentState(ctx, endpointURL, sensorObjects)
+		if filamentErr != nil {
+			errs = append(errs, filamentErr.Error())
+		}
+		capabilities["filament"] = map[string]any{
+			"state":        firstNonEmpty(normalizeFilamentState(filamentState), "unknown"),
+			"action_state": filamentActionStateIdle,
+			"state_source": firstNonEmpty(func() string {
+				if len(sensorObjects) > 0 {
+					return filamentStateSourceMoonrakerSensor
+				}
+				return filamentStateSourceUnknown
+			}(), filamentStateSourceUnknown),
+			"confidence": func() string {
+				if len(sensorObjects) > 0 {
+					return filamentConfidenceConfirmed
+				}
+				return filamentConfidenceHeuristic
+			}(),
+			"sensor_present": len(sensorObjects) > 0,
+		}
+		capabilities["load_filament"] = map[string]any{
+			"supported": moonrakerObjectListHasMacro(objects, "LOAD_FILAMENT"),
+		}
+		capabilities["unload_filament"] = map[string]any{
+			"supported": moonrakerObjectListHasMacro(objects, "UNLOAD_FILAMENT"),
+		}
+	}
+
+	if len(errs) > 0 {
+		return capabilities, errors.New(strings.Join(errs, "; "))
+	}
+	return capabilities, nil
+}
+
+func (a *agent) fetchMoonrakerDevicePowerDevices(ctx context.Context, endpointURL string) ([]moonrakerPowerDevice, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, "/machine/device_power/devices"),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return []moonrakerPowerDevice{}, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("moonraker device_power devices failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	result, _ := payload["result"]
+	return parseMoonrakerPowerDevices(result), nil
+}
+
+func parseMoonrakerPowerDevices(raw any) []moonrakerPowerDevice {
+	result := make([]moonrakerPowerDevice, 0)
+	appendDevice := func(deviceName string, statusValue any) {
+		name := strings.TrimSpace(deviceName)
+		if name == "" {
+			return
+		}
+		status := strings.TrimSpace(fmt.Sprint(statusValue))
+		result = append(result, moonrakerPowerDevice{Device: name, Status: status})
+	}
+
+	switch typed := raw.(type) {
+	case map[string]any:
+		if nested, ok := typed["devices"]; ok {
+			return parseMoonrakerPowerDevices(nested)
+		}
+		for key, value := range typed {
+			switch device := value.(type) {
+			case map[string]any:
+				name := strings.TrimSpace(firstNonEmpty(
+					stringFromAny(device["device"]),
+					stringFromAny(device["name"]),
+					key,
+				))
+				appendDevice(name, firstNonEmpty(stringFromAny(device["status"]), stringFromAny(device["state"])))
+			default:
+				appendDevice(key, value)
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			switch device := item.(type) {
+			case string:
+				appendDevice(device, "")
+			case map[string]any:
+				name := strings.TrimSpace(firstNonEmpty(
+					stringFromAny(device["device"]),
+					stringFromAny(device["name"]),
+				))
+				appendDevice(name, firstNonEmpty(stringFromAny(device["status"]), stringFromAny(device["state"])))
+			}
+		}
+	}
+	return result
+}
+
+func resolveMoonrakerPrimaryLightDevice(devices []moonrakerPowerDevice) (string, string, bool) {
+	if len(devices) == 0 {
+		return "", "", false
+	}
+	priority := []string{"chamber_light", "caselight", "case_light", "work_light", "worklight", "light"}
+	byName := make(map[string]moonrakerPowerDevice, len(devices))
+	for _, device := range devices {
+		normalizedName := strings.ToLower(strings.TrimSpace(device.Device))
+		if normalizedName == "" {
+			continue
+		}
+		byName[normalizedName] = device
+	}
+	for _, candidate := range priority {
+		if device, ok := byName[candidate]; ok {
+			return strings.TrimSpace(device.Device), strings.TrimSpace(device.Status), true
+		}
+	}
+
+	matches := make([]moonrakerPowerDevice, 0)
+	for _, device := range devices {
+		normalizedName := strings.ToLower(strings.TrimSpace(device.Device))
+		if strings.Contains(normalizedName, "light") || strings.Contains(normalizedName, "led") {
+			matches = append(matches, device)
+		}
+	}
+	if len(matches) == 1 {
+		return strings.TrimSpace(matches[0].Device), strings.TrimSpace(matches[0].Status), true
+	}
+	return "", "", false
+}
+
+func normalizeMoonrakerPowerState(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "true", "1":
+		return "on"
+	case "off", "false", "0":
+		return "off"
+	default:
+		return ""
+	}
+}
+
+func normalizeFilamentState(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "loaded", "unloaded", "unknown":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
+func normalizeFilamentActionState(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case filamentActionStateIdle,
+		filamentActionStateLoading,
+		filamentActionStateUnloading,
+		filamentActionStateNeedsUserConfirmation:
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
+func normalizeFilamentSourceKind(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case filamentSourceKindExternalSpool,
+		filamentSourceKindAMS,
+		filamentSourceKindNone,
+		filamentSourceKindUnknown:
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
+func defaultFilamentSourceLabel(sourceKind string, rawLabel string) string {
+	label := strings.TrimSpace(rawLabel)
+	if label != "" {
+		return label
+	}
+	switch normalizeFilamentSourceKind(sourceKind) {
+	case filamentSourceKindExternalSpool:
+		return "External spool"
+	case filamentSourceKindAMS:
+		return "AMS"
+	default:
+		return ""
+	}
+}
+
+func (a *agent) fetchMoonrakerObjectList(ctx context.Context, endpointURL string) ([]string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, "/printer/objects/list"),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("moonraker object list failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	result, _ := payload["result"]
+	return parseMoonrakerObjectList(result), nil
+}
+
+func parseMoonrakerObjectList(raw any) []string {
+	if typed, ok := raw.(map[string]any); ok {
+		if nested, exists := typed["objects"]; exists {
+			return parseMoonrakerObjectList(nested)
+		}
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	objects := make([]string, 0, len(items))
+	for _, item := range items {
+		name := strings.TrimSpace(fmt.Sprint(item))
+		if name == "" {
+			continue
+		}
+		objects = append(objects, name)
+	}
+	return objects
+}
+
+func moonrakerObjectListHasMacro(objects []string, macroName string) bool {
+	want := strings.ToLower(strings.TrimSpace("gcode_macro " + macroName))
+	for _, objectName := range objects {
+		if strings.ToLower(strings.TrimSpace(objectName)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func moonrakerFilamentSensorObjects(objects []string) []string {
+	out := make([]string, 0)
+	for _, objectName := range objects {
+		normalized := strings.ToLower(strings.TrimSpace(objectName))
+		if strings.HasPrefix(normalized, "filament_switch_sensor ") || strings.HasPrefix(normalized, "filament_motion_sensor ") {
+			out = append(out, strings.TrimSpace(objectName))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (a *agent) fetchMoonrakerFilamentState(ctx context.Context, endpointURL string, sensorObjects []string) (string, error) {
+	if len(sensorObjects) == 0 {
+		return "", nil
+	}
+	detected := make([]bool, 0, len(sensorObjects))
+	for _, objectName := range sensorObjects {
+		state, ok, err := a.fetchMoonrakerFilamentSensorState(ctx, endpointURL, objectName)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			continue
+		}
+		detected = append(detected, state)
+	}
+	if len(detected) == 0 {
+		return "", nil
+	}
+	allTrue := true
+	allFalse := true
+	for _, state := range detected {
+		if state {
+			allFalse = false
+		} else {
+			allTrue = false
+		}
+	}
+	switch {
+	case allTrue:
+		return "loaded", nil
+	case allFalse:
+		return "unloaded", nil
+	default:
+		return "unknown", nil
+	}
+}
+
+func (a *agent) fetchMoonrakerFilamentSensorState(ctx context.Context, endpointURL, objectName string) (bool, bool, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, "/printer/objects/query?"+url.QueryEscape(objectName)),
+		nil,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return false, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, false, fmt.Errorf("moonraker filament sensor query failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload struct {
+		Result struct {
+			Status map[string]map[string]any `json:"status"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, false, err
+	}
+	sensorPayload, ok := payload.Result.Status[objectName]
+	if !ok {
+		return false, false, nil
+	}
+	rawDetected, exists := sensorPayload["filament_detected"]
+	if !exists {
+		return false, false, nil
+	}
+	switch typed := rawDetected.(type) {
+	case bool:
+		return typed, true, nil
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(typed))
+		if normalized == "true" {
+			return true, true, nil
+		}
+		if normalized == "false" {
+			return false, true, nil
+		}
+	}
+	return false, false, nil
+}
+
+func unsupportedBambuCommandCapabilities() map[string]any {
+	return map[string]any{
+		"led": map[string]any{"supported": false},
+		"filament": map[string]any{
+			"state":        "unknown",
+			"action_state": filamentActionStateIdle,
+			"state_source": filamentStateSourceUnknown,
+			"confidence":   filamentConfidenceHeuristic,
+			"source_kind":  filamentSourceKindUnknown,
+		},
+		"load_filament":   map[string]any{"supported": false},
+		"unload_filament": map[string]any{"supported": false},
+	}
+}
+
+func cloneCommandCapabilities(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func mergeCommandCapabilities(previous map[string]any, latest map[string]any) map[string]any {
+	merged := cloneCommandCapabilities(latest)
+	if merged == nil {
+		merged = map[string]any{}
+	}
+	prev := cloneCommandCapabilities(previous)
+	if prev == nil {
+		return merged
+	}
+
+	prevFilament, _ := prev["filament"].(map[string]any)
+	nextFilament, _ := merged["filament"].(map[string]any)
+	if nextFilament == nil {
+		nextFilament = map[string]any{}
+	}
+	if normalizeFilamentState(stringFromAny(nextFilament["state"])) == "" {
+		if prevState := normalizeFilamentState(stringFromAny(prevFilament["state"])); prevState != "" {
+			nextFilament["state"] = prevState
+		}
+	}
+	if normalizeFilamentActionState(stringFromAny(nextFilament["action_state"])) == "" {
+		if prevActionState := normalizeFilamentActionState(stringFromAny(prevFilament["action_state"])); prevActionState != "" {
+			nextFilament["action_state"] = prevActionState
+		}
+	}
+	if strings.TrimSpace(stringFromAny(nextFilament["state_source"])) == "" {
+		if prevSource := strings.TrimSpace(stringFromAny(prevFilament["state_source"])); prevSource != "" {
+			nextFilament["state_source"] = prevSource
+		}
+	}
+	if strings.TrimSpace(stringFromAny(nextFilament["confidence"])) == "" {
+		if prevConfidence := strings.TrimSpace(stringFromAny(prevFilament["confidence"])); prevConfidence != "" {
+			nextFilament["confidence"] = prevConfidence
+		}
+	}
+	if strings.TrimSpace(stringFromAny(nextFilament["action_started_at"])) == "" {
+		if prevStartedAt := strings.TrimSpace(stringFromAny(prevFilament["action_started_at"])); prevStartedAt != "" {
+			nextFilament["action_started_at"] = prevStartedAt
+		}
+	}
+	if normalizeFilamentActionState(stringFromAny(nextFilament["action_state"])) == "" {
+		nextFilament["action_state"] = filamentActionStateIdle
+	}
+	if len(nextFilament) > 0 {
+		merged["filament"] = nextFilament
+	}
+	return merged
+}
+
+func filamentCapability(capabilities map[string]any) map[string]any {
+	if capabilities == nil {
+		return map[string]any{}
+	}
+	filament, _ := capabilities["filament"].(map[string]any)
+	if filament == nil {
+		filament = map[string]any{}
+		capabilities["filament"] = filament
+	}
+	return filament
+}
+
+func filamentCapabilitySourceKind(capabilities map[string]any) string {
+	filament := filamentCapability(capabilities)
+	return normalizeFilamentSourceKind(stringFromAny(filament["source_kind"]))
+}
+
+func filamentCapabilitySourceLabel(capabilities map[string]any) string {
+	filament := filamentCapability(capabilities)
+	return defaultFilamentSourceLabel(
+		normalizeFilamentSourceKind(stringFromAny(filament["source_kind"])),
+		stringFromAny(filament["source_label"]),
+	)
+}
+
+func setFilamentCapabilityState(
+	capabilities map[string]any,
+	state string,
+	actionState string,
+	stateSource string,
+	confidence string,
+	startedAt time.Time,
+) {
+	filament := filamentCapability(capabilities)
+	if normalizedState := normalizeFilamentState(state); normalizedState != "" {
+		filament["state"] = normalizedState
+	}
+	if normalizedActionState := normalizeFilamentActionState(actionState); normalizedActionState != "" {
+		filament["action_state"] = normalizedActionState
+	}
+	if strings.TrimSpace(stateSource) != "" {
+		filament["state_source"] = strings.TrimSpace(stateSource)
+	}
+	if strings.TrimSpace(confidence) != "" {
+		filament["confidence"] = strings.TrimSpace(confidence)
+	}
+	if startedAt.IsZero() {
+		delete(filament, "action_started_at")
+	} else {
+		filament["action_started_at"] = startedAt.UTC().Format(time.RFC3339Nano)
+	}
+	capabilities["filament"] = filament
+}
+
+func setFilamentCapabilitySource(capabilities map[string]any, sourceKind string, sourceLabel string) {
+	filament := filamentCapability(capabilities)
+	normalizedKind := normalizeFilamentSourceKind(sourceKind)
+	if normalizedKind == "" {
+		delete(filament, "source_kind")
+		delete(filament, "source_label")
+		capabilities["filament"] = filament
+		return
+	}
+	filament["source_kind"] = normalizedKind
+	normalizedLabel := defaultFilamentSourceLabel(normalizedKind, sourceLabel)
+	if normalizedLabel == "" {
+		delete(filament, "source_label")
+	} else {
+		filament["source_label"] = normalizedLabel
+	}
+	capabilities["filament"] = filament
+}
+
+func filamentCapabilityActionStartedAt(capabilities map[string]any) time.Time {
+	filament := filamentCapability(capabilities)
+	raw := strings.TrimSpace(stringFromAny(filament["action_started_at"]))
+	if raw == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed.UTC()
+}
+
+func resolveRuntimeFilamentCapability(binding edgeBinding, current *currentStateItem, previous currentStateItem, snapshot bindingSnapshot, now time.Time) {
+	if current == nil {
+		return
+	}
+	if current.CommandCapabilities == nil {
+		current.CommandCapabilities = map[string]any{}
+	}
+	filament := filamentCapability(current.CommandCapabilities)
+	state := normalizeFilamentState(stringFromAny(filament["state"]))
+	if state == "" {
+		state = "unknown"
+	}
+	actionState := normalizeFilamentActionState(stringFromAny(filament["action_state"]))
+	if actionState == "" {
+		actionState = filamentActionStateIdle
+	}
+	stateSource := firstNonEmpty(strings.TrimSpace(stringFromAny(filament["state_source"])), filamentStateSourceUnknown)
+	confidence := firstNonEmpty(strings.TrimSpace(stringFromAny(filament["confidence"])), filamentConfidenceHeuristic)
+	startedAt := filamentCapabilityActionStartedAt(current.CommandCapabilities)
+	sourceKind := firstNonEmpty(filamentCapabilitySourceKind(current.CommandCapabilities), filamentSourceKindUnknown)
+	sourceLabel := filamentCapabilitySourceLabel(current.CommandCapabilities)
+	previousCapabilities := cloneCommandCapabilities(previous.CommandCapabilities)
+	prevState := normalizeFilamentState(stringFromAny(filamentCapability(previousCapabilities)["state"]))
+	prevStateSource := firstNonEmpty(strings.TrimSpace(stringFromAny(filamentCapability(previousCapabilities)["state_source"])), filamentStateSourceUnknown)
+	prevSourceKind := normalizeFilamentSourceKind(stringFromAny(filamentCapability(previousCapabilities)["source_kind"]))
+	prevSourceLabel := filamentCapabilitySourceLabel(previousCapabilities)
+
+	setCurrent := func(nextState, nextActionState, nextStateSource, nextConfidence, nextSourceKind, nextSourceLabel string, nextStartedAt time.Time) {
+		setFilamentCapabilityState(
+			current.CommandCapabilities,
+			nextState,
+			nextActionState,
+			nextStateSource,
+			nextConfidence,
+			nextStartedAt,
+		)
+		setFilamentCapabilitySource(current.CommandCapabilities, nextSourceKind, nextSourceLabel)
+	}
+
+	rememberedSourceKind := sourceKind
+	rememberedSourceLabel := sourceLabel
+	if rememberedSourceKind == filamentSourceKindUnknown || rememberedSourceKind == filamentSourceKindNone {
+		if prevSourceKind == filamentSourceKindExternalSpool || prevSourceKind == filamentSourceKindAMS {
+			rememberedSourceKind = prevSourceKind
+			rememberedSourceLabel = prevSourceLabel
+		}
+	}
+
+	switch normalizeAdapterFamily(binding.AdapterFamily) {
+	case "moonraker":
+		if sensorPresent, ok := filament["sensor_present"].(bool); !ok || !sensorPresent {
+			setCurrent(
+				"unknown",
+				filamentActionStateIdle,
+				filamentStateSourceUnknown,
+				filamentConfidenceHeuristic,
+				filamentSourceKindUnknown,
+				"",
+				time.Time{},
+			)
+			return
+		}
+
+		switch actionState {
+		case filamentActionStateLoading:
+			if state == "loaded" {
+				setCurrent(state, filamentActionStateIdle, filamentStateSourceMoonrakerSensor, filamentConfidenceConfirmed, filamentSourceKindUnknown, "", time.Time{})
+				return
+			}
+			if !startedAt.IsZero() && now.Sub(startedAt) > moonrakerFilamentActionTimeout {
+				setCurrent("unknown", filamentActionStateIdle, filamentStateSourceUnknown, filamentConfidenceHeuristic, filamentSourceKindUnknown, "", time.Time{})
+				return
+			}
+		case filamentActionStateUnloading:
+			if state == "unloaded" {
+				setCurrent(state, filamentActionStateIdle, filamentStateSourceMoonrakerSensor, filamentConfidenceConfirmed, filamentSourceKindUnknown, "", time.Time{})
+				return
+			}
+			if !startedAt.IsZero() && now.Sub(startedAt) > moonrakerFilamentActionTimeout {
+				setCurrent("unknown", filamentActionStateIdle, filamentStateSourceUnknown, filamentConfidenceHeuristic, filamentSourceKindUnknown, "", time.Time{})
+				return
+			}
+		default:
+			setCurrent(state, filamentActionStateIdle, filamentStateSourceMoonrakerSensor, filamentConfidenceConfirmed, filamentSourceKindUnknown, "", time.Time{})
+			return
+		}
+		setCurrent(state, actionState, stateSource, confidence, filamentSourceKindUnknown, "", startedAt)
+	case "bambu":
+		switch actionState {
+		case filamentActionStateLoading:
+			if sourceKind == filamentSourceKindExternalSpool || sourceKind == filamentSourceKindAMS {
+				setCurrent("loaded", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, sourceLabel, time.Time{})
+				return
+			}
+			if !startedAt.IsZero() && now.Sub(startedAt) > bambuFilamentActionTimeout {
+				setCurrent("unknown", filamentActionStateNeedsUserConfirmation, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, time.Time{})
+				return
+			}
+			setCurrent("unknown", filamentActionStateLoading, filamentStateSourceCommandFallback, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, startedAt)
+			return
+		case filamentActionStateUnloading:
+			if sourceKind == filamentSourceKindNone {
+				setCurrent("unloaded", filamentActionStateIdle, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, time.Time{})
+				return
+			}
+			if !startedAt.IsZero() && now.Sub(startedAt) > bambuFilamentActionTimeout {
+				setCurrent("unknown", filamentActionStateNeedsUserConfirmation, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, time.Time{})
+				return
+			}
+			setCurrent("unknown", filamentActionStateUnloading, filamentStateSourceCommandFallback, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, startedAt)
+			return
+		case filamentActionStateNeedsUserConfirmation:
+			if sourceKind == filamentSourceKindExternalSpool || sourceKind == filamentSourceKindAMS {
+				setCurrent("loaded", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, sourceLabel, time.Time{})
+				return
+			}
+			if sourceKind == filamentSourceKindNone && (rememberedSourceKind == filamentSourceKindExternalSpool || rememberedSourceKind == filamentSourceKindAMS) {
+				setCurrent("unloaded", filamentActionStateIdle, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, time.Time{})
+				return
+			}
+			setCurrent("unknown", filamentActionStateNeedsUserConfirmation, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, rememberedSourceKind, rememberedSourceLabel, time.Time{})
+			return
+		default:
+			if sourceKind == filamentSourceKindExternalSpool || sourceKind == filamentSourceKindAMS {
+				setCurrent("loaded", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, sourceLabel, time.Time{})
+				return
+			}
+			if sourceKind == filamentSourceKindNone {
+				if prevState == "unloaded" && (prevSourceKind == filamentSourceKindExternalSpool || prevSourceKind == filamentSourceKindAMS) {
+					setCurrent("unloaded", filamentActionStateIdle, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, prevSourceKind, prevSourceLabel, time.Time{})
+					return
+				}
+				setCurrent("unknown", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, filamentSourceKindNone, "", time.Time{})
+				return
+			}
+			if now.Sub(previous.ReportedAt) <= bambuFilamentMemoryGrace &&
+				(prevState == "loaded" || prevState == "unloaded") &&
+				(prevStateSource == filamentStateSourceBambuCommandMemory || prevStateSource == filamentStateSourceBambuActiveSource) {
+				setCurrent(prevState, filamentActionStateIdle, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, prevSourceKind, prevSourceLabel, time.Time{})
+				return
+			}
+			setCurrent("unknown", filamentActionStateIdle, stateSource, confidence, sourceKind, sourceLabel, time.Time{})
+			return
+		}
+	default:
+		setCurrent(state, actionState, stateSource, confidence, sourceKind, sourceLabel, startedAt)
+	}
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func (a *agent) probeMoonrakerArtifactReuse(ctx context.Context, endpointURL string, artifact stagedArtifact) (bool, string, error) {
+	remoteName := artifact.moonrakerRemoteName()
+	sizeBytes, exists, err := a.fetchMoonrakerRemoteFileSize(ctx, endpointURL, remoteName)
+	if err != nil {
+		return false, "metadata_probe_error", err
+	}
+	if !exists {
+		return false, "absent", nil
+	}
+	if sizeBytes != artifact.SizeBytes {
+		return false, "size_mismatch", nil
+	}
+	remoteSHA256, err := a.fetchMoonrakerRemoteFileSHA256(ctx, endpointURL, remoteName)
+	if err != nil {
+		return false, "hash_probe_error", err
+	}
+	if !strings.EqualFold(strings.TrimSpace(remoteSHA256), strings.TrimSpace(artifact.SHA256)) {
+		return false, "sha256_mismatch", nil
+	}
+	return true, "sha256_match", nil
+}
+
+func (a *agent) fetchMoonrakerRemoteFileSize(ctx context.Context, endpointURL, filename string) (int64, bool, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, "/server/files/metadata?filename="+url.QueryEscape(filename)),
+		nil,
+	)
+	if err != nil {
+		return 0, false, err
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return 0, false, fmt.Errorf("moonraker file metadata failed: status=%d body=%s", resp.StatusCode, string(responseBody))
+	}
+
+	var payload struct {
+		Result struct {
+			Size json.Number `json:"size"`
+		} `json:"result"`
+	}
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return 0, false, err
+	}
+	if strings.TrimSpace(payload.Result.Size.String()) == "" {
+		return 0, true, errors.New("moonraker metadata missing size")
+	}
+	sizeBytes, err := payload.Result.Size.Int64()
+	if err != nil {
+		floatValue, floatErr := payload.Result.Size.Float64()
+		if floatErr != nil {
+			return 0, true, fmt.Errorf("moonraker metadata invalid size %q: %w", payload.Result.Size.String(), err)
+		}
+		sizeBytes = int64(floatValue)
+	}
+	return sizeBytes, true, nil
+}
+
+func (a *agent) fetchMoonrakerRemoteFileSHA256(ctx context.Context, endpointURL, filename string) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, "/server/files/gcodes/"+url.PathEscape(filename)),
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("moonraker file download failed: status=%d body=%s", resp.StatusCode, string(responseBody))
+	}
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, resp.Body); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func (a *agent) uploadArtifact(ctx context.Context, endpointURL string, artifact stagedArtifact) error {
+	f, err := os.Open(artifact.LocalPath)
 	if err != nil {
 		return err
 	}
@@ -3792,7 +5584,12 @@ func (a *agent) uploadArtifact(ctx context.Context, endpointURL, localPath, remo
 	if err := writer.WriteField("root", "gcodes"); err != nil {
 		return err
 	}
-	part, err := writer.CreateFormFile("file", remoteName)
+	if checksum := strings.TrimSpace(artifact.SHA256); checksum != "" {
+		if err := writer.WriteField("checksum", checksum); err != nil {
+			return err
+		}
+	}
+	part, err := writer.CreateFormFile("file", artifact.moonrakerRemoteName())
 	if err != nil {
 		return err
 	}
@@ -3833,32 +5630,32 @@ func (a *agent) uploadArtifact(ctx context.Context, endpointURL, localPath, remo
 	return nil
 }
 
-func (a *agent) downloadArtifact(ctx context.Context, desired desiredStateItem) (string, string, error) {
+func (a *agent) downloadArtifact(ctx context.Context, desired desiredStateItem) (stagedArtifact, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.ArtifactDownloadTimeout)
 	defer cancel()
 
 	artifactURL := strings.TrimSpace(desired.ArtifactURL)
 	if artifactURL == "" {
-		return "", "", errors.New("artifact_fetch_error: missing artifact_url")
+		return stagedArtifact{}, errors.New("artifact_fetch_error: missing artifact_url")
 	}
 	bootstrap := a.snapshotBootstrap()
 	if strings.HasPrefix(artifactURL, "/") {
 		artifactURL = strings.TrimSuffix(bootstrap.ControlPlaneURL, "/") + artifactURL
 	}
 	if err := os.MkdirAll(a.cfg.ArtifactStageDir, 0o755); err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	ok, err := hasMinFreeSpace(a.cfg.ArtifactStageDir, 1<<30)
 	if err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	if !ok {
-		return "", "", errors.New("artifact_fetch_error: insufficient free staging disk space")
+		return stagedArtifact{}, errors.New("artifact_fetch_error: insufficient free staging disk space")
 	}
 
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, artifactURL, nil)
 	if err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	artifactHost, artifactErr := url.Parse(artifactURL)
 	controlHost, controlErr := url.Parse(strings.TrimSpace(bootstrap.ControlPlaneURL))
@@ -3871,14 +5668,15 @@ func (a *agent) downloadArtifact(ctx context.Context, desired desiredStateItem) 
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", "", fmt.Errorf("artifact_fetch_error: download failed status=%d body=%s", resp.StatusCode, string(body))
+		return stagedArtifact{}, fmt.Errorf("artifact_fetch_error: download failed status=%d body=%s", resp.StatusCode, string(body))
 	}
 
+	sourceFilename := resolvePlateArtifactSourceFilename(artifactURL, resp.Header.Get("Content-Disposition"))
 	artifactExtension := resolvePlateArtifactExtension(artifactURL, resp.Header.Get("Content-Disposition"))
 	baseName := fmt.Sprintf("printer_%d_plate_%d_%d%s", desired.PrinterID, desired.PlateID, time.Now().UnixNano(), artifactExtension)
 	partPath := filepath.Join(a.cfg.ArtifactStageDir, baseName+".part")
@@ -3895,20 +5693,22 @@ func (a *agent) downloadArtifact(ctx context.Context, desired desiredStateItem) 
 
 	out, err := os.Create(partPath)
 	if err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 
-	hasher := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(out, hasher), resp.Body); err != nil {
+	shaHasher := sha256.New()
+	md5Hasher := md5.New()
+	sizeBytes, err := io.Copy(io.MultiWriter(out, shaHasher, md5Hasher), resp.Body)
+	if err != nil {
 		_ = out.Close()
-		return "", "", err
+		return stagedArtifact{}, err
 	}
-	sum := hex.EncodeToString(hasher.Sum(nil))
+	sum := hex.EncodeToString(shaHasher.Sum(nil))
 	expectedChecksum := strings.TrimSpace(desired.ChecksumSHA256)
 	if expectedChecksum != "" {
 		if !strings.EqualFold(sum, expectedChecksum) {
 			_ = out.Close()
-			return "", "", fmt.Errorf("artifact_fetch_error: checksum mismatch expected=%s actual=%s", desired.ChecksumSHA256, sum)
+			return stagedArtifact{}, fmt.Errorf("artifact_fetch_error: checksum mismatch expected=%s actual=%s", desired.ChecksumSHA256, sum)
 		}
 	} else {
 		a.audit("artifact_checksum_missing", map[string]any{
@@ -3919,18 +5719,58 @@ func (a *agent) downloadArtifact(ctx context.Context, desired desiredStateItem) 
 		})
 	}
 	if err := out.Close(); err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	if err := os.Rename(partPath, readyPath); err != nil {
-		return "", "", err
+		return stagedArtifact{}, err
 	}
 	cleanupPart = false
-	return readyPath, baseName, nil
+	return stagedArtifact{
+		LocalPath:           readyPath,
+		SourceFilename:      sourceFilename,
+		NormalizedExtension: artifactExtension,
+		SizeBytes:           sizeBytes,
+		SHA256:              sum,
+		MD5:                 hex.EncodeToString(md5Hasher.Sum(nil)),
+		RemoteName:          buildCanonicalArtifactRemoteName(sum, artifactExtension),
+	}, nil
+}
+
+func buildCanonicalArtifactRemoteName(checksumSHA256, normalizedExtension string) string {
+	trimmedChecksum := strings.ToLower(strings.TrimSpace(checksumSHA256))
+	trimmedExtension := normalizePlateArtifactExtension(normalizedExtension)
+	if trimmedExtension == "" {
+		trimmedExtension = ".gcode"
+	}
+	return "pfh-" + trimmedChecksum + trimmedExtension
+}
+
+func resolvePlateArtifactSourceFilename(artifactURL, contentDisposition string) string {
+	if fromContentDisposition := extractFilenameFromContentDisposition(contentDisposition); fromContentDisposition != "" {
+		return fromContentDisposition
+	}
+	parsedURL, err := url.Parse(strings.TrimSpace(artifactURL))
+	if err != nil {
+		return ""
+	}
+	for _, key := range []string{"filename", "file", "name"} {
+		if queryValue := strings.TrimSpace(parsedURL.Query().Get(key)); queryValue != "" {
+			return queryValue
+		}
+	}
+	base := strings.TrimSpace(path.Base(parsedURL.Path))
+	if base == "" || base == "." || base == "/" {
+		return ""
+	}
+	if normalizePlateArtifactExtension(base) == "" {
+		return ""
+	}
+	return base
 }
 
 func resolvePlateArtifactExtension(artifactURL, contentDisposition string) string {
-	if fromContentDisposition := extractFilenameFromContentDisposition(contentDisposition); fromContentDisposition != "" {
-		if normalized := normalizePlateArtifactExtension(fromContentDisposition); normalized != "" {
+	if sourceFilename := resolvePlateArtifactSourceFilename(artifactURL, contentDisposition); sourceFilename != "" {
+		if normalized := normalizePlateArtifactExtension(sourceFilename); normalized != "" {
 			return normalized
 		}
 	}
@@ -4048,6 +5888,59 @@ func (a *agent) markActionSuccess(queuedAction action) {
 
 	current := a.currentState[queuedAction.PrinterID]
 	current.PrinterID = queuedAction.PrinterID
+	if isPrinterRuntimeCommandKind(queuedAction.Kind) {
+		current.LastErrorCode = ""
+		current.LastErrorMessage = ""
+		current.ReportedAt = now
+		if current.CommandCapabilities == nil {
+			current.CommandCapabilities = map[string]any{}
+		}
+		binding := a.bindings[queuedAction.PrinterID]
+		sourceKind := filamentCapabilitySourceKind(current.CommandCapabilities)
+		sourceLabel := filamentCapabilitySourceLabel(current.CommandCapabilities)
+		switch queuedAction.Kind {
+		case "light_on":
+			current.CommandCapabilities["led"] = map[string]any{"supported": true, "state": "on"}
+		case "light_off":
+			current.CommandCapabilities["led"] = map[string]any{"supported": true, "state": "off"}
+		case "load_filament":
+			if normalizeAdapterFamily(binding.AdapterFamily) == "bambu" && (sourceKind == "" || sourceKind == filamentSourceKindUnknown || sourceKind == filamentSourceKindNone) {
+				sourceKind = filamentSourceKindExternalSpool
+				sourceLabel = defaultFilamentSourceLabel(sourceKind, sourceLabel)
+			}
+			setFilamentCapabilityState(
+				current.CommandCapabilities,
+				"unknown",
+				filamentActionStateLoading,
+				filamentStateSourceCommandFallback,
+				filamentConfidenceHeuristic,
+				now,
+			)
+			setFilamentCapabilitySource(current.CommandCapabilities, sourceKind, sourceLabel)
+		case "unload_filament":
+			if normalizeAdapterFamily(binding.AdapterFamily) == "bambu" && (sourceKind == "" || sourceKind == filamentSourceKindUnknown || sourceKind == filamentSourceKindNone) {
+				sourceKind = filamentSourceKindExternalSpool
+				sourceLabel = defaultFilamentSourceLabel(sourceKind, sourceLabel)
+			}
+			setFilamentCapabilityState(
+				current.CommandCapabilities,
+				"unknown",
+				filamentActionStateUnloading,
+				filamentStateSourceCommandFallback,
+				filamentConfidenceHeuristic,
+				now,
+			)
+			setFilamentCapabilitySource(current.CommandCapabilities, sourceKind, sourceLabel)
+		}
+		a.currentState[queuedAction.PrinterID] = current
+		delete(a.breakerUntil, queuedAction.PrinterID)
+		a.audit("action_executed", map[string]any{
+			"printer_id":         queuedAction.PrinterID,
+			"kind":               queuedAction.Kind,
+			"command_request_id": queuedAction.CommandRequestID,
+		})
+		return
+	}
 	current.CurrentPrinterState = queuedAction.Target.DesiredPrinterState
 	current.CurrentJobState = queuedAction.Target.DesiredJobState
 	current.JobID = queuedAction.Target.JobID
@@ -4116,6 +6009,33 @@ func (a *agent) markActionFailure(queuedAction action, errorCode, message string
 
 	current := a.currentState[queuedAction.PrinterID]
 	current.PrinterID = queuedAction.PrinterID
+	if isPrinterRuntimeCommandKind(queuedAction.Kind) {
+		current.LastErrorCode = errorCode
+		current.LastErrorMessage = message
+		if current.CommandCapabilities == nil {
+			current.CommandCapabilities = map[string]any{}
+		}
+		if queuedAction.Kind == "load_filament" || queuedAction.Kind == "unload_filament" {
+			setFilamentCapabilityState(
+				current.CommandCapabilities,
+				"unknown",
+				filamentActionStateIdle,
+				filamentStateSourceUnknown,
+				filamentConfidenceHeuristic,
+				time.Time{},
+			)
+		}
+		current.ReportedAt = now
+		a.currentState[queuedAction.PrinterID] = current
+		a.audit("action_failed", map[string]any{
+			"printer_id":         queuedAction.PrinterID,
+			"kind":               queuedAction.Kind,
+			"command_request_id": queuedAction.CommandRequestID,
+			"error_code":         errorCode,
+			"error_message":      message,
+		})
+		return
+	}
 	current.CurrentPrinterState = "error"
 	current.CurrentJobState = queuedAction.Target.DesiredJobState
 	current.JobID = queuedAction.Target.JobID
@@ -6247,6 +8167,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		observedAt := time.Now().UTC()
 		a.mu.Lock()
 		current := a.currentState[item.printerID]
+		previousCurrent := current
 		prevState := current.CurrentPrinterState
 		desired := a.desiredState[item.printerID]
 		current.PrinterID = item.printerID
@@ -6263,6 +8184,8 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.RemainingSeconds = snapshot.RemainingSeconds
 		current.TelemetrySource = snapshot.TelemetrySource
 		current.ManualIntervention = snapshot.ManualIntervention
+		current.CommandCapabilities = mergeCommandCapabilities(current.CommandCapabilities, snapshot.CommandCapabilities)
+		resolveRuntimeFilamentCapability(item.binding, &current, previousCurrent, snapshot, observedAt)
 		current.IsCanceled = snapshot.JobState == "canceled"
 		current.ReportedAt = observedAt
 		if snapshot.PrinterState == "queued" {
@@ -6363,16 +8286,24 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 				"error":        metadataErr.Error(),
 			})
 		}
+		commandCapabilities, capabilityErr := a.fetchMoonrakerCommandCapabilities(ctx, binding.EndpointURL)
+		if capabilityErr != nil {
+			a.audit("moonraker_command_capabilities_fetch_error", map[string]any{
+				"endpoint_url": binding.EndpointURL,
+				"error":        capabilityErr.Error(),
+			})
+		}
 		return bindingSnapshot{
-			PrinterState:       printerState,
-			JobState:           jobState,
-			TotalPrintSeconds:  totalPrintSeconds,
-			ProgressPct:        progressPct,
-			RemainingSeconds:   remainingSeconds,
-			TelemetrySource:    telemetrySource,
-			ManualIntervention: manualIntervention,
-			DetectedName:       detectedName,
-			DetectedModelHint:  detectedModelHint,
+			PrinterState:        printerState,
+			JobState:            jobState,
+			TotalPrintSeconds:   totalPrintSeconds,
+			ProgressPct:         progressPct,
+			RemainingSeconds:    remainingSeconds,
+			TelemetrySource:     telemetrySource,
+			ManualIntervention:  manualIntervention,
+			CommandCapabilities: commandCapabilities,
+			DetectedName:        detectedName,
+			DetectedModelHint:   detectedModelHint,
 		}, nil
 	case "bambu":
 		if !a.cfg.EnableBambu {
@@ -6412,6 +8343,7 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		}
 		lanSnapshot, lanErr := a.fetchBambuLANSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if lanErr == nil && !runtimeFailureThresholdReached {
+			lanSnapshot.CommandCapabilities = unsupportedBambuCommandCapabilities()
 			return lanSnapshot, nil
 		}
 		if runtimeFailureThresholdReached {
@@ -6420,6 +8352,7 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if a.isBambuAuthReady() {
 			snapshot, err := a.fetchBambuCloudSnapshotFromEndpoint(ctx, binding.EndpointURL)
 			if err == nil {
+				snapshot.CommandCapabilities = unsupportedBambuCommandCapabilities()
 				return snapshot, nil
 			}
 			var offlineErr *bambuCloudDeviceOfflineError

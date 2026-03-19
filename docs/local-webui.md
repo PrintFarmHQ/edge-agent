@@ -99,3 +99,16 @@ When the state is `not_connected` or `renew_key`, the printer board is hidden an
   - `POST /api/local/observations/scan`
     - starts a local scan and returns `202 Accepted`
     - returns `status=in_progress` when another discovery run is already active
+  - `GET /api/local/printers/{printer_id}/camera/stream`
+    - proxies the configured Moonraker webcam stream for the bound printer
+  - `GET /api/local/printers/{printer_id}/camera/snapshot`
+    - proxies the configured Moonraker webcam snapshot for the bound printer
+
+## Camera Notes
+
+- The local web UI camera routes remain useful for local diagnostics, but they are no longer the intended SaaS printer-camera transport.
+- The SaaS printer camera now relies on a camera-session bridge where `edge-agent` uploads stream bytes to the control plane for inline playback in the printer sheet.
+- Camera support is intentionally narrow and truthful:
+  - Moonraker webcams are supported through the local proxy.
+  - Bambu cameras use the local edge host plus `ffmpeg` to expose a browser-viewable feed when LAN credentials and camera reachability are available.
+  - Unsupported or unreachable camera sources remain explicitly unavailable instead of showing a fake stream.

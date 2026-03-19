@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
 func TestLocalObservationsEndpointReturnsNotConnectedPayload(t *testing.T) {
@@ -403,12 +406,20 @@ func TestLocalObservationStorePrunesStaleDisconnected(t *testing.T) {
 }
 
 func TestStartLocalWebUIServerCascadesToFallbackPort(t *testing.T) {
-	// Occupy the primary port so the server must fall back.
+	// Occupy the primary port when available so the server must fall back.
 	primary, err := net.Listen("tcp", "127.0.0.1:"+localWebUIDefaultPort)
 	if err != nil {
-		t.Fatalf("failed to occupy primary port: %v", err)
+		t.Logf("primary port %s already occupied externally; validating cascade behavior against the live environment", localWebUIDefaultPort)
+	} else {
+		defer primary.Close()
 	}
-	defer primary.Close()
+
+	fallbackAvailable := false
+	fallbackProbe, err := net.Listen("tcp", "127.0.0.1:"+localWebUIFallbackPort)
+	if err == nil {
+		fallbackAvailable = true
+		_ = fallbackProbe.Close()
+	}
 
 	a := newTestAgent(t)
 	a.cfg.LocalUIBindAddr = "" // no explicit override — cascade should kick in
@@ -419,12 +430,25 @@ func TestStartLocalWebUIServerCascadesToFallbackPort(t *testing.T) {
 	}
 	defer srv.Close()
 
-	if port != localWebUIFallbackPort {
-		t.Fatalf("port = %q, want fallback %q", port, localWebUIFallbackPort)
+	if fallbackAvailable {
+		if port != localWebUIFallbackPort {
+			t.Fatalf("port = %q, want fallback %q", port, localWebUIFallbackPort)
+		}
+		return
+	}
+
+	if port == localWebUIDefaultPort {
+		t.Fatalf("port = %q, want a non-default cascade target when default is unavailable", port)
 	}
 }
 
 func TestStartLocalWebUIServerUsesDefaultPort(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:"+localWebUIDefaultPort)
+	if err != nil {
+		t.Skipf("default local web ui port %s is already in use: %v", localWebUIDefaultPort, err)
+	}
+	_ = probe.Close()
+
 	a := newTestAgent(t)
 	a.cfg.LocalUIBindAddr = "" // no explicit override
 
@@ -482,5 +506,153 @@ func TestLocalObservationStoreSuppressesBambuDiscoveryOnlyState(t *testing.T) {
 	}
 	if payload.Printers[0].StatusDetailLevel != localObservationDetailDiscoveryBasic {
 		t.Fatalf("status_detail_level = %q, want %q", payload.Printers[0].StatusDetailLevel, localObservationDetailDiscoveryBasic)
+	}
+}
+
+func TestLocalPrinterCameraRouteProxiesMoonrakerStream(t *testing.T) {
+	a := newTestAgent(t)
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/webcams/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"webcams": []map[string]any{
+					{
+						"name":           "Default",
+						"enabled":        true,
+						"default_camera": true,
+						"stream_url":     "/webcam/?action=stream",
+						"snapshot_url":   "/webcam/?action=snapshot",
+					},
+				},
+			})
+		case "/webcam/":
+			if r.URL.Query().Get("action") != "stream" {
+				t.Fatalf("unexpected webcam action: %s", r.URL.RawQuery)
+			}
+			w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+			_, _ = w.Write([]byte("--frame\r\nContent-Type: image/jpeg\r\n\r\nframe-body\r\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	a.bindings[22] = edgeBinding{PrinterID: 22, AdapterFamily: "moonraker", EndpointURL: moonrakerSrv.URL}
+
+	mux := http.NewServeMux()
+	a.registerLocalWebUIRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/local/printers/22/camera/stream", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "multipart/x-mixed-replace") {
+		t.Fatalf("content-type = %q, want mjpeg stream", got)
+	}
+	if !strings.Contains(rec.Body.String(), "frame-body") {
+		t.Fatalf("body missing proxied frame payload")
+	}
+}
+
+func TestFetchMoonrakerPrimaryWebcamFallsBackToMonitorSnapshot(t *testing.T) {
+	a := newTestAgent(t)
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/webcams/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"webcams": []map[string]any{},
+				},
+			})
+		case "/server/files/camera/monitor.jpg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xd9})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	webcam, err := a.fetchMoonrakerPrimaryWebcam(context.Background(), moonrakerSrv.URL)
+	if err != nil {
+		t.Fatalf("fetchMoonrakerPrimaryWebcam failed: %v", err)
+	}
+	if webcam.SnapshotURL == "" {
+		t.Fatalf("expected snapshot fallback url")
+	}
+	if !strings.Contains(webcam.SnapshotURL, "/server/files/camera/monitor.jpg?ts={ts}") {
+		t.Fatalf("snapshot fallback url = %q, want monitor.jpg template", webcam.SnapshotURL)
+	}
+}
+
+func TestLocalPrinterCameraRouteRejectsUnsupportedAdapter(t *testing.T) {
+	a := newTestAgent(t)
+	a.bindings[9] = edgeBinding{PrinterID: 9, AdapterFamily: "bambu", EndpointURL: "bambu://printer_9"}
+
+	mux := http.NewServeMux()
+	a.registerLocalWebUIRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/local/printers/9/camera/stream", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestBuildClaimCapabilitiesIncludesLocalWebUIFields(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.DiscoveryAllowedAdapters = []string{"moonraker", "bambu"}
+	a.setLocalWebUIURL("http://127.0.0.1:18800/")
+
+	capabilities := a.buildClaimCapabilities()
+	if capabilities["local_web_ui_url"] != "http://127.0.0.1:18800/" {
+		t.Fatalf("local_web_ui_url = %q, want http://127.0.0.1:18800/", capabilities["local_web_ui_url"])
+	}
+	if capabilities["local_web_ui_port"] != "18800" {
+		t.Fatalf("local_web_ui_port = %q, want 18800", capabilities["local_web_ui_port"])
+	}
+}
+
+func TestBambuCameraRTSPCandidatesUseLANCredentials(t *testing.T) {
+	urls, err := bambuCameraRTSPCandidates(bambustore.BambuLANCredentials{
+		Host:       "192.168.1.88",
+		AccessCode: "abc123",
+	})
+	if err != nil {
+		t.Fatalf("bambuCameraRTSPCandidates failed: %v", err)
+	}
+	if len(urls) < 5 {
+		t.Fatalf("candidate count = %d, want at least 5", len(urls))
+	}
+	if urls[0] != "rtsp://bblp:abc123@192.168.1.88:6000/streaming/live/1" {
+		t.Fatalf("first rtsp url = %q, want rtsp://...:6000/streaming/live/1", urls[0])
+	}
+	if urls[3] != "rtsp://bblp:abc123@192.168.1.88:322/streaming/live/1" {
+		t.Fatalf("fourth rtsp url = %q, want rtsp://...:322/streaming/live/1", urls[3])
+	}
+}
+
+func TestBambuCameraHelperMJPEGURLUsesTemplatePlaceholders(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuCameraHelperMJPEGURLTemplate = "http://127.0.0.1:1984/api/stream.mjpeg?src={serial}&host={host}"
+
+	got := a.bambuCameraHelperMJPEGURL(bambustore.BambuLANCredentials{
+		Host:   "192.168.1.88",
+		Serial: "01P09C470101190",
+		Name:   "Forge#1",
+		Model:  "P1S",
+	})
+	want := "http://127.0.0.1:1984/api/stream.mjpeg?src=01P09C470101190&host=192.168.1.88"
+	if got != want {
+		t.Fatalf("helper url = %q, want %q", got, want)
 	}
 }

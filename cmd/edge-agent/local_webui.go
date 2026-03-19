@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
 const (
@@ -46,6 +51,19 @@ type localControlPlaneConnectRequest struct {
 	APIKey     string `json:"api_key"`
 }
 
+type moonrakerWebcamConfig struct {
+	Name        string
+	StreamURL   string
+	SnapshotURL string
+	Enabled     bool
+	IsDefault   bool
+}
+
+const (
+	bambuCameraRTSPPort = "6000"
+	bambuCameraRTSPPath = "/streaming/live/1"
+)
+
 type completedDiscoveryScan struct {
 	Result  discoveryJobResultRequest
 	Entries []discoveryInventoryEntryReport
@@ -69,6 +87,7 @@ func (a *agent) registerLocalWebUIRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/local/observations", a.loopbackOnly(http.HandlerFunc(a.handleLocalObservations)))
 	mux.Handle("/api/local/observations/scan", a.loopbackOnly(http.HandlerFunc(a.handleLocalObservationScan)))
 	mux.Handle("/api/local/control-plane/connect", a.loopbackOnly(http.HandlerFunc(a.handleLocalControlPlaneConnect)))
+	mux.Handle("/api/local/printers/", a.loopbackOnly(http.HandlerFunc(a.handleLocalPrinterCamera)))
 	mux.Handle("/", a.loopbackOnly(http.HandlerFunc(a.handleLocalWebUIIndex)))
 }
 
@@ -186,6 +205,378 @@ func (a *agent) handleLocalControlPlaneConnect(w http.ResponseWriter, r *http.Re
 		"schema_version":            claim.SchemaVersion,
 		"supported_schema_versions": claim.SupportedSchemaVersions,
 	})
+}
+
+func (a *agent) handleLocalPrinterCamera(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	printerID, variant, ok := parseLocalPrinterCameraPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	binding, found := a.snapshotBinding(printerID)
+	if !found {
+		http.Error(w, "printer binding not found", http.StatusNotFound)
+		return
+	}
+	if err := a.proxyLocalPrinterCamera(w, r, binding, variant); err != nil {
+		statusCode := localCameraProxyStatusCode(err)
+		http.Error(w, fmt.Sprintf("camera proxy failed: %v", err), statusCode)
+	}
+}
+
+func localCameraProxyStatusCode(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.HasPrefix(message, "validation_error:") ||
+		strings.Contains(message, "camera unavailable") ||
+		strings.Contains(message, "camera endpoint unavailable") ||
+		strings.Contains(message, "camera is not supported") ||
+		strings.Contains(message, "ffmpeg is required") ||
+		strings.Contains(message, "bambu_lan_credentials_") {
+		return http.StatusConflict
+	}
+
+	return http.StatusBadGateway
+}
+
+func parseLocalPrinterCameraPath(rawPath string) (int, string, bool) {
+	const prefix = "/api/local/printers/"
+	if !strings.HasPrefix(rawPath, prefix) {
+		return 0, "", false
+	}
+	trimmed := strings.Trim(strings.TrimPrefix(rawPath, prefix), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 3 || parts[1] != "camera" {
+		return 0, "", false
+	}
+	if parts[2] != "stream" && parts[2] != "snapshot" {
+		return 0, "", false
+	}
+	printerID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || printerID <= 0 {
+		return 0, "", false
+	}
+	return printerID, parts[2], true
+}
+
+func (a *agent) snapshotBinding(printerID int) (edgeBinding, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	binding, ok := a.bindings[printerID]
+	return binding, ok
+}
+
+func (a *agent) proxyLocalPrinterCamera(w http.ResponseWriter, r *http.Request, binding edgeBinding, variant string) error {
+	switch normalizeAdapterFamily(binding.AdapterFamily) {
+	case "moonraker":
+		webcam, err := a.fetchMoonrakerPrimaryWebcam(r.Context(), binding.EndpointURL)
+		if err != nil {
+			return fmt.Errorf("camera unavailable: %w", err)
+		}
+
+		targetURL := strings.TrimSpace(webcam.StreamURL)
+		isStream := true
+		if variant == "snapshot" {
+			targetURL = strings.TrimSpace(webcam.SnapshotURL)
+			isStream = false
+		}
+		if targetURL == "" {
+			return errors.New("camera endpoint unavailable")
+		}
+		return a.proxyLocalCameraResponse(w, r, targetURL, isStream)
+	case "bambu":
+		return a.proxyBambuCameraResponse(w, r, binding, variant)
+	default:
+		return errors.New("camera is not supported for this adapter")
+	}
+}
+
+func (a *agent) fetchMoonrakerPrimaryWebcam(ctx context.Context, endpointURL string) (moonrakerWebcamConfig, error) {
+	requestTimeout := a.cfg.MoonrakerRequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 8 * time.Second
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, resolveURL(endpointURL, "/server/webcams/list"), nil)
+	if err != nil {
+		return moonrakerWebcamConfig{}, err
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return moonrakerWebcamConfig{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return moonrakerWebcamConfig{}, fmt.Errorf("moonraker webcams failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Webcams []struct {
+			Name          string `json:"name"`
+			StreamURL     string `json:"stream_url"`
+			SnapshotURL   string `json:"snapshot_url"`
+			Enabled       *bool  `json:"enabled"`
+			Default       bool   `json:"default"`
+			DefaultCamera bool   `json:"default_camera"`
+		} `json:"webcams"`
+		Result struct {
+			Webcams []struct {
+				Name          string `json:"name"`
+				StreamURL     string `json:"stream_url"`
+				SnapshotURL   string `json:"snapshot_url"`
+				Enabled       *bool  `json:"enabled"`
+				Default       bool   `json:"default"`
+				DefaultCamera bool   `json:"default_camera"`
+			} `json:"webcams"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return moonrakerWebcamConfig{}, err
+	}
+
+	rawWebcams := payload.Webcams
+	if len(rawWebcams) == 0 {
+		rawWebcams = payload.Result.Webcams
+	}
+	webcams := make([]moonrakerWebcamConfig, 0, len(rawWebcams))
+	for _, item := range rawWebcams {
+		enabled := true
+		if item.Enabled != nil {
+			enabled = *item.Enabled
+		}
+		webcams = append(webcams, moonrakerWebcamConfig{
+			Name:        strings.TrimSpace(item.Name),
+			StreamURL:   normalizeMoonrakerCameraURL(endpointURL, item.StreamURL),
+			SnapshotURL: normalizeMoonrakerCameraURL(endpointURL, item.SnapshotURL),
+			Enabled:     enabled,
+			IsDefault:   item.Default || item.DefaultCamera,
+		})
+	}
+
+	webcam, ok := pickMoonrakerPrimaryWebcam(webcams)
+	if !ok {
+		fallback, fallbackErr := a.fetchMoonrakerSnapshotFallback(ctx, endpointURL)
+		if fallbackErr == nil {
+			return fallback, nil
+		}
+		return moonrakerWebcamConfig{}, errors.New("no enabled moonraker webcams expose a stream or snapshot url")
+	}
+	return webcam, nil
+}
+
+func (a *agent) fetchMoonrakerSnapshotFallback(ctx context.Context, endpointURL string) (moonrakerWebcamConfig, error) {
+	snapshotURLTemplate := resolveURL(
+		endpointURL,
+		fmt.Sprintf("/server/files/camera/monitor.jpg?ts=%d", time.Now().UnixMilli()),
+	)
+	if _, err := a.fetchCameraSnapshotBytes(ctx, snapshotURLTemplate); err != nil {
+		return moonrakerWebcamConfig{}, err
+	}
+	return moonrakerWebcamConfig{
+		Name:        "snapshot_fallback",
+		SnapshotURL: resolveURL(endpointURL, "/server/files/camera/monitor.jpg?ts={ts}"),
+		Enabled:     true,
+		IsDefault:   true,
+	}, nil
+}
+
+func pickMoonrakerPrimaryWebcam(webcams []moonrakerWebcamConfig) (moonrakerWebcamConfig, bool) {
+	if len(webcams) == 0 {
+		return moonrakerWebcamConfig{}, false
+	}
+	var firstEnabled *moonrakerWebcamConfig
+	var firstUsable *moonrakerWebcamConfig
+	for idx := range webcams {
+		webcam := webcams[idx]
+		usable := strings.TrimSpace(webcam.StreamURL) != "" || strings.TrimSpace(webcam.SnapshotURL) != ""
+		if webcam.Enabled && usable && webcam.IsDefault {
+			return webcam, true
+		}
+		if webcam.Enabled && usable && firstEnabled == nil {
+			candidate := webcam
+			firstEnabled = &candidate
+		}
+		if usable && firstUsable == nil {
+			candidate := webcam
+			firstUsable = &candidate
+		}
+	}
+	if firstEnabled != nil {
+		return *firstEnabled, true
+	}
+	if firstUsable != nil {
+		return *firstUsable, true
+	}
+	return moonrakerWebcamConfig{}, false
+}
+
+func normalizeMoonrakerCameraURL(endpointURL string, rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	return resolveURL(endpointURL, trimmed)
+}
+
+func (a *agent) proxyLocalCameraResponse(w http.ResponseWriter, r *http.Request, targetURL string, stream bool) error {
+	requestCtx := r.Context()
+	cancel := func() {}
+	if !stream {
+		requestTimeout := a.cfg.MoonrakerRequestTimeout
+		if requestTimeout <= 0 {
+			requestTimeout = 8 * time.Second
+		}
+		requestCtx, cancel = context.WithTimeout(r.Context(), requestTimeout)
+	}
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return err
+	}
+
+	client := a.client
+	if stream {
+		transport := http.DefaultTransport
+		if client != nil && client.Transport != nil {
+			transport = client.Transport
+		}
+		client = &http.Client{Transport: transport}
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("camera upstream returned status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if contentType := strings.TrimSpace(resp.Header.Get("Content-Type")); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+func (a *agent) proxyBambuCameraResponse(w http.ResponseWriter, r *http.Request, binding edgeBinding, variant string) error {
+	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	if err != nil {
+		return err
+	}
+	credentials, err := a.resolveBambuLANRuntimeCredentials(r.Context(), printerID)
+	if err != nil {
+		return err
+	}
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return errors.New("ffmpeg is required on the edge host for bambu camera streaming")
+	}
+
+	streamURL, err := bambuCameraRTSPURL(credentials)
+	if err != nil {
+		return err
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-rtsp_transport", "tcp",
+		"-i", streamURL,
+	}
+	contentType := "multipart/x-mixed-replace;boundary=frame"
+	if variant == "snapshot" {
+		args = append(args,
+			"-frames:v", "1",
+			"-f", "image2pipe",
+			"-vcodec", "mjpeg",
+			"pipe:1",
+		)
+		contentType = "image/jpeg"
+	} else {
+		args = append(args,
+			"-f", "mpjpeg",
+			"-boundary_tag", "frame",
+			"-q:v", "6",
+			"-r", "5",
+			"pipe:1",
+		)
+	}
+
+	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stdout = w
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	stderrCh := make(chan string, 1)
+	go func() {
+		msg, _ := io.ReadAll(io.LimitReader(stderr, 4096))
+		stderrCh <- strings.TrimSpace(string(msg))
+	}()
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	waitErr := cmd.Wait()
+	stderrMsg := <-stderrCh
+	if waitErr != nil {
+		if stderrMsg != "" {
+			return fmt.Errorf("bambu ffmpeg proxy failed: %s", stderrMsg)
+		}
+		return waitErr
+	}
+	return nil
+}
+
+func bambuCameraRTSPURL(credentials bambustore.BambuLANCredentials) (string, error) {
+	host := strings.TrimSpace(credentials.Host)
+	accessCode := strings.TrimSpace(credentials.AccessCode)
+	if host == "" {
+		return "", errors.New("bambu camera unavailable: missing bambu host")
+	}
+	if accessCode == "" {
+		return "", errors.New("bambu camera unavailable: missing bambu access code")
+	}
+	return (&url.URL{
+		Scheme: "rtsp",
+		User:   url.UserPassword("bblp", accessCode),
+		Host:   net.JoinHostPort(host, bambuCameraRTSPPort),
+		Path:   bambuCameraRTSPPath,
+	}).String(), nil
 }
 
 const (

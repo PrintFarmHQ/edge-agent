@@ -21,6 +21,7 @@ const (
 	bambuLANMQTTUsername          = "bblp"
 	bambuLANFailureThreshold      = 2
 	defaultBambuLANRuntimeTimeout = 2 * time.Second
+	bambuLANFilamentCommandTemp   = 215
 )
 
 var fetchBambuLANMQTTSnapshot = defaultFetchBambuLANMQTTSnapshot
@@ -94,6 +95,88 @@ func (a *agent) executeBambuLANControlAction(
 		return err
 	}
 	return a.verifyBambuControlAction(ctx, strings.TrimSpace(credentials.Serial), command)
+}
+
+func (a *agent) executeBambuLANPrinterCommand(
+	ctx context.Context,
+	queuedAction action,
+	binding edgeBinding,
+) error {
+	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	if err != nil {
+		return err
+	}
+	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
+	if err != nil {
+		if isBambuLANCredentialsUnavailable(err) {
+			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
+		}
+		return err
+	}
+
+	var payload []byte
+	switch strings.TrimSpace(queuedAction.Kind) {
+	case "light_on", "light_off":
+		ledMode := "on"
+		if strings.TrimSpace(queuedAction.Kind) == "light_off" {
+			ledMode = "off"
+		}
+		payload, err = json.Marshal(map[string]any{
+			"system": map[string]any{
+				"command":       "ledctrl",
+				"sequence_id":   strconv.FormatInt(time.Now().UnixMilli(), 10),
+				"led_node":      "chamber_light",
+				"led_mode":      ledMode,
+				"led_on_time":   500,
+				"led_off_time":  500,
+				"loop_times":    0,
+				"interval_time": 0,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal bambu led payload: %w", err)
+		}
+		if err := publishBambuMQTTRawFunc(
+			ctx,
+			net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
+			formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
+			bambuLANMQTTUsername,
+			strings.TrimSpace(credentials.AccessCode),
+			payload,
+			true,
+		); err != nil {
+			return err
+		}
+		return a.verifyBambuLEDState(ctx, strings.TrimSpace(credentials.Serial), ledMode)
+	case "load_filament", "unload_filament":
+		target := 255
+		if strings.TrimSpace(queuedAction.Kind) == "unload_filament" {
+			target = 254
+		}
+		payload, err = json.Marshal(map[string]any{
+			"print": map[string]any{
+				"command":     "ams_change_filament",
+				"sequence_id": strconv.FormatInt(time.Now().UnixMilli(), 10),
+				"target":      target,
+				"curr_temp":   bambuLANFilamentCommandTemp,
+				"tar_temp":    bambuLANFilamentCommandTemp,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal bambu filament payload: %w", err)
+		}
+		return publishBambuMQTTRawFunc(
+			ctx,
+			net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
+			formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
+			bambuLANMQTTUsername,
+			strings.TrimSpace(credentials.AccessCode),
+			payload,
+			true,
+		)
+	default:
+		return fmt.Errorf("validation_error: unsupported bambu lan printer command %s", queuedAction.Kind)
+	}
 }
 
 func (a *agent) resolveBambuLANRuntimeCredentials(ctx context.Context, printerID string) (bambustore.BambuLANCredentials, error) {
@@ -357,6 +440,39 @@ func parseBambuLANMQTTSnapshotPayload(raw []byte) (bindingSnapshot, error) {
 	} else if hasPrintError && printError > 0 {
 		snapshot.ManualIntervention = "print_error"
 	}
+	ledState := parseBambuLANLightState(payload.Print["lights_report"])
+	filamentState, filamentStateSource, filamentConfidence, sourceKind, sourceLabel := parseBambuLANFilamentTelemetry(payload.Print["ams"])
+	filamentActionState := parseBambuLANFilamentActionState(payload.Print["subtask_name"])
+	filamentCapability := map[string]any{
+		"state":        filamentState,
+		"state_source": filamentStateSource,
+		"confidence":   filamentConfidence,
+		"source_kind":  sourceKind,
+	}
+	if sourceLabel != "" {
+		filamentCapability["source_label"] = sourceLabel
+	}
+	if filamentActionState != "" {
+		filamentCapability["action_state"] = filamentActionState
+	}
+	snapshot.CommandCapabilities = map[string]any{
+		"led": map[string]any{
+			"supported": true,
+		},
+		"filament": filamentCapability,
+		"load_filament": map[string]any{
+			"supported": true,
+		},
+		"unload_filament": map[string]any{
+			"supported": true,
+		},
+	}
+	if ledState != "" {
+		snapshot.CommandCapabilities["led"] = map[string]any{
+			"supported": true,
+			"state":     ledState,
+		}
+	}
 
 	return snapshot, nil
 }
@@ -444,12 +560,111 @@ func bambuLANValueAsFloat(raw any) (float64, bool) {
 	}
 }
 
+func bambuLANValueAsInt(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	case int32:
+		return int(value), true
+	case float64:
+		return int(value), true
+	case float32:
+		return int(value), true
+	case json.Number:
+		parsed, err := value.Int64()
+		return int(parsed), err == nil
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
 func bambuLANValueAsSlice(raw any) []any {
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
 	return items
+}
+
+func parseBambuLANLightState(raw any) string {
+	fallback := ""
+	for _, item := range bambuLANValueAsSlice(raw) {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		mode := strings.ToLower(strings.TrimSpace(bambuLANValueAsString(entry["mode"])))
+		if mode != "on" && mode != "off" {
+			continue
+		}
+		node := strings.ToLower(strings.TrimSpace(bambuLANValueAsString(entry["node"])))
+		if node == "chamber_light" {
+			return mode
+		}
+		if fallback == "" && (node == "" || strings.Contains(node, "chamber") || strings.Contains(node, "light")) {
+			fallback = mode
+		}
+	}
+	return fallback
+}
+
+func parseBambuLANFilamentTelemetry(raw any) (string, string, string, string, string) {
+	sourceKind, sourceLabel, sourceKnown := parseBambuLANActiveSource(raw)
+	if !sourceKnown {
+		return "unknown", filamentStateSourceUnknown, filamentConfidenceHeuristic, filamentSourceKindUnknown, ""
+	}
+	switch sourceKind {
+	case filamentSourceKindExternalSpool, filamentSourceKindAMS:
+		return "loaded", filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, sourceLabel
+	case filamentSourceKindNone:
+		return "unknown", filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, ""
+	default:
+		return "unknown", filamentStateSourceUnknown, filamentConfidenceHeuristic, filamentSourceKindUnknown, ""
+	}
+}
+
+func parseBambuLANActiveSource(raw any) (string, string, bool) {
+	amsPayload, ok := raw.(map[string]any)
+	if !ok || len(amsPayload) == 0 {
+		return filamentSourceKindUnknown, "", false
+	}
+	trayNowRaw, exists := amsPayload["tray_now"]
+	if !exists {
+		return filamentSourceKindUnknown, "", false
+	}
+	trayNow, ok := bambuLANValueAsInt(trayNowRaw)
+	if !ok {
+		return filamentSourceKindUnknown, "", false
+	}
+	switch {
+	case trayNow == 254:
+		return filamentSourceKindExternalSpool, "External spool", true
+	case trayNow == 255:
+		return filamentSourceKindNone, "", true
+	case trayNow >= 80:
+		return filamentSourceKindAMS, fmt.Sprintf("AMS HT %d", trayNow), true
+	case trayNow >= 0:
+		return filamentSourceKindAMS, fmt.Sprintf("AMS %d / Tray %d", (trayNow>>2)+1, (trayNow&0x3)+1), true
+	default:
+		return filamentSourceKindUnknown, "", false
+	}
+}
+
+func parseBambuLANFilamentActionState(raw any) string {
+	value := strings.ToLower(strings.TrimSpace(bambuLANValueAsString(raw)))
+	switch {
+	case strings.Contains(value, "unload") && strings.Contains(value, "filament"):
+		return filamentActionStateUnloading
+	case strings.Contains(value, "load") && strings.Contains(value, "filament"):
+		return filamentActionStateLoading
+	default:
+		return ""
+	}
 }
 
 func formatBambuLANMQTTRequestTopic(printerID string) string {

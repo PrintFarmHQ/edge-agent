@@ -31,8 +31,23 @@ const (
 
 var bambuLANPASVPattern = regexp.MustCompile(`\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)`)
 
+var dialBambuLANArtifactClient = func(ctx context.Context, host string) (bambuLANArtifactClient, error) {
+	return dialBambuLANFTPS(ctx, host)
+}
+var probeBambuLANArtifact = defaultProbeBambuLANArtifact
 var uploadBambuLANArtifact = defaultUploadBambuLANArtifact
 var dispatchBambuLANProjectFile = defaultDispatchBambuLANProjectFile
+
+type bambuLANArtifactClient interface {
+	login(username, password string) error
+	setBinaryMode() error
+	store(remoteName string, fileBytes []byte) error
+	delete(remoteName string) error
+	size(remoteName string) (int64, error)
+	retrieve(remoteName string, writer io.Writer) (int64, error)
+	quit() error
+	close() error
+}
 
 type bambuLANProjectFileRequest struct {
 	RemoteName  string
@@ -54,92 +69,86 @@ func (a *agent) executeBambuLANPrintAction(ctx context.Context, queuedAction act
 		return err
 	}
 
-	localPath, remoteName, err := a.downloadArtifact(ctx, queuedAction.Target)
+	artifact, err := a.downloadArtifact(ctx, queuedAction.Target)
 	if err != nil {
 		return err
 	}
-	defer a.cleanupArtifact(localPath)
+	defer a.cleanupArtifact(artifact.LocalPath)
 
-	if !strings.EqualFold(filepath.Ext(strings.TrimSpace(remoteName)), ".3mf") {
+	if ext := strings.ToLower(strings.TrimSpace(artifact.NormalizedExtension)); ext != ".3mf" && ext != ".gcode.3mf" {
 		return fmt.Errorf(
 			"validation_error: bambu lan print start requires a .3mf artifact, got %q",
-			strings.TrimSpace(remoteName),
+			artifact.preferredSourceName(),
 		)
 	}
 
-	fileBytes, err := osReadFile(localPath)
-	if err != nil {
-		return err
-	}
-	fileMD5Sum := md5.Sum(fileBytes)
-	fileMD5 := strings.ToUpper(hex.EncodeToString(fileMD5Sum[:]))
-	remoteStartFileName := normalizeBambuLANRemoteStartFilename(remoteName)
+	remoteStartFileName := artifact.bambuLANRemoteName()
 	projectPath := defaultBambuLANProjectFileParam()
+	baseAuditFields := artifactAuditFields(queuedAction, "bambu", remoteStartFileName)
 
-	a.audit("artifact_downloaded", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteName,
-		"adapter_family":  "bambu",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-	})
-	a.audit("bambu_lan_upload_attempt", map[string]any{
-		"printer_id":     queuedAction.PrinterID,
-		"job_id":         queuedAction.Target.JobID,
-		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteStartFileName,
-		"transport":      "bambu_lan_ftps",
-		"adapter_family": "bambu",
-	})
+	a.audit("artifact_downloaded", mergedAuditFields(baseAuditFields, map[string]any{
+		"source_filename": artifact.preferredSourceName(),
+		"size_bytes":      artifact.SizeBytes,
+	}))
+	a.audit("artifact_reuse_probe_attempt", mergedAuditFields(baseAuditFields, map[string]any{
+		"transport": "bambu_lan_ftps",
+	}))
 
-	if err := uploadBambuLANArtifact(ctx, credentials, remoteStartFileName, fileBytes); err != nil {
-		a.audit("bambu_lan_upload_failed", map[string]any{
-			"printer_id":     queuedAction.PrinterID,
-			"job_id":         queuedAction.Target.JobID,
-			"plate_id":       queuedAction.Target.PlateID,
-			"filename":       remoteStartFileName,
-			"transport":      "bambu_lan_ftps",
-			"adapter_family": "bambu",
-			"error":          err.Error(),
-		})
-		return fmt.Errorf("bambu_lan_upload_failed: %w", err)
+	reused, reason, probeErr := probeBambuLANArtifact(ctx, credentials, remoteStartFileName, artifact)
+	switch {
+	case probeErr != nil:
+		a.audit("artifact_reuse_probe_fallback_upload", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+			"reason":    reason,
+			"error":     probeErr.Error(),
+		}))
+	case reused:
+		a.audit("artifact_reused", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+			"reason":    reason,
+		}))
+	case reason != "" && reason != "absent":
+		a.audit("artifact_reuse_probe_mismatch", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+			"reason":    reason,
+		}))
 	}
 
-	a.audit("bambu_lan_upload_success", map[string]any{
-		"printer_id":     queuedAction.PrinterID,
-		"job_id":         queuedAction.Target.JobID,
-		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteStartFileName,
-		"transport":      "bambu_lan_ftps",
-		"adapter_family": "bambu",
-	})
-	a.audit("artifact_uploaded", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteStartFileName,
-		"adapter_family":  "bambu",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-		"transport":       "bambu_lan_ftps",
-	})
+	if !reused {
+		fileBytes, err := osReadFile(artifact.LocalPath)
+		if err != nil {
+			return err
+		}
+		a.audit("bambu_lan_upload_attempt", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+		}))
+		if err := uploadBambuLANArtifact(ctx, credentials, remoteStartFileName, fileBytes); err != nil {
+			a.audit("bambu_lan_upload_failed", mergedAuditFields(baseAuditFields, map[string]any{
+				"transport": "bambu_lan_ftps",
+				"error":     err.Error(),
+			}))
+			return fmt.Errorf("bambu_lan_upload_failed: %w", err)
+		}
+
+		a.audit("bambu_lan_upload_success", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+		}))
+		a.audit("artifact_uploaded", mergedAuditFields(baseAuditFields, map[string]any{
+			"transport": "bambu_lan_ftps",
+		}))
+	}
 
 	projectReq := bambuLANProjectFileRequest{
 		RemoteName:  remoteStartFileName,
-		FileMD5:     fileMD5,
+		FileMD5:     strings.ToUpper(strings.TrimSpace(artifact.MD5)),
 		ProjectPath: projectPath,
 	}
-	a.audit("bambu_print_start_dispatch_attempt", map[string]any{
-		"printer_id":         queuedAction.PrinterID,
-		"job_id":             queuedAction.Target.JobID,
-		"plate_id":           queuedAction.Target.PlateID,
-		"filename":           remoteStartFileName,
+	a.audit("bambu_print_start_dispatch_attempt", mergedAuditFields(baseAuditFields, map[string]any{
 		"project_path":       projectPath,
 		"transport":          "bambu_lan_mqtt",
-		"adapter_family":     "bambu",
 		"has_file_md5":       projectReq.FileMD5 != "",
 		"uses_fixed_options": true,
-	})
+	}))
 	previousEchoAudit := auditBambuLANProjectFileEcho
 	auditBambuLANProjectFileEcho = func(payload map[string]any) {
 		merged := map[string]any{
@@ -181,29 +190,74 @@ func (a *agent) executeBambuLANPrintAction(ctx context.Context, queuedAction act
 		return fmt.Errorf("bambu_start_verification_timeout: %w", err)
 	}
 
-	a.audit("bambu_print_start_verified", map[string]any{
-		"printer_id":     queuedAction.PrinterID,
-		"job_id":         queuedAction.Target.JobID,
-		"plate_id":       queuedAction.Target.PlateID,
-		"filename":       remoteStartFileName,
-		"project_path":   projectPath,
-		"transport":      "bambu_lan_mqtt",
-		"adapter_family": "bambu",
-	})
-	a.audit("print_start_requested", map[string]any{
-		"printer_id":      queuedAction.PrinterID,
-		"job_id":          queuedAction.Target.JobID,
-		"plate_id":        queuedAction.Target.PlateID,
-		"filename":        remoteStartFileName,
-		"adapter_family":  "bambu",
-		"desired_printer": queuedAction.Target.DesiredPrinterState,
-		"transport":       "bambu_lan_mqtt",
-	})
+	a.audit("bambu_print_start_verified", mergedAuditFields(baseAuditFields, map[string]any{
+		"project_path": projectPath,
+		"transport":    "bambu_lan_mqtt",
+	}))
+	a.audit("print_start_requested", mergedAuditFields(baseAuditFields, map[string]any{
+		"transport": "bambu_lan_mqtt",
+	}))
 	return nil
 }
 
 var osReadFile = func(path string) ([]byte, error) {
 	return os.ReadFile(path)
+}
+
+func defaultProbeBambuLANArtifact(
+	ctx context.Context,
+	credentials bambustore.BambuLANCredentials,
+	remoteName string,
+	artifact stagedArtifact,
+) (bool, string, error) {
+	host := strings.TrimSpace(credentials.Host)
+	accessCode := strings.TrimSpace(credentials.AccessCode)
+	trimmedRemoteName := strings.TrimSpace(remoteName)
+	if host == "" || accessCode == "" {
+		return false, "probe_unavailable", errors.New("validation_error: bambu lan probe requires host and access code")
+	}
+	if trimmedRemoteName == "" {
+		return false, "probe_unavailable", errors.New("validation_error: bambu lan probe requires remote filename")
+	}
+
+	client, err := dialBambuLANArtifactClient(ctx, host)
+	if err != nil {
+		return false, "probe_unavailable", err
+	}
+	defer client.close()
+
+	if err := client.login(bambuLANFTPSUsername, accessCode); err != nil {
+		return false, "probe_unavailable", err
+	}
+	if err := client.setBinaryMode(); err != nil {
+		return false, "probe_unavailable", err
+	}
+
+	sizeBytes, err := client.size(trimmedRemoteName)
+	if err != nil {
+		if isBambuLANFTPSNotFound(err) {
+			return false, "absent", nil
+		}
+		return false, "size_probe_error", err
+	}
+	if sizeBytes != artifact.SizeBytes {
+		return false, "size_mismatch", nil
+	}
+
+	md5Hasher := md5.New()
+	retrievedSize, err := client.retrieve(trimmedRemoteName, md5Hasher)
+	if err != nil {
+		return false, "hash_probe_error", err
+	}
+	if retrievedSize != artifact.SizeBytes {
+		return false, "size_mismatch", nil
+	}
+
+	remoteMD5 := hex.EncodeToString(md5Hasher.Sum(nil))
+	if !strings.EqualFold(remoteMD5, strings.TrimSpace(artifact.MD5)) {
+		return false, "md5_mismatch", nil
+	}
+	return true, "md5_match", nil
 }
 
 func buildBambuLANProjectFilePayload(req bambuLANProjectFileRequest) map[string]any {
@@ -410,7 +464,7 @@ func defaultUploadBambuLANArtifact(
 		return errors.New("validation_error: bambu lan upload requires remote filename")
 	}
 
-	client, err := dialBambuLANFTPS(ctx, host)
+	client, err := dialBambuLANArtifactClient(ctx, host)
 	if err != nil {
 		return err
 	}
@@ -423,10 +477,54 @@ func defaultUploadBambuLANArtifact(
 		return err
 	}
 	if err := client.store(trimmedRemoteName, fileBytes); err != nil {
-		return err
+		if !isBambuLANFTPSOverwriteRequired(err) {
+			return err
+		}
+		if deleteErr := client.delete(trimmedRemoteName); deleteErr != nil && !isBambuLANFTPSNotFound(deleteErr) {
+			return deleteErr
+		}
+		if retryErr := client.store(trimmedRemoteName, fileBytes); retryErr != nil {
+			return retryErr
+		}
 	}
 	_ = client.quit()
 	return nil
+}
+
+type bambuLANFTPSResponseError struct {
+	Command string
+	Code    int
+	Message string
+}
+
+func (e *bambuLANFTPSResponseError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.Command) == "" {
+		return fmt.Sprintf("bambu ftps response returned %d: %s", e.Code, strings.TrimSpace(e.Message))
+	}
+	return fmt.Sprintf("bambu ftps command %q returned %d: %s", e.Command, e.Code, strings.TrimSpace(e.Message))
+}
+
+func isBambuLANFTPSNotFound(err error) bool {
+	var responseErr *bambuLANFTPSResponseError
+	return errors.As(err, &responseErr) && responseErr.Code == 550
+}
+
+func isBambuLANFTPSOverwriteRequired(err error) bool {
+	var responseErr *bambuLANFTPSResponseError
+	if errors.As(err, &responseErr) {
+		if responseErr.Code == 553 {
+			return true
+		}
+		if responseErr.Code == 550 {
+			message := strings.ToLower(strings.TrimSpace(responseErr.Message))
+			return strings.Contains(message, "exist") || strings.Contains(message, "overwrite") || strings.Contains(message, "delete")
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "exist") || strings.Contains(message, "overwrite")
 }
 
 type bambuLANFTPSClient struct {
@@ -526,6 +624,72 @@ func (c *bambuLANFTPSClient) store(remoteName string, fileBytes []byte) error {
 	return nil
 }
 
+func (c *bambuLANFTPSClient) delete(remoteName string) error {
+	_, _, err := c.command(250, "DELE %s", strings.TrimSpace(remoteName))
+	return err
+}
+
+func (c *bambuLANFTPSClient) size(remoteName string) (int64, error) {
+	trimmedRemoteName := strings.TrimSpace(remoteName)
+	command := fmt.Sprintf("SIZE %s", trimmedRemoteName)
+	code, message, err := c.expectAny([]int{213, 550, 553}, "SIZE %s", trimmedRemoteName)
+	if err != nil {
+		return 0, err
+	}
+	if code != 213 {
+		return 0, &bambuLANFTPSResponseError{Command: command, Code: code, Message: message}
+	}
+	fields := strings.Fields(message)
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("bambu ftps SIZE response malformed: %s", strings.TrimSpace(message))
+	}
+	sizeBytes, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("bambu ftps SIZE response malformed: %w", err)
+	}
+	return sizeBytes, nil
+}
+
+func (c *bambuLANFTPSClient) retrieve(remoteName string, writer io.Writer) (int64, error) {
+	trimmedRemoteName := strings.TrimSpace(remoteName)
+	dataAddr, err := c.pasvAddr()
+	if err != nil {
+		return 0, err
+	}
+
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	dataConn, err := tls.DialWithDialer(dialer, "tcp", dataAddr, &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         c.host,
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("connection error: bambu lan ftps data connection failed: %w", err)
+	}
+	defer dataConn.Close()
+
+	command := fmt.Sprintf("RETR %s", trimmedRemoteName)
+	code, message, err := c.expectAny([]int{125, 150, 550, 553}, "RETR %s", trimmedRemoteName)
+	if err != nil {
+		return 0, err
+	}
+	if code != 125 && code != 150 {
+		return 0, &bambuLANFTPSResponseError{Command: command, Code: code, Message: message}
+	}
+
+	written, err := io.Copy(writer, dataConn)
+	if err != nil {
+		return 0, fmt.Errorf("bambu lan ftps download failed: %w", err)
+	}
+	if err := dataConn.Close(); err != nil {
+		return 0, fmt.Errorf("bambu lan ftps download close failed: %w", err)
+	}
+	if _, _, err := c.readAnyResponse([]int{226, 250}); err != nil {
+		return 0, err
+	}
+	return written, nil
+}
+
 func (c *bambuLANFTPSClient) pasvAddr() (string, error) {
 	_, message, err := c.command(227, "PASV")
 	if err != nil {
@@ -614,7 +778,7 @@ func (c *bambuLANFTPSClient) expectAny(expectCodes []int, format string, args ..
 			return code, message, nil
 		}
 	}
-	return code, message, fmt.Errorf("bambu ftps command %q returned %d: %s", format, code, strings.TrimSpace(message))
+	return code, message, &bambuLANFTPSResponseError{Command: format, Code: code, Message: message}
 }
 
 func (c *bambuLANFTPSClient) readAnyResponse(expectCodes []int) (int, string, error) {
@@ -651,5 +815,5 @@ func (c *bambuLANFTPSClient) readAnyResponse(expectCodes []int) (int, string, er
 			return code, message, nil
 		}
 	}
-	return code, message, fmt.Errorf("bambu ftps response returned %d: %s", code, strings.TrimSpace(message))
+	return code, message, &bambuLANFTPSResponseError{Code: code, Message: message}
 }

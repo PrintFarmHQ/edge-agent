@@ -21,6 +21,11 @@ Optional test commands:
 make test
 ```
 
+- Edge-managed print start now uses content-addressed printer-side filenames and reuses an existing printer-local artifact when the adapter-specific probe proves the remote bytes already match.
+- Reuse is supported for:
+  - Moonraker via file metadata plus remote SHA256 verification
+  - adopted Bambu LAN printers via FTPS `SIZE` plus streamed MD5 verification
+
 ## Dev defaults
 
 - Backend health check: `http://localhost:8000/health`
@@ -83,8 +88,12 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
 - Empty/invalid MFA code (or non-interactive console) makes startup fail with a non-zero exit.
 - Bambu cloud devices are discovered through the same discovery inventory pipeline as Klipper and submitted to SaaS on the periodic inventory cadence (default 30s).
 - Bambu print lifecycle actions are enabled:
-  - print start uses Bambu cloud upload + print submit APIs, with MQTT fallback when the cloud print-start endpoint is not available for the account/region.
-  - pause/resume/stop use the Bambu cloud MQTT command channel.
+  - adopted LAN print start uses Bambu FTPS upload plus local MQTT `project_file`, and skips upload when the target printer already has the same content-addressed artifact with matching size and MD5.
+  - pause/resume/stop prefer the local MQTT command channel when LAN credentials are available, with the legacy cloud path remaining as fallback outside the adopted LAN path.
+- Print Jobs command-center runtime commands are enabled for edge-managed printers:
+  - Moonraker supports LED on/off through `device_power` and filament load/unload through `LOAD_FILAMENT` / `UNLOAD_FILAMENT` macros when those printer-side capabilities exist.
+  - adopted Bambu LAN printers support LED on/off and external-spool load/unload over local MQTT when local credentials are available and the printer is reachable.
+  - the command-center filament button now uses edge-reported `filament_state` plus `filament_action_state`; Moonraker needs a real filament sensor for a trustworthy single-button filament UX, and Bambu prefers `ams.tray_now` active-source detection with command-memory fallback plus `needs_user_confirmation` when load/unload flows still require operator completion on the printer.
 - MQTT command auth resolves username from the current Bambu access-token claims (`user_id`/`uid`/`sub`) at action time.
 - Print start success is verified against Bambu cloud telemetry (`queued`/`printing`) before the action is marked successful.
 - If the upload response does not include a printable `file_url`, print-start fails fast with a validation error (no signed-upload-URL guessing).

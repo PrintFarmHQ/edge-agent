@@ -49,7 +49,8 @@ Once the access code is stored on the edge host:
 - edge-agent uses it for authenticated local MQTT snapshot reads,
 - edge-agent routes Bambu `pause`, `resume`, and `stop` through local MQTT when credentials are available,
 - edge-agent can start prints unattended over the local LAN when the printer is in `LAN Only + Developer Mode`,
-- unattended LAN start currently requires a `.3mf` artifact and uses a fixed agent-side start profile.
+- unattended LAN start currently requires a `.3mf` artifact and uses a fixed agent-side start profile,
+- printer-side LAN start artifacts are named from the artifact SHA256 and reused when FTPS `SIZE` plus streamed MD5 prove the exact same bytes are already present on the printer.
 
 If the local edge state is lost while the printer is still adopted:
 

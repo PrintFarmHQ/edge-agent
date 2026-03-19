@@ -21,6 +21,11 @@ lowercase snake_case token such as `canceled`, `stopped`, `hms_alert`, or `print
 SaaS may assign special behavior to `canceled` and `stopped`, but it must preserve other
 vendor-specific tokens instead of rejecting the whole state batch.
 
+`command_capabilities` is another auxiliary field. It does not alter the canonical
+printer/job runtime state, but it does tell SaaS which command-center controls are
+currently supported by the selected printer and, when applicable, the last known LED state,
+filament state, and filament action progress.
+
 ## Provider Mapping
 
 ### Moonraker / Klipper
@@ -31,6 +36,11 @@ vendor-specific tokens instead of rejecting the whole state batch.
 - `cancelled` / `canceled` -> `idle / canceled`
 - `error` -> `error / failed`
 - unknown states -> `idle / pending`
+- command capabilities are discovered separately from runtime state:
+  - LED support comes from Moonraker `device_power`
+  - filament load/unload support comes from the presence of `gcode_macro LOAD_FILAMENT` and `gcode_macro UNLOAD_FILAMENT`
+  - a truthful single-button filament UX additionally requires a real `filament_switch_sensor` or `filament_motion_sensor`
+  - filament action progress can transiently report `loading` or `unloading`; if the sensor never converges, edge-agent falls back to `unknown`
 
 ### Bambu Cloud
 
@@ -55,6 +65,14 @@ For runtime snapshots, if a Bambu cloud device is offline, the agent returns con
 - For adopted Bambu printers, edge-agent uses a dedicated short live-runtime timeout for local MQTT snapshots. It tolerates one transient live MQTT runtime miss by falling back to the recent LAN discovery cache. After 2 consecutive live runtime connectivity failures, it stops trusting discovery cache and pushes `connectivity_error` so SaaS can mark the printer unreachable in near real time.
 - While a Bambu `print` action is still inflight, transient live-runtime connectivity misses are suppressed instead of downgrading the printer to `unreachable`, because printers can briefly stop answering snapshot reads during upload/start preparation even though the print is starting successfully.
 - After a Bambu printer accepts `project_file`, edge-agent immediately projects `queued / pending` with the target job/plate identity before final verification completes. That allows SaaS to treat calibration/preparation as a legitimate in-progress start instead of a stalled start that never began.
+- command capabilities come from the same local MQTT runtime path:
+  - LED state is derived from `lights_report`
+  - LED on/off uses the local MQTT `system.ledctrl` envelope
+  - spool load/unload uses the local MQTT `print.ams_change_filament` envelope
+  - active filament-source detection comes from `print.ams.tray_now`; `vt_tray` is metadata for the external spool, not proof that filament is currently loaded
+  - when runtime telemetry is ambiguous at idle, edge-agent can fall back to short-lived command memory so the single filament button remains truthful after a completed unload
+  - read-path AMS source detection is supported, but AMS write actions remain gated until the exact MQTT write contract is verified
+  - Bambu filament actions can surface `needs_user_confirmation` when the printer does not converge automatically after a load/unload request
 
 ## Discovery vs Runtime
 

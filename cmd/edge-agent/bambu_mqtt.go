@@ -16,6 +16,8 @@ import (
 
 type defaultBambuPrintCommandPublisher struct{}
 
+var publishBambuMQTTRawFunc = publishBambuMQTTRaw
+
 func (defaultBambuPrintCommandPublisher) PublishPrintCommand(ctx context.Context, req bambuMQTTCommandRequest) error {
 	brokerAddr := strings.TrimSpace(req.BrokerAddr)
 	if brokerAddr == "" {
@@ -75,6 +77,72 @@ func (defaultBambuPrintCommandPublisher) PublishPrintCommand(ctx context.Context
 		return err
 	}
 	if err := writeMQTTPublish(conn, topic, payload); err != nil {
+		return err
+	}
+	_, _ = conn.Write([]byte{0xE0, 0x00})
+	return nil
+}
+
+func publishBambuMQTTRaw(
+	ctx context.Context,
+	brokerAddr string,
+	topic string,
+	username string,
+	password string,
+	payload []byte,
+	insecureSkipVerify bool,
+) error {
+	trimmedBrokerAddr := strings.TrimSpace(brokerAddr)
+	if trimmedBrokerAddr == "" {
+		return errors.New("validation_error: missing bambu mqtt broker address")
+	}
+	trimmedTopic := strings.TrimSpace(topic)
+	if trimmedTopic == "" {
+		return errors.New("validation_error: missing bambu mqtt topic")
+	}
+	trimmedUsername := strings.TrimSpace(username)
+	if trimmedUsername == "" {
+		return errors.New("validation_error: missing bambu mqtt username")
+	}
+	trimmedPassword := strings.TrimSpace(password)
+	if trimmedPassword == "" {
+		return errors.New("validation_error: missing bambu mqtt password")
+	}
+	if len(payload) == 0 {
+		return errors.New("validation_error: missing bambu mqtt payload")
+	}
+
+	host, _, err := net.SplitHostPort(trimmedBrokerAddr)
+	if err != nil {
+		return fmt.Errorf("validation_error: invalid bambu mqtt broker address %q: %w", trimmedBrokerAddr, err)
+	}
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	if deadline, ok := ctx.Deadline(); ok {
+		dialer.Deadline = deadline
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", trimmedBrokerAddr, &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         strings.TrimSpace(host),
+		InsecureSkipVerify: insecureSkipVerify,
+	})
+	if err != nil {
+		return fmt.Errorf("bambu mqtt connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+
+	if err := writeMQTTConnect(conn, trimmedUsername, trimmedPassword); err != nil {
+		return err
+	}
+	if err := readMQTTConnAck(conn); err != nil {
+		return err
+	}
+	if err := writeMQTTPublish(conn, trimmedTopic, payload); err != nil {
 		return err
 	}
 	_, _ = conn.Write([]byte{0xE0, 0x00})
