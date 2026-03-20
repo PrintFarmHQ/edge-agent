@@ -110,5 +110,8 @@ When the state is `not_connected` or `renew_key`, the printer board is hidden an
 - The SaaS printer camera now relies on a camera-session bridge where `edge-agent` uploads stream bytes to the control plane for inline playback in the printer sheet.
 - Camera support is intentionally narrow and truthful:
   - Moonraker webcams are supported through the local proxy.
-  - Bambu cameras use the local edge host plus `ffmpeg` to expose a browser-viewable feed when LAN credentials and camera reachability are available.
+  - Bambu cameras are served through an `edge-agent`-owned local runtime and internal loopback contract.
+  - the Bambu plugin bundle is version-pinned, downloaded from the official source when missing, and checksum-verified before `edge-agent` uses it from `~/.printfarmhq`.
+  - directly tested Bambu camera support currently exists only for `P1S`.
+  - unverified families remain explicitly unavailable instead of pretending to work through blind fallback probes.
   - Unsupported or unreachable camera sources remain explicitly unavailable instead of showing a fake stream.

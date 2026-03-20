@@ -89,7 +89,9 @@ Examples:
   - use `server/files/camera/monitor.jpg?ts=<now>`
   - treat camera as `snapshot_poll`
 - Bambu P1/P1S:
-  - prefer helper-backed local MJPEG
+  - prefer an `edge-agent`-owned local runtime that exposes a stable loopback MJPEG contract
+  - do not treat blind `:322` RTSP probing as a default supported path
+  - directly tested support currently exists only for `P1S`
   - treat camera as `live_stream`
 
 ### Rule 3: Truth over symmetry

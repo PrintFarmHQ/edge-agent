@@ -90,6 +90,13 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
 - Bambu print lifecycle actions are enabled:
   - adopted LAN print start uses Bambu FTPS upload plus local MQTT `project_file`, and skips upload when the target printer already has the same content-addressed artifact with matching size and MD5.
   - pause/resume/stop prefer the local MQTT command channel when LAN credentials are available, with the legacy cloud path remaining as fallback outside the adopted LAN path.
+- Bambu camera is now managed internally by `edge-agent`:
+  - `edge-agent` owns the local Bambu camera runtime and exposes a loopback-only internal MJPEG contract for its own use.
+  - the required Bambu plugin bundle is pinned to a specific version and checksum-verified before use.
+  - if the pinned plugin bundle is missing, `edge-agent` downloads the official archive into `~/.printfarmhq` and uses the cached copy instead of following whatever Bambu Studio version is installed locally.
+  - SaaS still does not connect to `edge-agent` directly; `edge-agent` pulls camera-session work and pushes stream bytes back to the control plane.
+  - directly tested Bambu camera support currently exists only for `P1S`.
+  - unverified families such as `X1C` must remain truthfully unavailable until they are directly validated and implemented.
 - Print Jobs command-center runtime commands are enabled for edge-managed printers:
   - Moonraker supports LED on/off through `device_power` and filament load/unload through `LOAD_FILAMENT` / `UNLOAD_FILAMENT` macros when those printer-side capabilities exist.
   - adopted Bambu LAN printers support LED on/off and external-spool load/unload over local MQTT when local credentials are available and the printer is reachable.

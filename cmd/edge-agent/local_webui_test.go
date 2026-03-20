@@ -1,17 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	bambucamera "printfarmhq/edge-agent/internal/bambu/cameraruntime"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
+
+type fakeBambuCameraRuntime struct {
+	ensureFn func(ctx context.Context, req bambucamera.EnsureRequest) (bambucamera.Handle, error)
+}
+
+func (f fakeBambuCameraRuntime) Ensure(ctx context.Context, req bambucamera.EnsureRequest) (bambucamera.Handle, error) {
+	if f.ensureFn == nil {
+		return bambucamera.Handle{}, errors.New("ensure not implemented")
+	}
+	return f.ensureFn(ctx, req)
+}
 
 func TestLocalObservationsEndpointReturnsNotConnectedPayload(t *testing.T) {
 	a := newTestAgent(t)
@@ -184,12 +200,13 @@ func TestLocalObservationScanEndpointReturnsStartedWhenIdle(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if !a.localObservations.scanStatus().LastStartedAt.IsZero() {
+		status := a.localObservations.scanStatus()
+		if !status.LastStartedAt.IsZero() && !status.LastFinishedAt.IsZero() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("expected scan start to be recorded")
+	t.Fatalf("expected scan to start and finish")
 }
 
 func TestLocalControlPlaneConnectEndpointClaimsAgent(t *testing.T) {
@@ -630,14 +647,129 @@ func TestBambuCameraRTSPCandidatesUseLANCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bambuCameraRTSPCandidates failed: %v", err)
 	}
-	if len(urls) < 5 {
-		t.Fatalf("candidate count = %d, want at least 5", len(urls))
+	if len(urls) != 3 {
+		t.Fatalf("candidate count = %d, want 3", len(urls))
 	}
 	if urls[0] != "rtsp://bblp:abc123@192.168.1.88:6000/streaming/live/1" {
 		t.Fatalf("first rtsp url = %q, want rtsp://...:6000/streaming/live/1", urls[0])
 	}
-	if urls[3] != "rtsp://bblp:abc123@192.168.1.88:322/streaming/live/1" {
-		t.Fatalf("fourth rtsp url = %q, want rtsp://...:322/streaming/live/1", urls[3])
+	if strings.Contains(strings.Join(urls, ","), ":322/") {
+		t.Fatalf("rtsp candidates = %#v, did not expect port 322 fallback", urls)
+	}
+}
+
+func TestResolveBambuCameraSourcePrefersHelperByDefault(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuCameraHelperMJPEGURLTemplate = "http://127.0.0.1:1984/api/stream.mjpeg?src={serial}"
+	a.cfg.BambuCameraRTSPFallbackEnabled = false
+
+	originalHelperProber := bambuCameraHelperProber
+	originalCandidateProber := bambuCameraCandidateProber
+	t.Cleanup(func() {
+		bambuCameraHelperProber = originalHelperProber
+		bambuCameraCandidateProber = originalCandidateProber
+	})
+
+	bambuCameraHelperProber = func(context.Context, string) error {
+		return nil
+	}
+	bambuCameraCandidateProber = func(context.Context, string) error {
+		t.Fatalf("RTSP fallback should not run when helper is reachable")
+		return nil
+	}
+
+	source, err := a.resolveBambuCameraSource(context.Background(), bambustore.BambuLANCredentials{
+		Host:       "192.168.1.88",
+		Serial:     "01P09C470101190",
+		AccessCode: "abc123",
+	})
+	if err != nil {
+		t.Fatalf("resolveBambuCameraSource failed: %v", err)
+	}
+	if source.Kind != bambuCameraSourceKindHelper {
+		t.Fatalf("source kind = %q, want %q", source.Kind, bambuCameraSourceKindHelper)
+	}
+	if source.URL != "http://127.0.0.1:1984/api/stream.mjpeg?src=01P09C470101190" {
+		t.Fatalf("source url = %q, want helper url", source.URL)
+	}
+}
+
+func TestResolveBambuCameraSourceRequiresHelperWhenFallbackDisabled(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuCameraHelperMJPEGURLTemplate = ""
+	a.cfg.BambuCameraRTSPFallbackEnabled = false
+
+	_, err := a.resolveBambuCameraSource(context.Background(), bambustore.BambuLANCredentials{
+		Host:       "192.168.1.88",
+		Serial:     "01P09C470101190",
+		AccessCode: "abc123",
+	})
+	if err == nil {
+		t.Fatalf("expected helper-required error")
+	}
+	if !strings.Contains(err.Error(), "bambu_camera_helper_required") {
+		t.Fatalf("error = %q, want helper-required reason", err)
+	}
+}
+
+func TestResolveBambuCameraSourceReturnsHelperUnreachableWhenFallbackDisabled(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuCameraHelperMJPEGURLTemplate = "http://127.0.0.1:1984/api/stream.mjpeg?src={serial}"
+	a.cfg.BambuCameraRTSPFallbackEnabled = false
+
+	originalHelperProber := bambuCameraHelperProber
+	t.Cleanup(func() {
+		bambuCameraHelperProber = originalHelperProber
+	})
+	bambuCameraHelperProber = func(context.Context, string) error {
+		return errors.New("dial tcp 127.0.0.1:1984: connect: connection refused")
+	}
+
+	_, err := a.resolveBambuCameraSource(context.Background(), bambustore.BambuLANCredentials{
+		Host:       "192.168.1.88",
+		Serial:     "01P09C470101190",
+		AccessCode: "abc123",
+	})
+	if err == nil {
+		t.Fatalf("expected helper-unreachable error")
+	}
+	if !strings.Contains(err.Error(), "bambu_camera_helper_unreachable") {
+		t.Fatalf("error = %q, want helper-unreachable reason", err)
+	}
+}
+
+func TestResolveBambuCameraSourceRTSPFallbackRedactsCandidateErrors(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuCameraHelperMJPEGURLTemplate = ""
+	a.cfg.BambuCameraRTSPFallbackEnabled = true
+
+	originalCandidateProber := bambuCameraCandidateProber
+	t.Cleanup(func() {
+		bambuCameraCandidateProber = originalCandidateProber
+	})
+	bambuCameraCandidateProber = func(_ context.Context, candidate string) error {
+		if strings.Contains(candidate, ":322/") {
+			t.Fatalf("unexpected 322 fallback candidate: %q", candidate)
+		}
+		return errors.New("connection refused")
+	}
+
+	_, err := a.resolveBambuCameraSource(context.Background(), bambustore.BambuLANCredentials{
+		Host:       "192.168.1.88",
+		Serial:     "01P09C470101190",
+		AccessCode: "secret-access-code",
+	})
+	if err == nil {
+		t.Fatalf("expected RTSP fallback probe error")
+	}
+	if !strings.Contains(err.Error(), "bambu_camera_rtsp_probe_failed") {
+		t.Fatalf("error = %q, want rtsp probe failure", err)
+	}
+	if strings.Contains(err.Error(), "secret-access-code") {
+		t.Fatalf("error leaked access code: %q", err)
+	}
+	if strings.Contains(err.Error(), ":322/") {
+		t.Fatalf("error should not mention removed 322 fallback: %q", err)
 	}
 }
 
@@ -654,5 +786,154 @@ func TestBambuCameraHelperMJPEGURLUsesTemplatePlaceholders(t *testing.T) {
 	want := "http://127.0.0.1:1984/api/stream.mjpeg?src=01P09C470101190&host=192.168.1.88"
 	if got != want {
 		t.Fatalf("helper url = %q, want %q", got, want)
+	}
+}
+
+func TestReadNextJPEGFrameSkipsLeadingNoise(t *testing.T) {
+	frame, err := readNextJPEGFrame(bytes.NewReader(append(
+		[]byte("BambuTunnel::GetMsg(1)\n"),
+		[]byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}...,
+	)))
+	if err != nil {
+		t.Fatalf("readNextJPEGFrame failed: %v", err)
+	}
+	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}) {
+		t.Fatalf("frame = %v, want JPEG payload", frame)
+	}
+}
+
+func TestReadNextJPEGFrameStopsAtFirstFrame(t *testing.T) {
+	payload := append(
+		[]byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9},
+		[]byte{0xFF, 0xD8, 0xBB, 0xFF, 0xD9}...,
+	)
+	frame, err := readNextJPEGFrame(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("readNextJPEGFrame failed: %v", err)
+	}
+	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9}) {
+		t.Fatalf("frame = %v, want first JPEG frame", frame)
+	}
+}
+
+func TestParseInternalBambuCameraPath(t *testing.T) {
+	serial, resource, ok := parseInternalBambuCameraPath("/internal/camera/v1/bambu/01P00C511601082/stream.mjpeg")
+	if !ok {
+		t.Fatalf("expected path to parse")
+	}
+	if serial != "01P00C511601082" || resource != "stream.mjpeg" {
+		t.Fatalf("got serial=%q resource=%q", serial, resource)
+	}
+}
+
+func TestInternalBambuCameraRouteProxiesRuntimeStream(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.SetupBindAddr = "127.0.0.1:18090"
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "01P00C511601082",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+		Model:      "C12",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "multipart/x-mixed-replace;boundary=frame")
+		_, _ = w.Write([]byte("--frame\r\nContent-Type: image/jpeg\r\n\r\nframe-body\r\n"))
+	}))
+	defer upstream.Close()
+
+	originalOpenManagedReader := openManagedBambuMJPEGReader
+	t.Cleanup(func() {
+		openManagedBambuMJPEGReader = originalOpenManagedReader
+	})
+	openManagedBambuMJPEGReader = func(context.Context, bambucamera.Handle) (io.ReadCloser, error) {
+		resp, err := http.Get(upstream.URL)
+		if err != nil {
+			t.Fatalf("http.Get upstream failed: %v", err)
+		}
+		return resp.Body, nil
+	}
+
+	a.bambuCameraRuntime = fakeBambuCameraRuntime{
+		ensureFn: func(_ context.Context, req bambucamera.EnsureRequest) (bambucamera.Handle, error) {
+			if req.Serial != "01P00C511601082" {
+				t.Fatalf("serial = %q, want printer serial", req.Serial)
+			}
+			return bambucamera.Handle{
+				Serial:            req.Serial,
+				Host:              req.Host,
+				AccessCode:        req.AccessCode,
+				Support:           bambucamera.SupportInfo{Status: bambucamera.SupportStatusTestedSupported, DirectlyTested: true},
+				PluginLibraryPath: "/tmp/libBambuSource.dylib",
+				HelperBinaryPath:  "/tmp/BambuP1Streamer",
+			}, nil
+		},
+	}
+
+	mux := http.NewServeMux()
+	a.registerRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/camera/v1/bambu/01P00C511601082/stream.mjpeg", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "frame-body") {
+		t.Fatalf("expected proxied stream body")
+	}
+}
+
+func TestInternalBambuCameraHealthReturnsUnavailableReason(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.SetupBindAddr = "127.0.0.1:18090"
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "serial-1",
+		Host:       "192.168.100.200",
+		AccessCode: "87654321",
+		Model:      "X1C",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	a.bambuCameraRuntime = fakeBambuCameraRuntime{
+		ensureFn: func(context.Context, bambucamera.EnsureRequest) (bambucamera.Handle, error) {
+			return bambucamera.Handle{}, errors.New("bambu_camera_family_unverified: directly tested Bambu camera support currently exists only for P1S (model=X1C)")
+		},
+	}
+
+	mux := http.NewServeMux()
+	a.registerRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/camera/v1/bambu/serial-1/health", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode health payload failed: %v", err)
+	}
+	if payload["available"] != false {
+		t.Fatalf("available = %v, want false", payload["available"])
+	}
+	if !strings.Contains(payload["reason_unavailable"].(string), "bambu_camera_family_unverified") {
+		t.Fatalf("reason_unavailable = %v, want family-unverified", payload["reason_unavailable"])
 	}
 }

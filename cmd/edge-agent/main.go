@@ -35,6 +35,7 @@ import (
 	"time"
 
 	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
+	bambucamera "printfarmhq/edge-agent/internal/bambu/cameraruntime"
 	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
@@ -516,49 +517,51 @@ type bambuAuthState struct {
 }
 
 type appConfig struct {
-	SetupBindAddr               string
-	BootstrapConfigPath         string
-	AuditLogPath                string
-	ArtifactStageDir            string
-	StartupControlPlaneURL      string
-	StartupSaaSAPIKey           string
-	EnableKlipper               bool
-	EnableBambu                 bool
-	BambuCloudAuthBaseURL       string
-	BambuCloudUploadPath        string
-	BambuCloudPrintPath         string
-	BambuCloudMQTTBroker        string
-	BambuCloudMQTTTopicTemplate string
-	BambuConnectURI             string
+	SetupBindAddr                     string
+	BootstrapConfigPath               string
+	AuditLogPath                      string
+	ArtifactStageDir                  string
+	StartupControlPlaneURL            string
+	StartupSaaSAPIKey                 string
+	EnableKlipper                     bool
+	EnableBambu                       bool
+	BambuCloudAuthBaseURL             string
+	BambuCloudUploadPath              string
+	BambuCloudPrintPath               string
+	BambuCloudMQTTBroker              string
+	BambuCloudMQTTTopicTemplate       string
+	BambuConnectURI                   string
+	BambuCameraRuntimeDir             string
 	BambuCameraHelperMJPEGURLTemplate string
-	BindingsPollInterval        time.Duration
-	ConfigCommandsPollInterval  time.Duration
-	DesiredStatePollInterval    time.Duration
-	StatePushInterval           time.Duration
-	ConvergenceTickInterval     time.Duration
-	ActionExecInterval          time.Duration
-	ActionRetryBaseInterval     time.Duration
-	ActionMaxAttempts           int
-	ActionNonRetryableCooldown  time.Duration
-	MoonrakerRequestTimeout     time.Duration
-	BambuLANRuntimeTimeout      time.Duration
-	ArtifactUploadTimeout       time.Duration
-	ArtifactDownloadTimeout     time.Duration
-	CircuitBreakerCooldown      time.Duration
-	ProbePollInterval           time.Duration
-	DiscoveryPollInterval       time.Duration
-	DiscoveryInventoryInterval  time.Duration
-	DiscoveryManualPollInterval time.Duration
-	LocalUIScanInterval         time.Duration
-	LocalUIBindAddr             string
-	DiscoveryProfileMax         string
-	DiscoveryNetworkMode        string
-	DiscoveryAllowedAdapters    []string
-	DiscoveryEndpointHints      []string
-	DiscoveryCIDRAllowlist      []string
-	DiscoveryMaxTargets         int
-	DiscoveryWorkerCount        int
-	DiscoveryProbeTimeout       time.Duration
+	BambuCameraRTSPFallbackEnabled    bool
+	BindingsPollInterval              time.Duration
+	ConfigCommandsPollInterval        time.Duration
+	DesiredStatePollInterval          time.Duration
+	StatePushInterval                 time.Duration
+	ConvergenceTickInterval           time.Duration
+	ActionExecInterval                time.Duration
+	ActionRetryBaseInterval           time.Duration
+	ActionMaxAttempts                 int
+	ActionNonRetryableCooldown        time.Duration
+	MoonrakerRequestTimeout           time.Duration
+	BambuLANRuntimeTimeout            time.Duration
+	ArtifactUploadTimeout             time.Duration
+	ArtifactDownloadTimeout           time.Duration
+	CircuitBreakerCooldown            time.Duration
+	ProbePollInterval                 time.Duration
+	DiscoveryPollInterval             time.Duration
+	DiscoveryInventoryInterval        time.Duration
+	DiscoveryManualPollInterval       time.Duration
+	LocalUIScanInterval               time.Duration
+	LocalUIBindAddr                   string
+	DiscoveryProfileMax               string
+	DiscoveryNetworkMode              string
+	DiscoveryAllowedAdapters          []string
+	DiscoveryEndpointHints            []string
+	DiscoveryCIDRAllowlist            []string
+	DiscoveryMaxTargets               int
+	DiscoveryWorkerCount              int
+	DiscoveryProbeTimeout             time.Duration
 }
 
 type runtimeFlags struct {
@@ -572,16 +575,17 @@ type agent struct {
 	cfg    appConfig
 	client *http.Client
 
-	bambuAuthProvider bambuauth.Provider
-	bambuAuthStore    bambustore.BambuCredentialsStore
-	bambuLANStore     bambustore.BambuLANCredentialsStore
-	bambuMQTTPublish  bambuPrintCommandPublisher
-	bambuAuthMu       sync.RWMutex
-	bambuAuth         bambuAuthState
-	controlPlaneMu    sync.RWMutex
-	controlPlane      localControlPlaneState
-	localWebUIMu      sync.RWMutex
-	localWebUIURL     string
+	bambuAuthProvider  bambuauth.Provider
+	bambuAuthStore     bambustore.BambuCredentialsStore
+	bambuLANStore      bambustore.BambuLANCredentialsStore
+	bambuCameraRuntime bambucamera.Runtime
+	bambuMQTTPublish   bambuPrintCommandPublisher
+	bambuAuthMu        sync.RWMutex
+	bambuAuth          bambuAuthState
+	controlPlaneMu     sync.RWMutex
+	controlPlane       localControlPlaneState
+	localWebUIMu       sync.RWMutex
+	localWebUIURL      string
 
 	mu              sync.RWMutex
 	bootstrap       bootstrapConfig
@@ -642,6 +646,9 @@ func main() {
 		bambuLANProbeHosts:    make(map[string]time.Time),
 		localObservations:     newLocalObservationStore(),
 		activeCameraSessions:  make(map[string]context.CancelFunc),
+	}
+	if cfg.EnableBambu {
+		app.bambuCameraRuntime = bambucamera.NewManager(cfg.BambuCameraRuntimeDir, runExternalCommand)
 	}
 	bambuLANStoreWarning := ""
 	if cfg.EnableBambu {
@@ -1283,42 +1290,44 @@ func loadConfig() appConfig {
 	defaultStateDir := defaultEdgeStateDir()
 	bambuCloudAuthBaseURL := getEnvOrDefault("BAMBU_CLOUD_AUTH_BASE_URL", "https://api.bambulab.com")
 	return appConfig{
-		SetupBindAddr:               getEnvOrDefault("SETUP_BIND_ADDR", "127.0.0.1:18090"),
-		BootstrapConfigPath:         getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", filepath.Join(defaultStateDir, "bootstrap", "config.json")),
-		AuditLogPath:                getEnvOrDefault("AUDIT_LOG_PATH", filepath.Join(defaultStateDir, "logs", "audit.log")),
-		ArtifactStageDir:            getEnvOrDefault("ARTIFACT_STAGE_DIR", filepath.Join(defaultStateDir, "artifacts")),
-		StartupControlPlaneURL:      getEnvOrDefault("CONTROL_PLANE_URL", ""),
-		StartupSaaSAPIKey:           getEnvOrDefault("SAAS_API_KEY", getEnvOrDefault("EDGE_API_KEY", "")),
-		EnableKlipper:               parseBoolEnv("ENABLE_KLIPPER", false),
-		EnableBambu:                 parseBoolEnv("ENABLE_BAMBU", false),
-		BambuCloudAuthBaseURL:       bambuCloudAuthBaseURL,
-		BambuCloudUploadPath:        getEnvOrDefault("BAMBU_CLOUD_UPLOAD_PATH", "/v1/iot-service/api/user/upload"),
-		BambuCloudPrintPath:         getEnvOrDefault("BAMBU_CLOUD_PRINT_PATH", "/v1/iot-service/api/user/print"),
-		BambuCloudMQTTBroker:        getEnvOrDefault("BAMBU_CLOUD_MQTT_BROKER", defaultBambuCloudMQTTBroker(bambuCloudAuthBaseURL)),
-		BambuCloudMQTTTopicTemplate: getEnvOrDefault("BAMBU_CLOUD_MQTT_TOPIC_TEMPLATE", defaultBambuMQTTTopic),
-		BambuConnectURI:             getEnvOrDefault("BAMBU_CONNECT_URI", ""),
+		SetupBindAddr:                     getEnvOrDefault("SETUP_BIND_ADDR", "127.0.0.1:18090"),
+		BootstrapConfigPath:               getEnvOrDefault("BOOTSTRAP_CONFIG_PATH", filepath.Join(defaultStateDir, "bootstrap", "config.json")),
+		AuditLogPath:                      getEnvOrDefault("AUDIT_LOG_PATH", filepath.Join(defaultStateDir, "logs", "audit.log")),
+		ArtifactStageDir:                  getEnvOrDefault("ARTIFACT_STAGE_DIR", filepath.Join(defaultStateDir, "artifacts")),
+		StartupControlPlaneURL:            getEnvOrDefault("CONTROL_PLANE_URL", ""),
+		StartupSaaSAPIKey:                 getEnvOrDefault("SAAS_API_KEY", getEnvOrDefault("EDGE_API_KEY", "")),
+		EnableKlipper:                     parseBoolEnv("ENABLE_KLIPPER", false),
+		EnableBambu:                       parseBoolEnv("ENABLE_BAMBU", false),
+		BambuCloudAuthBaseURL:             bambuCloudAuthBaseURL,
+		BambuCloudUploadPath:              getEnvOrDefault("BAMBU_CLOUD_UPLOAD_PATH", "/v1/iot-service/api/user/upload"),
+		BambuCloudPrintPath:               getEnvOrDefault("BAMBU_CLOUD_PRINT_PATH", "/v1/iot-service/api/user/print"),
+		BambuCloudMQTTBroker:              getEnvOrDefault("BAMBU_CLOUD_MQTT_BROKER", defaultBambuCloudMQTTBroker(bambuCloudAuthBaseURL)),
+		BambuCloudMQTTTopicTemplate:       getEnvOrDefault("BAMBU_CLOUD_MQTT_TOPIC_TEMPLATE", defaultBambuMQTTTopic),
+		BambuConnectURI:                   getEnvOrDefault("BAMBU_CONNECT_URI", ""),
+		BambuCameraRuntimeDir:             getEnvOrDefault("BAMBU_CAMERA_RUNTIME_DIR", filepath.Join(defaultStateDir, "bambu", "camera_runtime")),
 		BambuCameraHelperMJPEGURLTemplate: getEnvOrDefault("BAMBU_CAMERA_HELPER_MJPEG_URL_TEMPLATE", "http://127.0.0.1:1984/api/stream.mjpeg?src=p1s"),
-		BindingsPollInterval:        parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
-		ConfigCommandsPollInterval:  parseDurationMS("CONFIG_COMMANDS_POLL_INTERVAL_MS", 5000),
-		DesiredStatePollInterval:    parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
-		StatePushInterval:           parseDurationMS("STATE_PUSH_INTERVAL_MS", 3000),
-		ConvergenceTickInterval:     parseDurationMS("CONVERGENCE_TICK_INTERVAL_MS", 500),
-		ActionExecInterval:          parseDurationMS("ACTION_EXEC_INTERVAL_MS", 250),
-		ActionRetryBaseInterval:     parseDurationMS("ACTION_RETRY_BASE_INTERVAL_MS", 1000),
-		ActionMaxAttempts:           parsePositiveInt("ACTION_MAX_ATTEMPTS", 3),
-		ActionNonRetryableCooldown:  parseDurationMS("ACTION_NON_RETRYABLE_COOLDOWN_MS", 180000),
-		MoonrakerRequestTimeout:     parseDurationMS("MOONRAKER_REQUEST_TIMEOUT_MS", 8000),
-		BambuLANRuntimeTimeout:      parseDurationMS("BAMBU_LAN_RUNTIME_TIMEOUT_MS", 2000),
-		ArtifactUploadTimeout:       parseDurationMS("ARTIFACT_UPLOAD_TIMEOUT_MS", 90000),
-		ArtifactDownloadTimeout:     parseDurationMS("ARTIFACT_DOWNLOAD_TIMEOUT_MS", 15000),
-		CircuitBreakerCooldown:      parseDurationMS("CIRCUIT_BREAKER_COOLDOWN_MS", 15000),
-		ProbePollInterval:           parseDurationMS("PROBE_POLL_INTERVAL_MS", 2000),
-		DiscoveryPollInterval:       parseDurationMS("DISCOVERY_POLL_INTERVAL_MS", 4000),
-		DiscoveryInventoryInterval:  parseDurationMS("DISCOVERY_INVENTORY_INTERVAL_MS", 30000),
-		DiscoveryManualPollInterval: parseDurationMS("DISCOVERY_MANUAL_POLL_INTERVAL_MS", 5000),
-		LocalUIScanInterval:         parseDurationMS("LOCAL_UI_SCAN_INTERVAL_MS", 15000),
-		LocalUIBindAddr:             getEnvOrDefault("LOCAL_UI_BIND_ADDR", ""),
-		DiscoveryProfileMax:         parseDiscoveryProfile(getEnvOrDefault("DISCOVERY_PROFILE_MAX", "hybrid")),
+		BambuCameraRTSPFallbackEnabled:    parseBoolEnv("BAMBU_CAMERA_RTSP_FALLBACK_ENABLED", false),
+		BindingsPollInterval:              parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
+		ConfigCommandsPollInterval:        parseDurationMS("CONFIG_COMMANDS_POLL_INTERVAL_MS", 5000),
+		DesiredStatePollInterval:          parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
+		StatePushInterval:                 parseDurationMS("STATE_PUSH_INTERVAL_MS", 3000),
+		ConvergenceTickInterval:           parseDurationMS("CONVERGENCE_TICK_INTERVAL_MS", 500),
+		ActionExecInterval:                parseDurationMS("ACTION_EXEC_INTERVAL_MS", 250),
+		ActionRetryBaseInterval:           parseDurationMS("ACTION_RETRY_BASE_INTERVAL_MS", 1000),
+		ActionMaxAttempts:                 parsePositiveInt("ACTION_MAX_ATTEMPTS", 3),
+		ActionNonRetryableCooldown:        parseDurationMS("ACTION_NON_RETRYABLE_COOLDOWN_MS", 180000),
+		MoonrakerRequestTimeout:           parseDurationMS("MOONRAKER_REQUEST_TIMEOUT_MS", 8000),
+		BambuLANRuntimeTimeout:            parseDurationMS("BAMBU_LAN_RUNTIME_TIMEOUT_MS", 2000),
+		ArtifactUploadTimeout:             parseDurationMS("ARTIFACT_UPLOAD_TIMEOUT_MS", 90000),
+		ArtifactDownloadTimeout:           parseDurationMS("ARTIFACT_DOWNLOAD_TIMEOUT_MS", 15000),
+		CircuitBreakerCooldown:            parseDurationMS("CIRCUIT_BREAKER_COOLDOWN_MS", 15000),
+		ProbePollInterval:                 parseDurationMS("PROBE_POLL_INTERVAL_MS", 2000),
+		DiscoveryPollInterval:             parseDurationMS("DISCOVERY_POLL_INTERVAL_MS", 4000),
+		DiscoveryInventoryInterval:        parseDurationMS("DISCOVERY_INVENTORY_INTERVAL_MS", 30000),
+		DiscoveryManualPollInterval:       parseDurationMS("DISCOVERY_MANUAL_POLL_INTERVAL_MS", 5000),
+		LocalUIScanInterval:               parseDurationMS("LOCAL_UI_SCAN_INTERVAL_MS", 15000),
+		LocalUIBindAddr:                   getEnvOrDefault("LOCAL_UI_BIND_ADDR", ""),
+		DiscoveryProfileMax:               parseDiscoveryProfile(getEnvOrDefault("DISCOVERY_PROFILE_MAX", "hybrid")),
 		// Binary runtime should scan host LAN by default. Bridge mode remains opt-in.
 		DiscoveryNetworkMode:     parseDiscoveryNetworkMode(getEnvOrDefault("DISCOVERY_NETWORK_MODE", "host")),
 		DiscoveryAllowedAdapters: parseDiscoveryAdaptersEnv(getEnvOrDefault("DISCOVERY_ALLOWED_ADAPTERS", "moonraker,bambu")),
@@ -2581,60 +2590,96 @@ func (a *agent) fetchCameraSnapshotBytes(ctx context.Context, snapshotURL string
 	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 }
 
+type bambuCameraSource struct {
+	URL  string
+	Kind string
+}
+
+const (
+	bambuCameraSourceKindHelper = "helper_mjpeg"
+	bambuCameraSourceKindRTSP   = "rtsp"
+)
+
+var (
+	bambuCameraHelperProber     = probeBambuCameraHelper
+	bambuCameraCandidateProber  = probeBambuCameraCandidate
+	openManagedBambuMJPEGReader = openManagedBambuMJPEGReaderDefault
+	fetchManagedBambuSnapshot   = fetchManagedBambuSnapshotDefault
+)
+
 func (a *agent) openBambuCameraReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
 	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
 	if err != nil {
 		return nil, "", err
 	}
+	if a.bambuCameraRuntime != nil {
+		internalURL, urlErr := a.internalBambuCameraContractURL(printerID, "stream.mjpeg")
+		if urlErr != nil {
+			return nil, "", urlErr
+		}
+		return a.openCameraHTTPReader(ctx, internalURL, "multipart/x-mixed-replace;boundary=frame")
+	}
 	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
 	if err != nil {
 		return nil, "", err
 	}
+	source, err := a.resolveBambuCameraSource(ctx, credentials)
+	if err != nil {
+		return nil, "", err
+	}
+	if source.Kind == bambuCameraSourceKindHelper {
+		return a.openCameraHTTPReader(ctx, source.URL, "multipart/x-mixed-replace;boundary=frame")
+	}
+
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return nil, "", errors.New("ffmpeg is required on the edge host for bambu camera streaming")
 	}
-	if helperURL := a.bambuCameraHelperMJPEGURL(credentials); helperURL != "" {
-		if err := probeBambuCameraHelper(ctx, helperURL); err == nil {
-			client := a.cameraStreamHTTPClient()
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, helperURL, nil)
-			if reqErr == nil {
-				resp, doErr := client.Do(req)
-				if doErr == nil {
-					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-						contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-						if contentType == "" {
-							contentType = "multipart/x-mixed-replace;boundary=frame"
-						}
-						return resp.Body, contentType, nil
-					}
-					body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-					resp.Body.Close()
-					return nil, "", fmt.Errorf("bambu camera helper returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-				}
-			}
-		}
-	}
-	streamURL, err := resolveBambuCameraStreamURL(ctx, credentials)
+	return openCameraFFmpegReader(ctx, ffmpegPath, source.URL)
+}
+
+func (a *agent) openCameraHTTPReader(ctx context.Context, targetURL string, defaultContentType string) (io.ReadCloser, string, error) {
+	client := a.cameraStreamHTTPClient()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("camera source returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = defaultContentType
+	}
+	return resp.Body, contentType, nil
+}
 
+func openCameraFFmpegReader(ctx context.Context, ffmpegPath string, inputURL string) (io.ReadCloser, string, error) {
 	pipeReader, pipeWriter := io.Pipe()
-	cmd := exec.CommandContext(
-		ctx,
-		ffmpegPath,
+	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-nostdin",
-		"-rtsp_transport", "tcp",
-		"-i", streamURL,
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(inputURL)), "rtsp") {
+		args = append(args, "-rtsp_transport", "tcp")
+	}
+	args = append(args,
+		"-i", inputURL,
 		"-f", "mpjpeg",
 		"-boundary_tag", "frame",
 		"-q:v", "6",
 		"-r", "5",
 		"pipe:1",
 	)
+
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		pipeReader.Close()
@@ -2663,23 +2708,237 @@ func (a *agent) openBambuCameraReader(ctx context.Context, binding edgeBinding) 
 	return pipeReader, "multipart/x-mixed-replace;boundary=frame", nil
 }
 
+func (a *agent) ensureBambuCameraHandle(ctx context.Context, printerID string) (bambucamera.Handle, error) {
+	if a.bambuCameraRuntime == nil {
+		return bambucamera.Handle{}, errors.New("bambu_camera_runtime_unavailable: internal runtime manager is not configured")
+	}
+	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
+	if err != nil {
+		return bambucamera.Handle{}, err
+	}
+	return a.bambuCameraRuntime.Ensure(ctx, bambucamera.EnsureRequest{
+		Serial:     strings.TrimSpace(printerID),
+		Host:       strings.TrimSpace(credentials.Host),
+		AccessCode: strings.TrimSpace(credentials.AccessCode),
+		Model:      strings.TrimSpace(credentials.Model),
+	})
+}
+
+func openManagedBambuMJPEGReaderDefault(ctx context.Context, handle bambucamera.Handle) (io.ReadCloser, error) {
+	sourceCmd := exec.CommandContext(
+		ctx,
+		handle.HelperBinaryPath,
+		handle.PluginLibraryPath,
+		handle.Host,
+		handle.AccessCode,
+	)
+	sourceCmd.Env = append(os.Environ(),
+		"DYLD_LIBRARY_PATH="+handle.PluginDir,
+		"LD_LIBRARY_PATH="+handle.PluginDir,
+	)
+	sourceStdout, err := sourceCmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	sourceStderr, err := sourceCmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := sourceCmd.Start(); err != nil {
+		return nil, err
+	}
+
+	sourceErrCh := readProcessStderr(sourceStderr)
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		defer func() {
+			if sourceCmd.Process != nil {
+				_ = sourceCmd.Process.Kill()
+			}
+		}()
+
+		for {
+			frame, frameErr := readNextJPEGFrame(sourceStdout)
+			if frameErr != nil {
+				sourceWaitErr := sourceCmd.Wait()
+				sourceErr := <-sourceErrCh
+				switch {
+				case errors.Is(frameErr, io.EOF):
+					if sourceWaitErr != nil {
+						_ = pipeWriter.CloseWithError(firstManagedProcessError("bambu native source failed", sourceErr, sourceWaitErr))
+						return
+					}
+					_ = pipeWriter.Close()
+				default:
+					_ = pipeWriter.CloseWithError(frameErr)
+				}
+				return
+			}
+
+			frameHeader := fmt.Sprintf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(frame))
+			if _, err := pipeWriter.Write([]byte(frameHeader)); err != nil {
+				return
+			}
+			if _, err := pipeWriter.Write(frame); err != nil {
+				return
+			}
+			if _, err := pipeWriter.Write([]byte("\r\n")); err != nil {
+				return
+			}
+		}
+	}()
+	return &managedProcessPipeReader{
+		PipeReader: pipeReader,
+		closeFn: func() {
+			if sourceCmd.Process != nil {
+				_ = sourceCmd.Process.Kill()
+			}
+		},
+	}, nil
+}
+
+func fetchManagedBambuSnapshotDefault(ctx context.Context, handle bambucamera.Handle) ([]byte, error) {
+	sourceCmd := exec.CommandContext(
+		ctx,
+		handle.HelperBinaryPath,
+		handle.PluginLibraryPath,
+		handle.Host,
+		handle.AccessCode,
+	)
+	sourceCmd.Env = append(os.Environ(),
+		"DYLD_LIBRARY_PATH="+handle.PluginDir,
+		"LD_LIBRARY_PATH="+handle.PluginDir,
+	)
+	sourceStdout, err := sourceCmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	sourceStderr, err := sourceCmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := sourceCmd.Start(); err != nil {
+		return nil, err
+	}
+
+	imageBytes, readErr := readNextJPEGFrame(sourceStdout)
+	sourceWaitErr := sourceCmd.Wait()
+	sourceErr := <-readProcessStderr(sourceStderr)
+	if sourceWaitErr != nil {
+		return nil, firstManagedProcessError("bambu native source failed", sourceErr, sourceWaitErr)
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if len(imageBytes) == 0 {
+		return nil, errors.New("bambu snapshot failed: empty image output")
+	}
+	return imageBytes, nil
+}
+
+type managedProcessPipeReader struct {
+	*io.PipeReader
+	closeFn func()
+}
+
+func (r *managedProcessPipeReader) Close() error {
+	if r.closeFn != nil {
+		r.closeFn()
+	}
+	return r.PipeReader.Close()
+}
+
+func readNextJPEGFrame(reader io.Reader) ([]byte, error) {
+	buffer := make([]byte, 0, 128*1024)
+	chunk := make([]byte, 4096)
+	prev := byte(0x00)
+	inFrame := false
+
+	for {
+		n, err := reader.Read(chunk)
+		for i := 0; i < n; i++ {
+			current := chunk[i]
+			if !inFrame {
+				if prev == 0xFF && current == 0xD8 {
+					inFrame = true
+					buffer = append(buffer[:0], 0xFF, 0xD8)
+				}
+			} else {
+				buffer = append(buffer, current)
+				if prev == 0xFF && current == 0xD9 {
+					return append([]byte(nil), buffer...), nil
+				}
+			}
+			prev = current
+		}
+		if err != nil {
+			if len(buffer) > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+}
+
+func readProcessStderr(stderr io.Reader) <-chan string {
+	ch := make(chan string, 1)
+	go func() {
+		msg, _ := io.ReadAll(io.LimitReader(stderr, 4096))
+		ch <- strings.TrimSpace(string(msg))
+	}()
+	return ch
+}
+
+func firstManagedProcessError(prefix string, stderr string, fallback error) error {
+	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
+		return fmt.Errorf("%s: %s", prefix, trimmed)
+	}
+	return fmt.Errorf("%s: %w", prefix, fallback)
+}
+
+func (a *agent) resolveBambuCameraSource(ctx context.Context, credentials bambustore.BambuLANCredentials) (bambuCameraSource, error) {
+	helperURL := a.bambuCameraHelperMJPEGURL(credentials)
+	if helperURL == "" {
+		if !a.cfg.BambuCameraRTSPFallbackEnabled {
+			return bambuCameraSource{}, errors.New("bambu_camera_helper_required: configure BAMBU_CAMERA_HELPER_MJPEG_URL_TEMPLATE or enable BAMBU_CAMERA_RTSP_FALLBACK_ENABLED")
+		}
+		streamURL, err := resolveBambuCameraStreamURL(ctx, credentials)
+		if err != nil {
+			return bambuCameraSource{}, err
+		}
+		return bambuCameraSource{URL: streamURL, Kind: bambuCameraSourceKindRTSP}, nil
+	}
+
+	if err := bambuCameraHelperProber(ctx, helperURL); err == nil {
+		return bambuCameraSource{URL: helperURL, Kind: bambuCameraSourceKindHelper}, nil
+	} else if !a.cfg.BambuCameraRTSPFallbackEnabled {
+		return bambuCameraSource{}, fmt.Errorf("bambu_camera_helper_unreachable: helper %s is not reachable: %v", sanitizeCameraURL(helperURL), err)
+	}
+
+	streamURL, err := resolveBambuCameraStreamURL(ctx, credentials)
+	if err != nil {
+		return bambuCameraSource{}, err
+	}
+	return bambuCameraSource{URL: streamURL, Kind: bambuCameraSourceKindRTSP}, nil
+}
+
 func resolveBambuCameraStreamURL(ctx context.Context, credentials bambustore.BambuLANCredentials) (string, error) {
 	candidates, err := bambuCameraRTSPCandidates(credentials)
 	if err != nil {
 		return "", err
 	}
-	var lastErr error
+	failures := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if err := probeBambuCameraCandidate(ctx, candidate); err == nil {
+		probeErr := bambuCameraCandidateProber(ctx, candidate)
+		if probeErr == nil {
 			return candidate, nil
-		} else {
-			lastErr = err
 		}
+		failures = append(failures, fmt.Sprintf("%s => %s", sanitizeCameraURL(candidate), strings.TrimSpace(probeErr.Error())))
 	}
-	if lastErr != nil {
-		return "", fmt.Errorf("bambu camera source probe failed: %w", lastErr)
+	if len(failures) == 0 {
+		return "", errors.New("bambu_camera_rtsp_probe_failed: no RTSP candidates configured")
 	}
-	return "", errors.New("bambu camera source probe failed")
+	return "", fmt.Errorf("bambu_camera_rtsp_probe_failed: %s", strings.Join(failures, "; "))
 }
 
 func (a *agent) bambuCameraHelperMJPEGURL(credentials bambustore.BambuLANCredentials) string {
@@ -2733,8 +2992,6 @@ func bambuCameraRTSPCandidates(credentials bambustore.BambuLANCredentials) ([]st
 		{scheme: "rtsp", port: "6000", path: "/streaming/live/1"},
 		{scheme: "rtsp", port: "6000", path: "/live"},
 		{scheme: "rtsps", port: "6000", path: "/streaming/live/1"},
-		{scheme: "rtsp", port: "322", path: "/streaming/live/1"},
-		{scheme: "rtsps", port: "322", path: "/streaming/live/1"},
 	}
 
 	out := make([]string, 0, len(shapes))
@@ -2758,7 +3015,7 @@ func bambuCameraRTSPCandidates(credentials bambustore.BambuLANCredentials) ([]st
 func probeBambuCameraCandidate(ctx context.Context, candidate string) error {
 	ffprobePath, err := exec.LookPath("ffprobe")
 	if err == nil {
-		requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(
 			requestCtx,
@@ -2795,6 +3052,17 @@ func probeBambuCameraCandidate(ctx context.Context, candidate string) error {
 	}
 	_ = conn.Close()
 	return nil
+}
+
+func sanitizeCameraURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	if parsed.User != nil {
+		parsed.User = url.User(parsed.User.Username())
+	}
+	return parsed.String()
 }
 
 func (a *agent) ingestCameraSession(ctx context.Context, bootstrap bootstrapConfig, session cameraSessionItem, contentType string, body io.ReadCloser) error {

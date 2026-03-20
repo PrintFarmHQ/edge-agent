@@ -76,6 +76,7 @@ func (a *agent) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/setup/status", a.handleSetupStatus)
 	mux.HandleFunc("/setup/claim", a.handleSetupClaim)
+	mux.Handle("/internal/camera/v1/bambu/", a.loopbackOnly(http.HandlerFunc(a.handleInternalBambuCamera)))
 	mux.HandleFunc("/", a.handleLocalWebUIRedirect)
 }
 
@@ -230,6 +231,69 @@ func (a *agent) handleLocalPrinterCamera(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (a *agent) handleInternalBambuCamera(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	printerID, resource, ok := parseInternalBambuCameraPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	handle, err := a.ensureBambuCameraHandle(r.Context(), printerID)
+	if resource == "health" {
+		status := http.StatusOK
+		payload := map[string]any{
+			"printer_id":         printerID,
+			"available":          err == nil,
+			"support_status":     string(handle.Support.Status),
+			"directly_tested":    handle.Support.DirectlyTested,
+			"helper_binary_path": handle.HelperBinaryPath,
+			"plugin_library":     handle.PluginLibraryPath,
+			"reason_unavailable": nil,
+		}
+		if err != nil {
+			payload["available"] = false
+			payload["reason_unavailable"] = err.Error()
+		}
+		writeJSON(w, status, payload)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), localCameraProxyStatusCode(err))
+		return
+	}
+
+	if resource == "snapshot.jpg" {
+		imageBytes, snapshotErr := fetchManagedBambuSnapshot(r.Context(), handle)
+		if snapshotErr != nil {
+			http.Error(w, snapshotErr.Error(), localCameraProxyStatusCode(snapshotErr))
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(imageBytes)
+		return
+	}
+
+	reader, streamErr := openManagedBambuMJPEGReader(r.Context(), handle)
+	if streamErr != nil {
+		http.Error(w, streamErr.Error(), localCameraProxyStatusCode(streamErr))
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace;boundary=frame")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if _, copyErr := io.Copy(w, reader); copyErr != nil && !errors.Is(copyErr, context.Canceled) {
+		http.Error(w, fmt.Sprintf("camera proxy failed: %v", copyErr), localCameraProxyStatusCode(copyErr))
+	}
+}
+
 func localCameraProxyStatusCode(err error) int {
 	if err == nil {
 		return http.StatusOK
@@ -240,6 +304,7 @@ func localCameraProxyStatusCode(err error) int {
 
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	if strings.HasPrefix(message, "validation_error:") ||
+		strings.HasPrefix(message, "bambu_camera_") ||
 		strings.Contains(message, "camera unavailable") ||
 		strings.Contains(message, "camera endpoint unavailable") ||
 		strings.Contains(message, "camera is not supported") ||
@@ -269,6 +334,29 @@ func parseLocalPrinterCameraPath(rawPath string) (int, string, bool) {
 		return 0, "", false
 	}
 	return printerID, parts[2], true
+}
+
+func parseInternalBambuCameraPath(rawPath string) (string, string, bool) {
+	const prefix = "/internal/camera/v1/bambu/"
+	if !strings.HasPrefix(rawPath, prefix) {
+		return "", "", false
+	}
+	trimmed := strings.Trim(strings.TrimPrefix(rawPath, prefix), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	resource := strings.TrimSpace(parts[1])
+	switch resource {
+	case "stream.mjpeg", "snapshot.jpg", "health":
+	default:
+		return "", "", false
+	}
+	serial := strings.TrimSpace(parts[0])
+	if serial == "" {
+		return "", "", false
+	}
+	return serial, resource, true
 }
 
 func (a *agent) snapshotBinding(printerID int) (edgeBinding, bool) {
@@ -487,27 +575,43 @@ func (a *agent) proxyBambuCameraResponse(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return err
 	}
+	if a.bambuCameraRuntime != nil {
+		resource := "stream.mjpeg"
+		if variant == "snapshot" {
+			resource = "snapshot.jpg"
+		}
+		internalURL, urlErr := a.internalBambuCameraContractURL(printerID, resource)
+		if urlErr != nil {
+			return urlErr
+		}
+		return a.proxyLocalCameraResponse(w, r, internalURL, resource == "stream.mjpeg")
+	}
 	credentials, err := a.resolveBambuLANRuntimeCredentials(r.Context(), printerID)
 	if err != nil {
 		return err
 	}
+	source, err := a.resolveBambuCameraSource(r.Context(), credentials)
+	if err != nil {
+		return err
+	}
+	if source.Kind == bambuCameraSourceKindHelper && variant == "stream" {
+		return a.proxyLocalCameraResponse(w, r, source.URL, true)
+	}
+
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return errors.New("ffmpeg is required on the edge host for bambu camera streaming")
-	}
-
-	streamURL, err := bambuCameraRTSPURL(credentials)
-	if err != nil {
-		return err
 	}
 
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-nostdin",
-		"-rtsp_transport", "tcp",
-		"-i", streamURL,
 	}
+	if source.Kind == bambuCameraSourceKindRTSP {
+		args = append(args, "-rtsp_transport", "tcp")
+	}
+	args = append(args, "-i", source.URL)
 	contentType := "multipart/x-mixed-replace;boundary=frame"
 	if variant == "snapshot" {
 		args = append(args,
@@ -560,6 +664,30 @@ func (a *agent) proxyBambuCameraResponse(w http.ResponseWriter, r *http.Request,
 		return waitErr
 	}
 	return nil
+}
+
+func (a *agent) internalBambuCameraContractURL(printerID string, resource string) (string, error) {
+	address := strings.TrimSpace(a.cfg.SetupBindAddr)
+	if address == "" {
+		return "", errors.New("bambu_camera_runtime_unavailable: setup bind address is not configured")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("bambu_camera_runtime_unavailable: invalid setup bind address %q: %w", address, err)
+	}
+	if strings.TrimSpace(port) == "" {
+		return "", errors.New("bambu_camera_runtime_unavailable: setup bind address is missing port")
+	}
+	loopbackHost := "127.0.0.1"
+	trimmedHost := strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(trimmedHost, "localhost") || net.ParseIP(trimmedHost) != nil && net.ParseIP(trimmedHost).IsLoopback() {
+		loopbackHost = trimmedHost
+	}
+	return (&url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(loopbackHost, port),
+		Path:   "/internal/camera/v1/bambu/" + url.PathEscape(strings.TrimSpace(printerID)) + "/" + resource,
+	}).String(), nil
 }
 
 func bambuCameraRTSPURL(credentials bambustore.BambuLANCredentials) (string, error) {
