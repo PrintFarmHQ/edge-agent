@@ -269,6 +269,25 @@ type currentStateItem struct {
 	ReportedAt           time.Time      `json:"reported_at"`
 }
 
+type printerTemperatureStatus struct {
+	Current *float64 `json:"current,omitempty"`
+	Target  *float64 `json:"target,omitempty"`
+}
+
+type printerFanStatus struct {
+	Supported bool   `json:"supported"`
+	State     string `json:"state,omitempty"`
+}
+
+type printerControlStatusSnapshot struct {
+	Nozzle          printerTemperatureStatus    `json:"nozzle"`
+	Bed             printerTemperatureStatus    `json:"bed"`
+	Chamber         printerTemperatureStatus    `json:"chamber"`
+	Fans            map[string]printerFanStatus `json:"fans,omitempty"`
+	MotionSupported bool                        `json:"motion_supported"`
+	HomeSupported   bool                        `json:"home_supported"`
+}
+
 const (
 	filamentActionStateIdle                  = "idle"
 	filamentActionStateLoading               = "loading"
@@ -297,13 +316,25 @@ const (
 )
 
 const (
-	moonrakerFilamentActionTimeout = 20 * time.Second
-	bambuFilamentActionTimeout     = 45 * time.Second
-	bambuFilamentMemoryGrace       = 10 * time.Second
+	moonrakerFilamentActionTimeout    = 20 * time.Second
+	bambuFilamentActionTimeout        = 45 * time.Second
+	bambuFilamentMemoryGrace          = 10 * time.Second
+	bambuRuntimeCommandSuppressWindow = 8 * time.Second
 )
 
 type pushStateRequest struct {
 	States []currentStateItem `json:"states"`
+}
+
+type printerControlStatusItem struct {
+	PrinterID     int                          `json:"printer_id"`
+	AdapterFamily string                       `json:"adapter_family,omitempty"`
+	Status        printerControlStatusSnapshot `json:"status"`
+	ReportedAt    time.Time                    `json:"reported_at"`
+}
+
+type pushPrinterControlStatusRequest struct {
+	Items []printerControlStatusItem `json:"items"`
 }
 
 type printerProbeItem struct {
@@ -486,6 +517,7 @@ type action struct {
 	PrinterID        int              `json:"printer_id"`
 	Kind             string           `json:"kind"`
 	Reason           string           `json:"reason"`
+	Payload          map[string]any   `json:"payload,omitempty"`
 	Target           desiredStateItem `json:"target"`
 	CommandRequestID int              `json:"command_request_id,omitempty"`
 	EnqueuedAt       time.Time        `json:"enqueued_at"`
@@ -503,6 +535,7 @@ type bindingSnapshot struct {
 	RawPrinterStatus    string
 	ManualIntervention  string
 	CommandCapabilities map[string]any
+	ControlStatus       *printerControlStatusSnapshot
 	DetectedName        string
 	DetectedModelHint   string
 }
@@ -538,6 +571,7 @@ type appConfig struct {
 	BambuCameraRuntimeDir             string
 	BambuCameraHelperMJPEGURLTemplate string
 	BambuCameraRTSPFallbackEnabled    bool
+	BambuControlStatusPushInterval    time.Duration
 	BindingsPollInterval              time.Duration
 	ConfigCommandsPollInterval        time.Duration
 	DesiredStatePollInterval          time.Duration
@@ -591,31 +625,34 @@ type agent struct {
 	localWebUIMu       sync.RWMutex
 	localWebUIURL      string
 
-	mu              sync.RWMutex
-	bootstrap       bootstrapConfig
-	claimed         bool
-	lastETag        string
-	desiredState    map[int]desiredStateItem
-	bindings        map[int]edgeBinding
-	currentState    map[int]currentStateItem
-	actionQueue     map[int][]action
-	inflightActions map[int]action
-	deadLetters     map[int][]action
-	queuedSince     map[int]time.Time
-	recentEnqueue   map[string]time.Time
-	suppressedUntil map[string]time.Time
-	resyncRequested bool
-	breakerUntil    map[int]time.Time
+	mu                        sync.RWMutex
+	bootstrap                 bootstrapConfig
+	claimed                   bool
+	lastETag                  string
+	desiredState              map[int]desiredStateItem
+	bindings                  map[int]edgeBinding
+	currentState              map[int]currentStateItem
+	actionQueue               map[int][]action
+	inflightActions           map[int]action
+	deadLetters               map[int][]action
+	queuedSince               map[int]time.Time
+	recentEnqueue             map[string]time.Time
+	suppressedUntil           map[string]time.Time
+	resyncRequested           bool
+	breakerUntil              map[int]time.Time
+	bambuRuntimeSuppressUntil map[int]time.Time
 
-	discoveryStateMu      sync.Mutex
-	discoveryRunning      bool
-	discoverySeedMu       sync.Mutex
-	discoverySeeds        map[string]time.Time
-	bambuLANMu            sync.Mutex
-	bambuLANRecords       map[string]bambuLANDiscoveryRecord
-	bambuLANFailures      map[string]int
-	bambuLANRecoveryUntil map[int]time.Time
-	bambuLANProbeHosts    map[string]time.Time
+	discoveryStateMu       sync.Mutex
+	discoveryRunning       bool
+	discoverySeedMu        sync.Mutex
+	discoverySeeds         map[string]time.Time
+	bambuLANMu             sync.Mutex
+	bambuLANRecords        map[string]bambuLANDiscoveryRecord
+	bambuLANRuntimeRecords map[string]*bambuLANRuntimeRecord
+	bambuLANFallbackUsed   map[string]bool
+	bambuLANFailures       map[string]int
+	bambuLANRecoveryUntil  map[int]time.Time
+	bambuLANProbeHosts     map[string]time.Time
 
 	localObservations    *localObservationStore
 	activeCameraSessions map[string]context.CancelFunc
@@ -631,25 +668,28 @@ func main() {
 	cfg := loadConfig()
 	cfg = applyRuntimeFlags(cfg, flags)
 	app := &agent{
-		cfg:                   cfg,
-		client:                &http.Client{Timeout: 15 * time.Second},
-		desiredState:          make(map[int]desiredStateItem),
-		bindings:              make(map[int]edgeBinding),
-		currentState:          make(map[int]currentStateItem),
-		actionQueue:           make(map[int][]action),
-		inflightActions:       make(map[int]action),
-		deadLetters:           make(map[int][]action),
-		queuedSince:           make(map[int]time.Time),
-		recentEnqueue:         make(map[string]time.Time),
-		suppressedUntil:       make(map[string]time.Time),
-		breakerUntil:          make(map[int]time.Time),
-		discoverySeeds:        make(map[string]time.Time),
-		bambuLANRecords:       make(map[string]bambuLANDiscoveryRecord),
-		bambuLANFailures:      make(map[string]int),
-		bambuLANRecoveryUntil: make(map[int]time.Time),
-		bambuLANProbeHosts:    make(map[string]time.Time),
-		localObservations:     newLocalObservationStore(),
-		activeCameraSessions:  make(map[string]context.CancelFunc),
+		cfg:                       cfg,
+		client:                    &http.Client{Timeout: 15 * time.Second},
+		desiredState:              make(map[int]desiredStateItem),
+		bindings:                  make(map[int]edgeBinding),
+		currentState:              make(map[int]currentStateItem),
+		actionQueue:               make(map[int][]action),
+		inflightActions:           make(map[int]action),
+		deadLetters:               make(map[int][]action),
+		queuedSince:               make(map[int]time.Time),
+		recentEnqueue:             make(map[string]time.Time),
+		suppressedUntil:           make(map[string]time.Time),
+		breakerUntil:              make(map[int]time.Time),
+		bambuRuntimeSuppressUntil: make(map[int]time.Time),
+		discoverySeeds:            make(map[string]time.Time),
+		bambuLANRecords:           make(map[string]bambuLANDiscoveryRecord),
+		bambuLANRuntimeRecords:    make(map[string]*bambuLANRuntimeRecord),
+		bambuLANFallbackUsed:      make(map[string]bool),
+		bambuLANFailures:          make(map[string]int),
+		bambuLANRecoveryUntil:     make(map[int]time.Time),
+		bambuLANProbeHosts:        make(map[string]time.Time),
+		localObservations:         newLocalObservationStore(),
+		activeCameraSessions:      make(map[string]context.CancelFunc),
 	}
 	if cfg.EnableBambu {
 		app.bambuCameraRuntime = bambucamera.NewManager(cfg.BambuCameraRuntimeDir, runExternalCommand)
@@ -694,22 +734,17 @@ func main() {
 
 	var localUIServer *http.Server
 	localUIURL := ""
-	localUIPort := ""
 	localUIStartWarning := ""
-	if startedServer, uiURL, uiPort, err := app.startLocalWebUIServer(); err != nil {
+	if startedServer, uiURL, _, err := app.startLocalWebUIServer(); err != nil {
 		localUIStartWarning = err.Error()
 	} else {
 		localUIServer = startedServer
 		app.setLocalWebUIURL(uiURL)
 		localUIURL = uiURL
-		localUIPort = uiPort
 	}
 
 	printStartupBanner(startupBannerInfo{
 		DashboardURL:    localUIURL,
-		DashboardPort:   localUIPort,
-		SetupURL:        "http://" + setupListener.Addr().String() + "/",
-		ControlPlaneURL: app.currentControlPlaneURL(),
 		EnabledAdapters: enabledDiscoveryAdapters(cfg.EnableKlipper, cfg.EnableBambu),
 		ShowAlertOnly:   !app.isClaimed() && strings.TrimSpace(cfg.StartupSaaSAPIKey) == "",
 		AlertMessage:    "Edge agent is NOT connected to control plane SaaS. Paste a valid API key in the dashboard.",
@@ -739,7 +774,7 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(13)
+	wg.Add(14)
 	go app.bindingsPollLoop(rootCtx, &wg)
 	go app.configCommandsPollLoop(rootCtx, &wg)
 	go app.printerCommandsPollLoop(rootCtx, &wg)
@@ -748,6 +783,7 @@ func main() {
 	go app.convergenceLoop(rootCtx, &wg)
 	go app.actionExecLoop(rootCtx, &wg)
 	go app.statePushLoop(rootCtx, &wg)
+	go app.controlStatusPushLoop(rootCtx, &wg)
 	go app.probePollLoop(rootCtx, &wg)
 	go app.discoveryPollLoop(rootCtx, &wg)
 	go app.discoveryInventoryLoop(rootCtx, &wg)
@@ -795,6 +831,9 @@ func (a *agent) bootstrapSync(ctx context.Context) {
 	a.reconcileOnce()
 	if err := a.pushStateOnce(ctx); err != nil {
 		a.audit("bootstrap_state_push_error", map[string]any{"error": err.Error()})
+	}
+	if err := a.pushPrinterControlStatusOnce(ctx); err != nil {
+		a.audit("bootstrap_control_status_push_error", map[string]any{"error": err.Error()})
 	}
 }
 
@@ -1311,6 +1350,7 @@ func loadConfig() appConfig {
 		BambuCameraRuntimeDir:             getEnvOrDefault("BAMBU_CAMERA_RUNTIME_DIR", filepath.Join(defaultStateDir, "bambu", "camera_runtime")),
 		BambuCameraHelperMJPEGURLTemplate: getEnvOrDefault("BAMBU_CAMERA_HELPER_MJPEG_URL_TEMPLATE", "http://127.0.0.1:1984/api/stream.mjpeg?src=p1s"),
 		BambuCameraRTSPFallbackEnabled:    parseBoolEnv("BAMBU_CAMERA_RTSP_FALLBACK_ENABLED", false),
+		BambuControlStatusPushInterval:    parseDurationMS("BAMBU_CONTROL_STATUS_PUSH_INTERVAL_MS", 1000),
 		BindingsPollInterval:              parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
 		ConfigCommandsPollInterval:        parseDurationMS("CONFIG_COMMANDS_POLL_INTERVAL_MS", 5000),
 		DesiredStatePollInterval:          parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
@@ -2271,9 +2311,15 @@ func (a *agent) enqueuePrinterCommand(command printerCommandItem) error {
 		return errors.New("validation_error: printer command is missing printer_id")
 	}
 	switch commandKey {
-	case "light_on", "light_off", "load_filament", "unload_filament":
+	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
 	default:
 		return fmt.Errorf("validation_error: unsupported printer command key %q", commandKey)
+	}
+	var payload map[string]any
+	if len(command.Payload) > 0 {
+		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+			return fmt.Errorf("validation_error: printer command payload is invalid JSON: %w", err)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -2289,6 +2335,7 @@ func (a *agent) enqueuePrinterCommand(command printerCommandItem) error {
 		PrinterID:        command.PrinterID,
 		Kind:             commandKey,
 		Reason:           fmt.Sprintf("printer command %s", commandKey),
+		Payload:          payload,
 		CommandRequestID: command.CommandID,
 		EnqueuedAt:       now,
 		Attempts:         0,
@@ -3538,7 +3585,7 @@ func mapDesiredToAction(current, desired string) string {
 
 func isPrinterRuntimeCommandKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "light_on", "light_off", "load_filament", "unload_filament":
+	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
 		return true
 	default:
 		return false
@@ -3707,6 +3754,10 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 		a.mu.Unlock()
 	}()
 
+	if normalizeAdapterFamily(binding.AdapterFamily) == "bambu" && isPrinterRuntimeCommandKind(queuedAction.Kind) {
+		a.extendBambuRuntimeConnectivitySuppression(queuedAction.PrinterID, bambuRuntimeCommandSuppressWindow)
+	}
+
 	if strings.TrimSpace(binding.EndpointURL) == "" {
 		a.handleActionFailure(queuedAction, "connectivity_error", "missing endpoint_url in printer binding", true)
 		return nil
@@ -3734,6 +3785,9 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 		return nil
 	}
 	a.markActionSuccess(queuedAction)
+	if normalizeAdapterFamily(binding.AdapterFamily) == "bambu" && isPrinterRuntimeCommandKind(queuedAction.Kind) {
+		a.extendBambuRuntimeConnectivitySuppression(queuedAction.PrinterID, bambuRuntimeCommandSuppressWindow)
+	}
 	if queuedAction.CommandRequestID != 0 {
 		if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "acknowledged", ""); ackErr != nil {
 			return ackErr
@@ -4076,7 +4130,7 @@ func (a *agent) executeBambuAction(ctx context.Context, queuedAction action, bin
 			return err
 		}
 		return a.executeBambuCloudAction(ctx, queuedAction, binding)
-	case "light_on", "light_off", "load_filament", "unload_filament":
+	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
 		return a.executeBambuLANPrinterCommand(ctx, queuedAction, binding)
 	default:
 		return fmt.Errorf("unsupported action kind: %s", queuedAction.Kind)
@@ -5731,9 +5785,9 @@ func unsupportedBambuCommandCapabilities() map[string]any {
 }
 
 func (a *agent) fallbackBambuCommandCapabilities(printerID string) map[string]any {
-	record, ok := a.currentBambuLANDiscoveryRecord(printerID)
+	snapshot, ok := a.lastBambuLANRuntimeSnapshot(printerID)
 	if ok {
-		if capabilities := cloneCommandCapabilities(record.Snapshot.CommandCapabilities); capabilities != nil {
+		if capabilities := cloneCommandCapabilities(snapshot.CommandCapabilities); capabilities != nil {
 			return capabilities
 		}
 	}
@@ -6076,11 +6130,7 @@ func resolveRuntimeFilamentCapability(binding edgeBinding, current *currentState
 				return
 			}
 			if sourceKind == filamentSourceKindNone {
-				if prevState == "unloaded" && (prevSourceKind == filamentSourceKindExternalSpool || prevSourceKind == filamentSourceKindAMS) {
-					setCurrent("unloaded", filamentActionStateIdle, filamentStateSourceBambuCommandMemory, filamentConfidenceHeuristic, prevSourceKind, prevSourceLabel, time.Time{})
-					return
-				}
-				setCurrent("unknown", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, filamentSourceKindNone, "", time.Time{})
+				setCurrent("unloaded", filamentActionStateIdle, filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, filamentSourceKindNone, "", time.Time{})
 				return
 			}
 			if now.Sub(previous.ReportedAt) <= bambuFilamentMemoryGrace &&
@@ -6889,6 +6939,129 @@ func (a *agent) pushStateOnce(ctx context.Context) error {
 		return fmt.Errorf("state push returned %d: %s", resp.StatusCode, string(body))
 	}
 	a.audit("state_pushed", map[string]any{"count": len(states), "status_code": resp.StatusCode})
+	return nil
+}
+
+func (a *agent) controlStatusPushLoop(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	interval := a.cfg.BambuControlStatusPushInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !a.isClaimed() || !a.cfg.EnableBambu {
+				continue
+			}
+			if err := a.pushPrinterControlStatusOnce(ctx); err != nil {
+				a.audit("control_status_push_error", map[string]any{"error": err.Error()})
+			}
+		}
+	}
+}
+
+func (a *agent) pushPrinterControlStatusOnce(ctx context.Context) error {
+	bootstrap := a.snapshotBootstrap()
+	if bootstrap.AgentID == "" {
+		return nil
+	}
+
+	type bindingState struct {
+		printerID int
+		binding   edgeBinding
+	}
+
+	a.mu.RLock()
+	bindings := make([]bindingState, 0, len(a.bindings))
+	for printerID, binding := range a.bindings {
+		if normalizeAdapterFamily(binding.AdapterFamily) != "bambu" {
+			continue
+		}
+		bindings = append(bindings, bindingState{printerID: printerID, binding: binding})
+	}
+	a.mu.RUnlock()
+
+	if len(bindings) == 0 {
+		return nil
+	}
+
+	sort.Slice(bindings, func(i, j int) bool {
+		return bindings[i].printerID < bindings[j].printerID
+	})
+
+	items := make([]printerControlStatusItem, 0, len(bindings))
+	for _, item := range bindings {
+		printerID, err := parseBambuPrinterEndpointID(item.binding.EndpointURL)
+		if err != nil {
+			a.audit("bambu_control_status_printer_id_error", map[string]any{
+				"printer_id":   item.printerID,
+				"endpoint_url": item.binding.EndpointURL,
+				"error":        err.Error(),
+			})
+			continue
+		}
+		snapshot, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
+		if err != nil {
+			a.audit("bambu_control_status_snapshot_error", map[string]any{
+				"printer_id":   item.printerID,
+				"endpoint_url": item.binding.EndpointURL,
+				"error":        err.Error(),
+			})
+			continue
+		}
+		if snapshot.ControlStatus == nil {
+			continue
+		}
+		items = append(items, printerControlStatusItem{
+			PrinterID:     item.printerID,
+			AdapterFamily: "bambu",
+			Status:        *snapshot.ControlStatus,
+			ReportedAt:    time.Now().UTC(),
+		})
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/edge/agents/%s/control-status",
+		strings.TrimSuffix(bootstrap.ControlPlaneURL, "/"),
+		bootstrap.AgentID,
+	)
+
+	reqPayload := pushPrinterControlStatusRequest{Items: items}
+	reqBody, err := json.Marshal(reqPayload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrap.SaaSAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Schema-Version", schemaVersionHeaderValue())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			a.handleControlPlaneAuthFailure("control_status_push", resp.StatusCode, string(body))
+			return fmt.Errorf("%w: control status push returned %d: %s", errEdgeAuthRevoked, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("control status push returned %d: %s", resp.StatusCode, string(body))
+	}
+	a.audit("control_status_pushed", map[string]any{"count": len(items), "status_code": resp.StatusCode})
 	return nil
 }
 
@@ -8953,6 +9126,7 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if err != nil {
 			return bindingSnapshot{}, err
 		}
+		hasSuccessfulRuntimeSnapshot := a.hasBambuLANSuccessfulRuntimeSnapshot(printerID)
 		runtimeSnapshot, runtimeErr := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
 		if runtimeErr == nil {
 			a.clearBambuLANRuntimeFailure(printerID)
@@ -8980,6 +9154,9 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 			} else {
 				runtimeFailureThresholdReached = a.recordBambuLANRuntimeFailure(printerID, runtimeErr)
 			}
+		}
+		if hasSuccessfulRuntimeSnapshot {
+			return bindingSnapshot{}, runtimeErr
 		}
 		lanSnapshot, lanErr := a.fetchBambuLANSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if lanErr == nil && !runtimeFailureThresholdReached {
@@ -9063,11 +9240,42 @@ func (a *agent) shouldSuppressBambuRuntimeConnectivityFailure(printerID int, run
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	if until, ok := a.bambuRuntimeSuppressUntil[printerID]; ok {
+		if time.Now().UTC().Before(until) {
+			return true
+		}
+	}
+	if queue := a.actionQueue[printerID]; len(queue) > 0 {
+		for _, queued := range queue {
+			if isPrinterRuntimeCommandKind(queued.Kind) {
+				return true
+			}
+		}
+	}
 	inflight, ok := a.inflightActions[printerID]
 	if !ok {
 		return false
 	}
-	return inflight.Kind == "print" && inflight.Target.DesiredPrinterState == "printing"
+	if inflight.Kind == "print" && inflight.Target.DesiredPrinterState == "printing" {
+		return true
+	}
+	return isPrinterRuntimeCommandKind(inflight.Kind)
+}
+
+func (a *agent) extendBambuRuntimeConnectivitySuppression(printerID int, duration time.Duration) {
+	if printerID == 0 || duration <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.bambuRuntimeSuppressUntil == nil {
+		a.bambuRuntimeSuppressUntil = make(map[int]time.Time)
+	}
+	until := time.Now().UTC().Add(duration)
+	if existing, ok := a.bambuRuntimeSuppressUntil[printerID]; ok && existing.After(until) {
+		return
+	}
+	a.bambuRuntimeSuppressUntil[printerID] = until
 }
 
 func (a *agent) fetchBambuCloudSnapshotFromEndpoint(ctx context.Context, endpointURL string) (bindingSnapshot, error) {

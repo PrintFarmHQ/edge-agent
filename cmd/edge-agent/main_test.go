@@ -48,23 +48,24 @@ func newTestAgent(t *testing.T) *agent {
 			CircuitBreakerCooldown:     2 * time.Second,
 			LocalUIScanInterval:        15 * time.Second,
 		},
-		client:                &http.Client{Timeout: 2 * time.Second},
-		desiredState:          make(map[int]desiredStateItem),
-		bindings:              make(map[int]edgeBinding),
-		currentState:          make(map[int]currentStateItem),
-		actionQueue:           make(map[int][]action),
-		inflightActions:       make(map[int]action),
-		deadLetters:           make(map[int][]action),
-		queuedSince:           make(map[int]time.Time),
-		recentEnqueue:         make(map[string]time.Time),
-		suppressedUntil:       make(map[string]time.Time),
-		breakerUntil:          make(map[int]time.Time),
-		discoverySeeds:        make(map[string]time.Time),
-		bambuLANRecords:       make(map[string]bambuLANDiscoveryRecord),
-		bambuLANFailures:      make(map[string]int),
-		bambuLANRecoveryUntil: make(map[int]time.Time),
-		bambuLANProbeHosts:    make(map[string]time.Time),
-		localObservations:     newLocalObservationStore(),
+		client:                 &http.Client{Timeout: 2 * time.Second},
+		desiredState:           make(map[int]desiredStateItem),
+		bindings:               make(map[int]edgeBinding),
+		currentState:           make(map[int]currentStateItem),
+		actionQueue:            make(map[int][]action),
+		inflightActions:        make(map[int]action),
+		deadLetters:            make(map[int][]action),
+		queuedSince:            make(map[int]time.Time),
+		recentEnqueue:          make(map[string]time.Time),
+		suppressedUntil:        make(map[string]time.Time),
+		breakerUntil:           make(map[int]time.Time),
+		discoverySeeds:         make(map[string]time.Time),
+		bambuLANRecords:        make(map[string]bambuLANDiscoveryRecord),
+		bambuLANRuntimeRecords: make(map[string]*bambuLANRuntimeRecord),
+		bambuLANFailures:       make(map[string]int),
+		bambuLANRecoveryUntil:  make(map[int]time.Time),
+		bambuLANProbeHosts:     make(map[string]time.Time),
+		localObservations:      newLocalObservationStore(),
 	}
 }
 
@@ -1330,9 +1331,70 @@ func TestRefreshCurrentStateFromBindingsBambuIdleTransitionMarksCompletion(t *te
 	}
 }
 
-func TestRefreshCurrentStateFromBindingsBambuUsesDiscoveryFallbackOnceBeforeConnectivityError(t *testing.T) {
+func TestFetchBambuLANRuntimeSnapshotByPrinterIDCoalescesConcurrentFetches(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
+	a.cfg.BambuControlStatusPushInterval = time.Millisecond
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-lan-runtime",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	var calls int
+	var callsMu sync.Mutex
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		time.Sleep(25 * time.Millisecond)
+		return bindingSnapshot{
+			PrinterState:     "idle",
+			JobState:         "pending",
+			TelemetrySource:  telemetrySourceBambuLANMQTT,
+			RawPrinterStatus: "IDLE",
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			snapshot, fetchErr := a.fetchBambuLANRuntimeSnapshotByPrinterID(context.Background(), "printer-lan-runtime")
+			if fetchErr != nil {
+				t.Errorf("fetchBambuLANRuntimeSnapshotByPrinterID failed: %v", fetchErr)
+				return
+			}
+			if snapshot.PrinterState != "idle" {
+				t.Errorf("snapshot.PrinterState = %q, want idle", snapshot.PrinterState)
+			}
+		}()
+	}
+	wg.Wait()
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("fetchBambuLANMQTTSnapshot calls = %d, want 1", calls)
+	}
+}
+
+func TestRefreshCurrentStateFromBindingsBambuKeepsRecentRuntimeSnapshotReachableWithinGraceWindow(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.cfg.BambuControlStatusPushInterval = time.Millisecond
 
 	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
 	if err != nil {
@@ -1372,24 +1434,74 @@ func TestRefreshCurrentStateFromBindingsBambuUsesDiscoveryFallbackOnceBeforeConn
 		fetchBambuLANMQTTSnapshot = previousFetch
 	})
 
+	time.Sleep(2 * time.Millisecond)
+	a.refreshCurrentStateFromBindings(context.Background())
+	time.Sleep(2 * time.Millisecond)
 	a.refreshCurrentStateFromBindings(context.Background())
 
 	current := a.currentState[1]
 	if current.LastErrorCode != "" {
-		t.Fatalf("first failure last_error_code = %q, want empty", current.LastErrorCode)
+		t.Fatalf("last_error_code = %q, want empty while recent runtime snapshot is still within grace", current.LastErrorCode)
 	}
 	if current.CurrentPrinterState != "idle" {
-		t.Fatalf("first failure current_printer_state = %q, want idle", current.CurrentPrinterState)
+		t.Fatalf("current_printer_state = %q, want idle", current.CurrentPrinterState)
 	}
+}
 
+func TestRefreshCurrentStateFromBindingsBambuReportsConnectivityErrorAfterGraceWindow(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.cfg.BambuControlStatusPushInterval = time.Millisecond
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-lan-runtime",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-lan-runtime",
+	}
+	a.currentState[1] = currentStateItem{
+		PrinterID:           1,
+		CurrentPrinterState: "idle",
+		CurrentJobState:     "pending",
+		ReportedAt:          time.Now().UTC().Add(-1 * time.Minute),
+	}
+	a.recordBambuLANRuntimeSnapshot("printer-lan-runtime", "192.168.100.172", bindingSnapshot{
+		PrinterState:     "idle",
+		JobState:         "pending",
+		TelemetrySource:  telemetrySourceBambuLANMQTT,
+		RawPrinterStatus: "IDLE",
+	})
+	record := a.bambuLANRuntimeRecords["printer-lan-runtime"]
+	record.LastSuccessAt = time.Now().UTC().Add(-1 * (bambuLANOfflineGraceWindow + time.Second))
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		return bindingSnapshot{}, errors.New("bambu lan mqtt connection failed: dial tcp 192.168.100.172:8883: i/o timeout")
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	time.Sleep(2 * time.Millisecond)
 	a.refreshCurrentStateFromBindings(context.Background())
 
-	current = a.currentState[1]
+	current := a.currentState[1]
 	if current.LastErrorCode != "connectivity_error" {
-		t.Fatalf("second failure last_error_code = %q, want connectivity_error", current.LastErrorCode)
+		t.Fatalf("last_error_code = %q, want connectivity_error after grace window expires", current.LastErrorCode)
 	}
 	if !strings.Contains(current.LastErrorMessage, "i/o timeout") {
-		t.Fatalf("second failure last_error_message = %q, want timeout", current.LastErrorMessage)
+		t.Fatalf("last_error_message = %q, want timeout", current.LastErrorMessage)
 	}
 }
 
@@ -1460,6 +1572,26 @@ func TestRefreshCurrentStateFromBindingsBambuInflightPrintSuppressesTransientCon
 	}
 	if got := a.bambuLANFailures["printer-lan-runtime"]; got != 0 {
 		t.Fatalf("failure counter = %d, want 0 while print start is inflight", got)
+	}
+}
+
+func TestShouldSuppressBambuRuntimeConnectivityFailureForRuntimeCommandGraceWindow(t *testing.T) {
+	a := newTestAgent(t)
+	a.extendBambuRuntimeConnectivitySuppression(23, 5*time.Second)
+
+	if !a.shouldSuppressBambuRuntimeConnectivityFailure(23, errors.New("read tcp: i/o timeout")) {
+		t.Fatalf("expected runtime command suppression to be active")
+	}
+}
+
+func TestShouldSuppressBambuRuntimeConnectivityFailureForQueuedRuntimeCommand(t *testing.T) {
+	a := newTestAgent(t)
+	a.actionQueue[23] = []action{
+		{PrinterID: 23, Kind: "light_on"},
+	}
+
+	if !a.shouldSuppressBambuRuntimeConnectivityFailure(23, errors.New("read tcp: i/o timeout")) {
+		t.Fatalf("expected queued runtime command suppression to be active")
 	}
 }
 
@@ -3890,6 +4022,139 @@ func TestParseBambuLANMQTTSnapshotPayloadReportsAMSActiveSource(t *testing.T) {
 	}
 }
 
+func TestParseBambuLANMQTTSnapshotPayloadReportsNoActiveSourceAsUnloaded(t *testing.T) {
+	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
+		"print": {
+			"gcode_state": "IDLE",
+			"print_type": "idle",
+			"ams": {"tray_now":"255"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parseBambuLANMQTTSnapshotPayload failed: %v", err)
+	}
+	filament, ok := snapshot.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["state"] != "unloaded" {
+		t.Fatalf("filament state = %v, want unloaded", filament["state"])
+	}
+	if filament["source_kind"] != filamentSourceKindNone {
+		t.Fatalf("filament source_kind = %v, want none", filament["source_kind"])
+	}
+}
+
+func TestParseBambuLANMQTTSnapshotPayloadIncludesControlTemperaturesAndFans(t *testing.T) {
+	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
+		"print": {
+			"gcode_state": "IDLE",
+			"print_type": "idle",
+			"nozzle_temper": "215.5",
+			"nozzle_target_temper": "220",
+			"bed_temper": "58.2",
+			"bed_target_temper": "60",
+			"chamber_temper": "31",
+			"cooling_fan_speed": "15",
+			"big_fan1_speed": "0",
+			"big_fan2_speed": "1"
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parseBambuLANMQTTSnapshotPayload failed: %v", err)
+	}
+	if snapshot.ControlStatus == nil {
+		t.Fatalf("missing control status")
+	}
+	if snapshot.ControlStatus.Nozzle.Current == nil || *snapshot.ControlStatus.Nozzle.Current != 215.5 {
+		t.Fatalf("nozzle current = %#v, want 215.5", snapshot.ControlStatus.Nozzle.Current)
+	}
+	if snapshot.ControlStatus.Bed.Target == nil || *snapshot.ControlStatus.Bed.Target != 60 {
+		t.Fatalf("bed target = %#v, want 60", snapshot.ControlStatus.Bed.Target)
+	}
+	if snapshot.ControlStatus.Chamber.Current == nil || *snapshot.ControlStatus.Chamber.Current != 31 {
+		t.Fatalf("chamber current = %#v, want 31", snapshot.ControlStatus.Chamber.Current)
+	}
+	if fan := snapshot.ControlStatus.Fans["part_cooling"]; fan.State != "on" {
+		t.Fatalf("part cooling state = %q, want on", fan.State)
+	}
+	if fan := snapshot.ControlStatus.Fans["auxiliary"]; fan.State != "off" {
+		t.Fatalf("auxiliary state = %q, want off", fan.State)
+	}
+	if fan := snapshot.ControlStatus.Fans["chamber"]; fan.State != "on" {
+		t.Fatalf("chamber state = %q, want on", fan.State)
+	}
+}
+
+func TestFetchBambuLANRuntimeSnapshotByPrinterIDPreservesPreviousFanStateWhenTelemetryOmitsFans(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.cfg.BambuControlStatusPushInterval = time.Millisecond
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-fans",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	a.recordBambuLANRuntimeSnapshot("printer-fans", "192.168.100.172", bindingSnapshot{
+		PrinterState:     "idle",
+		JobState:         "pending",
+		TelemetrySource:  telemetrySourceBambuLANMQTT,
+		RawPrinterStatus: "IDLE",
+		ControlStatus: &printerControlStatusSnapshot{
+			Fans: map[string]printerFanStatus{
+				"part_cooling": {Supported: true, State: "on"},
+				"chamber":      {Supported: true, State: "off"},
+			},
+			MotionSupported: true,
+			HomeSupported:   true,
+		},
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		return bindingSnapshot{
+			PrinterState:     "idle",
+			JobState:         "pending",
+			TelemetrySource:  telemetrySourceBambuLANMQTT,
+			RawPrinterStatus: "IDLE",
+			ControlStatus: &printerControlStatusSnapshot{
+				Nozzle:          printerTemperatureStatus{},
+				Bed:             printerTemperatureStatus{},
+				Chamber:         printerTemperatureStatus{},
+				Fans:            nil,
+				MotionSupported: true,
+				HomeSupported:   true,
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	time.Sleep(2 * time.Millisecond)
+	snapshot, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(context.Background(), "printer-fans")
+	if err != nil {
+		t.Fatalf("fetchBambuLANRuntimeSnapshotByPrinterID failed: %v", err)
+	}
+	if snapshot.ControlStatus == nil {
+		t.Fatalf("expected control status")
+	}
+	if fan := snapshot.ControlStatus.Fans["part_cooling"]; fan.State != "on" {
+		t.Fatalf("part cooling state = %q, want preserved on", fan.State)
+	}
+	if fan := snapshot.ControlStatus.Fans["chamber"]; fan.State != "off" {
+		t.Fatalf("chamber state = %q, want preserved off", fan.State)
+	}
+}
+
 func TestMarkActionSuccessForFilamentCommandSetsActionStateNotFinalState(t *testing.T) {
 	a := newTestAgent(t)
 	a.currentState[1] = currentStateItem{
@@ -3952,6 +4217,50 @@ func TestResolveRuntimeFilamentCapabilityMarksBambuUnloadCompleteWhenSourceClear
 	}
 	if filament["source_kind"] != filamentSourceKindExternalSpool {
 		t.Fatalf("filament source_kind = %v, want external_spool", filament["source_kind"])
+	}
+}
+
+func TestResolveRuntimeFilamentCapabilityTreatsIdleBambuNoSourceAsUnloaded(t *testing.T) {
+	now := time.Now().UTC()
+	previous := currentStateItem{
+		PrinterID:  1,
+		ReportedAt: now.Add(-2 * time.Second),
+		CommandCapabilities: map[string]any{
+			"filament": map[string]any{
+				"state":        "loaded",
+				"action_state": filamentActionStateIdle,
+				"state_source": filamentStateSourceBambuActiveSource,
+				"confidence":   filamentConfidenceConfirmed,
+				"source_kind":  filamentSourceKindExternalSpool,
+				"source_label": "External spool",
+			},
+		},
+	}
+	current := previous
+	current.CommandCapabilities = mergeCommandCapabilities(previous.CommandCapabilities, map[string]any{
+		"filament": map[string]any{
+			"state":        "unloaded",
+			"action_state": filamentActionStateIdle,
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+			"source_kind":  filamentSourceKindNone,
+		},
+	})
+
+	resolveRuntimeFilamentCapability(edgeBinding{AdapterFamily: "bambu"}, &current, previous, bindingSnapshot{}, now)
+
+	filament, ok := current.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["state"] != "unloaded" {
+		t.Fatalf("filament state = %v, want unloaded", filament["state"])
+	}
+	if filament["action_state"] != filamentActionStateIdle {
+		t.Fatalf("filament action_state = %v, want idle", filament["action_state"])
+	}
+	if filament["source_kind"] != filamentSourceKindNone {
+		t.Fatalf("filament source_kind = %v, want none", filament["source_kind"])
 	}
 }
 
@@ -4206,6 +4515,275 @@ func TestExecuteBambuLANPrinterCommandLoadFilamentPublishesChangeFilamentPayload
 	}
 	if printPayload["target"] != float64(255) {
 		t.Fatalf("target = %v, want 255", printPayload["target"])
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandHomeAxesPublishesGCodeLinePayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "home_axes", Payload: map[string]any{"axes": []any{"x", "y", "z"}}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(home_axes) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "gcode_line" {
+		t.Fatalf("command = %v, want gcode_line", printPayload["command"])
+	}
+	if param := fmt.Sprint(printPayload["param"]); !strings.Contains(param, "G28") {
+		t.Fatalf("param = %q, want G28", param)
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandSetFanEnabledPublishesGCodeLinePayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "set_fan_enabled", Payload: map[string]any{"fan": "chamber", "enabled": true}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(set_fan_enabled) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "gcode_line" {
+		t.Fatalf("command = %v, want gcode_line", printPayload["command"])
+	}
+	if param := fmt.Sprint(printPayload["param"]); !strings.Contains(param, "M106 P3 S255") {
+		t.Fatalf("param = %q, want chamber fan M106 command", param)
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandJogMotionBatchPublishesOrderedGCodeLinePayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "jog_motion_batch",
+			Payload: map[string]any{
+				"steps": []any{
+					map[string]any{"axis": "x", "distance_mm": 1},
+					map[string]any{"axis": "y", "distance_mm": -1},
+					map[string]any{"axis": "z", "distance_mm": 10},
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(jog_motion_batch) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "gcode_line" {
+		t.Fatalf("command = %v, want gcode_line", printPayload["command"])
+	}
+	param := fmt.Sprint(printPayload["param"])
+	if !strings.Contains(param, "G91") || !strings.Contains(param, "G90") {
+		t.Fatalf("param = %q, want relative/absolute motion wrapper", param)
+	}
+	expectedLines := []string{
+		"G0 X1 F6000",
+		"G0 Y-1 F6000",
+		"G0 Z10 F300",
+	}
+	for _, line := range expectedLines {
+		if !strings.Contains(param, line) {
+			t.Fatalf("param = %q, want %q", param, line)
+		}
+	}
+	if strings.Index(param, expectedLines[0]) > strings.Index(param, expectedLines[1]) || strings.Index(param, expectedLines[1]) > strings.Index(param, expectedLines[2]) {
+		t.Fatalf("param = %q, want ordered jog lines", param)
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandSetNozzleTemperaturePublishesGCodeLinePayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "set_nozzle_temperature", Payload: map[string]any{"target_c": 235}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(set_nozzle_temperature) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "gcode_line" {
+		t.Fatalf("command = %v, want gcode_line", printPayload["command"])
+	}
+	if param := fmt.Sprint(printPayload["param"]); !strings.Contains(param, "M104 S235") {
+		t.Fatalf("param = %q, want nozzle temperature M104 command", param)
+	}
+}
+
+func TestExecuteBambuLANPrinterCommandSetBedTemperaturePublishesGCodeLinePayload(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var capturedPayload map[string]any
+	previousPublish := publishBambuMQTTRawFunc
+	publishBambuMQTTRawFunc = func(_ context.Context, _, _, _, _ string, payload []byte, _ bool) error {
+		if err := json.Unmarshal(payload, &capturedPayload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		publishBambuMQTTRawFunc = previousPublish
+	})
+
+	err = a.executeBambuLANPrinterCommand(
+		context.Background(),
+		action{PrinterID: 1, Kind: "set_bed_temperature", Payload: map[string]any{"target_c": 65}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANPrinterCommand(set_bed_temperature) failed: %v", err)
+	}
+	printPayload, ok := capturedPayload["print"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want print envelope", capturedPayload)
+	}
+	if printPayload["command"] != "gcode_line" {
+		t.Fatalf("command = %v, want gcode_line", printPayload["command"])
+	}
+	if param := fmt.Sprint(printPayload["param"]); !strings.Contains(param, "M140 S65") {
+		t.Fatalf("param = %q, want bed temperature M140 command", param)
 	}
 }
 

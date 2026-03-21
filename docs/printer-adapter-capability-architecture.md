@@ -175,6 +175,12 @@ After camera, move these behind the same adapter model:
 - `resume`
 - `light_on`
 - `light_off`
+- `home_axes`
+- `jog_motion`
+- `jog_motion_batch`
+- `set_fan_enabled`
+- `set_nozzle_temperature`
+- `set_bed_temperature`
 - `load_filament`
 - `unload_filament`
 
@@ -182,6 +188,11 @@ The same principles apply:
 - normalized capability surface
 - adapter-owned execution
 - truthful unavailable reasons
+
+For the current Bambu slice specifically:
+- temperatures and fan read-state come from local MQTT runtime telemetry
+- motion/home and fan writes route through local MQTT `gcode_line`
+- the SaaS-side Print Jobs `Control` panel is Bambu-only until equivalent truthfully normalized contracts exist for other adapters
 
 ## Implementation Expectations
 

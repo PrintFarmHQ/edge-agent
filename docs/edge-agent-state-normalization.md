@@ -26,6 +26,10 @@ printer/job runtime state, but it does tell SaaS which command-center controls a
 currently supported by the selected printer and, when applicable, the last known LED state,
 filament state, and filament action progress.
 
+Bambu now also has a separate high-frequency control-status telemetry path.
+That path is for operator-facing live control data such as temperatures and fan states,
+not for the canonical printer/job runtime state machine.
+
 ## Provider Mapping
 
 ### Moonraker / Klipper
@@ -62,7 +66,9 @@ For runtime snapshots, if a Bambu cloud device is offline, the agent returns con
 - `FINISH` / `FINISHED` -> `idle / completed`
 - `IDLE` -> `idle / pending`, unless the printer has just transitioned from an active PrintFarm-managed print, in which case edge-agent emits a one-shot `completed` job state so SaaS can activate cleanup confirmation.
 - When edge-agent restarts during an active PrintFarm-managed print, it rehydrates the active desired job/plate identity onto the resumed active snapshot so SaaS can keep the correct active plate context, clear false stalled-start warnings, and continue showing live progress after reconnect.
-- For adopted Bambu printers, edge-agent uses a dedicated short live-runtime timeout for local MQTT snapshots. It tolerates one transient live MQTT runtime miss by falling back to the recent LAN discovery cache. After 2 consecutive live runtime connectivity failures, it stops trusting discovery cache and pushes `connectivity_error` so SaaS can mark the printer unreachable in near real time.
+- For adopted Bambu printers, edge-agent now coalesces local MQTT runtime reads behind a shared per-printer snapshot coordinator instead of opening duplicate one-shot MQTT sessions from the state loop, control-status loop, and command verification paths.
+- Recent successful Bambu runtime snapshots are reused for the live control/status cadence, so short MQTT read turbulence does not immediately surface as printer flapping in SaaS.
+- edge-agent only pushes `connectivity_error` for adopted Bambu printers after runtime reads have stayed unhealthy beyond a 15-second grace window; before that, SaaS continues to see the printer as reachable.
 - While a Bambu `print` action is still inflight, transient live-runtime connectivity misses are suppressed instead of downgrading the printer to `unreachable`, because printers can briefly stop answering snapshot reads during upload/start preparation even though the print is starting successfully.
 - After a Bambu printer accepts `project_file`, edge-agent immediately projects `queued / pending` with the target job/plate identity before final verification completes. That allows SaaS to treat calibration/preparation as a legitimate in-progress start instead of a stalled start that never began.
 - command capabilities come from the same local MQTT runtime path:
@@ -73,6 +79,11 @@ For runtime snapshots, if a Bambu cloud device is offline, the agent returns con
   - when runtime telemetry is ambiguous at idle, edge-agent can fall back to short-lived command memory so the single filament button remains truthful after a completed unload
   - read-path AMS source detection is supported, but AMS write actions remain gated until the exact MQTT write contract is verified
   - Bambu filament actions can surface `needs_user_confirmation` when the printer does not converge automatically after a load/unload request
+- control-status telemetry is reported separately from canonical runtime state:
+  - temperatures are parsed from local MQTT fields such as nozzle, bed, and chamber temperature values
+  - per-fan read-state is parsed from the local MQTT report payload
+  - motion/home, fan writes, and heater setpoint writes use local MQTT `print.gcode_line`
+  - edge-agent pushes Bambu control-status telemetry to SaaS every second, and SaaS retains the last 60 seconds for the Print Jobs `Control` panel
 
 ## Discovery vs Runtime
 

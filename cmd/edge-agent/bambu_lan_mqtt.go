@@ -21,10 +21,25 @@ const (
 	bambuLANMQTTUsername          = "bblp"
 	bambuLANFailureThreshold      = 2
 	defaultBambuLANRuntimeTimeout = 2 * time.Second
+	defaultBambuLANSnapshotReuse  = 1 * time.Second
+	bambuLANOfflineGraceWindow    = 15 * time.Second
 	bambuLANFilamentCommandTemp   = 215
+	bambuLANFanOnPWM              = 255
+	bambuLANXYJogFeedRateMMPerMin = 6000
+	bambuLANZJogFeedRateMMPerMin  = 300
 )
 
 var fetchBambuLANMQTTSnapshot = defaultFetchBambuLANMQTTSnapshot
+
+type bambuLANRuntimeRecord struct {
+	Snapshot      bindingSnapshot
+	Host          string
+	LastSuccessAt time.Time
+	LastAttemptAt time.Time
+	LastError     string
+	FetchInFlight bool
+	WaitCh        chan struct{}
+}
 
 func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterID(ctx context.Context, printerID string) (bindingSnapshot, error) {
 	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
@@ -32,22 +47,71 @@ func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterID(ctx context.Context, pri
 		return bindingSnapshot{}, err
 	}
 
-	requestTimeout := a.cfg.BambuLANRuntimeTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = defaultBambuLANRuntimeTimeout
+	serial := strings.TrimSpace(credentials.Serial)
+	if snapshot, ok := a.cachedBambuLANRuntimeSnapshot(serial, a.bambuLANRuntimeSnapshotReuseWindow()); ok {
+		return withBambuLANRuntimeMetadata(snapshot, credentials), nil
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-	defer cancel()
 
-	snapshot, err := fetchBambuLANMQTTSnapshot(
-		requestCtx,
-		strings.TrimSpace(credentials.Host),
-		strings.TrimSpace(credentials.Serial),
-		strings.TrimSpace(credentials.AccessCode),
-	)
-	if err != nil {
+	for {
+		waitCh, shouldFetch, recentErr := a.beginBambuLANRuntimeFetch(serial, strings.TrimSpace(credentials.Host))
+		if !shouldFetch {
+			if waitCh != nil {
+				select {
+				case <-ctx.Done():
+					return bindingSnapshot{}, ctx.Err()
+				case <-waitCh:
+				}
+				if snapshot, ok := a.cachedBambuLANRuntimeSnapshot(serial, a.bambuLANRuntimeSnapshotReuseWindow()); ok {
+					return withBambuLANRuntimeMetadata(snapshot, credentials), nil
+				}
+				if snapshot, ok := a.cachedBambuLANRuntimeSnapshot(serial, bambuLANOfflineGraceWindow); ok {
+					return withBambuLANRuntimeMetadata(snapshot, credentials), nil
+				}
+				if recentErr != nil {
+					return bindingSnapshot{}, recentErr
+				}
+				continue
+			}
+			if snapshot, ok := a.cachedBambuLANRuntimeSnapshot(serial, bambuLANOfflineGraceWindow); ok {
+				return withBambuLANRuntimeMetadata(snapshot, credentials), nil
+			}
+			if recentErr != nil {
+				return bindingSnapshot{}, recentErr
+			}
+		}
+
+		requestTimeout := a.cfg.BambuLANRuntimeTimeout
+		if requestTimeout <= 0 {
+			requestTimeout = defaultBambuLANRuntimeTimeout
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+
+		snapshot, err := fetchBambuLANMQTTSnapshot(
+			requestCtx,
+			strings.TrimSpace(credentials.Host),
+			serial,
+			strings.TrimSpace(credentials.AccessCode),
+		)
+		cancel()
+		if previousSnapshot, ok := a.lastBambuLANRuntimeSnapshot(serial); ok {
+			snapshot = mergeBambuLANRuntimeSnapshot(previousSnapshot, snapshot)
+		}
+		snapshot = withBambuLANRuntimeMetadata(snapshot, credentials)
+		a.completeBambuLANRuntimeFetch(serial, strings.TrimSpace(credentials.Host), snapshot, err)
+		if err == nil {
+			return snapshot, nil
+		}
+		if snapshot, ok := a.cachedBambuLANRuntimeSnapshot(serial, bambuLANOfflineGraceWindow); ok {
+			return withBambuLANRuntimeMetadata(snapshot, credentials), nil
+		}
 		return bindingSnapshot{}, err
 	}
+}
+
+func withBambuLANRuntimeMetadata(
+	snapshot bindingSnapshot,
+	credentials bambustore.BambuLANCredentials,
+) bindingSnapshot {
 	if strings.TrimSpace(snapshot.DetectedName) == "" {
 		snapshot.DetectedName = strings.TrimSpace(credentials.Name)
 	}
@@ -57,8 +121,166 @@ func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterID(ctx context.Context, pri
 	if strings.TrimSpace(snapshot.TelemetrySource) == "" {
 		snapshot.TelemetrySource = telemetrySourceBambuLANMQTT
 	}
-	a.recordBambuLANRuntimeSnapshot(strings.TrimSpace(credentials.Serial), strings.TrimSpace(credentials.Host), snapshot)
-	return snapshot, nil
+	return snapshot
+}
+
+func mergeBambuLANRuntimeSnapshot(previous bindingSnapshot, current bindingSnapshot) bindingSnapshot {
+	if previous.ControlStatus == nil {
+		return current
+	}
+	if current.ControlStatus == nil {
+		cloned := clonePrinterControlStatusSnapshot(previous.ControlStatus)
+		current.ControlStatus = &cloned
+		return current
+	}
+	merged := clonePrinterControlStatusSnapshot(current.ControlStatus)
+	if len(merged.Fans) == 0 && len(previous.ControlStatus.Fans) > 0 {
+		merged.Fans = clonePrinterFanStatuses(previous.ControlStatus.Fans)
+	} else {
+		for key, fan := range previous.ControlStatus.Fans {
+			if merged.Fans == nil {
+				merged.Fans = map[string]printerFanStatus{}
+			}
+			if _, ok := merged.Fans[key]; !ok {
+				merged.Fans[key] = fan
+			}
+		}
+	}
+	current.ControlStatus = &merged
+	return current
+}
+
+func clonePrinterControlStatusSnapshot(in *printerControlStatusSnapshot) printerControlStatusSnapshot {
+	if in == nil {
+		return printerControlStatusSnapshot{}
+	}
+	return printerControlStatusSnapshot{
+		Nozzle:          in.Nozzle,
+		Bed:             in.Bed,
+		Chamber:         in.Chamber,
+		Fans:            clonePrinterFanStatuses(in.Fans),
+		MotionSupported: in.MotionSupported,
+		HomeSupported:   in.HomeSupported,
+	}
+}
+
+func clonePrinterFanStatuses(in map[string]printerFanStatus) map[string]printerFanStatus {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]printerFanStatus, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func (a *agent) bambuLANRuntimeSnapshotReuseWindow() time.Duration {
+	interval := a.cfg.BambuControlStatusPushInterval
+	if interval <= 0 {
+		return defaultBambuLANSnapshotReuse
+	}
+	return interval
+}
+
+func (a *agent) beginBambuLANRuntimeFetch(
+	printerID string,
+	host string,
+) (chan struct{}, bool, error) {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return nil, false, errors.New("validation_error: missing bambu printer identifier")
+	}
+	now := time.Now().UTC()
+	reuseWindow := a.bambuLANRuntimeSnapshotReuseWindow()
+
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	if a.bambuLANRuntimeRecords == nil {
+		a.bambuLANRuntimeRecords = make(map[string]*bambuLANRuntimeRecord)
+	}
+	record, ok := a.bambuLANRuntimeRecords[key]
+	if !ok || record == nil {
+		record = &bambuLANRuntimeRecord{}
+		a.bambuLANRuntimeRecords[key] = record
+	}
+	if strings.TrimSpace(host) != "" {
+		record.Host = strings.TrimSpace(host)
+	}
+	if record.FetchInFlight {
+		return record.WaitCh, false, nil
+	}
+	if reuseWindow > 0 && !record.LastAttemptAt.IsZero() && now.Sub(record.LastAttemptAt) < reuseWindow {
+		if strings.TrimSpace(record.LastError) != "" {
+			return nil, false, errors.New(record.LastError)
+		}
+		return nil, false, nil
+	}
+	record.FetchInFlight = true
+	record.WaitCh = make(chan struct{})
+	record.LastAttemptAt = now
+	return record.WaitCh, true, nil
+}
+
+func (a *agent) completeBambuLANRuntimeFetch(
+	printerID string,
+	host string,
+	snapshot bindingSnapshot,
+	err error,
+) {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return
+	}
+	now := time.Now().UTC()
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	if a.bambuLANRuntimeRecords == nil {
+		a.bambuLANRuntimeRecords = make(map[string]*bambuLANRuntimeRecord)
+	}
+	record, ok := a.bambuLANRuntimeRecords[key]
+	if !ok || record == nil {
+		record = &bambuLANRuntimeRecord{}
+		a.bambuLANRuntimeRecords[key] = record
+	}
+	if strings.TrimSpace(host) != "" {
+		record.Host = strings.TrimSpace(host)
+	}
+	if err == nil {
+		record.Snapshot = snapshot
+		record.LastSuccessAt = now
+		record.LastError = ""
+	} else {
+		record.LastError = err.Error()
+	}
+	waitCh := record.WaitCh
+	record.FetchInFlight = false
+	record.WaitCh = nil
+	if waitCh != nil {
+		close(waitCh)
+	}
+}
+
+func (a *agent) hasBambuLANSuccessfulRuntimeSnapshot(printerID string) bool {
+	_, ok := a.lastBambuLANRuntimeSnapshot(printerID)
+	return ok
+}
+
+func (a *agent) lastBambuLANRuntimeSnapshot(printerID string) (bindingSnapshot, bool) {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return bindingSnapshot{}, false
+	}
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	if a.bambuLANRuntimeRecords == nil {
+		return bindingSnapshot{}, false
+	}
+	record, ok := a.bambuLANRuntimeRecords[key]
+	if !ok || record == nil || record.LastSuccessAt.IsZero() {
+		return bindingSnapshot{}, false
+	}
+	return record.Snapshot, true
 }
 
 func (a *agent) executeBambuLANControlAction(
@@ -174,9 +396,301 @@ func (a *agent) executeBambuLANPrinterCommand(
 			payload,
 			true,
 		)
+	case "home_axes":
+		gcodeLine, err := buildBambuLANHomeAxesGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
+	case "jog_motion":
+		gcodeLine, err := buildBambuLANJogMotionGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
+	case "jog_motion_batch":
+		gcodeLine, err := buildBambuLANJogMotionBatchGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
+	case "set_fan_enabled":
+		gcodeLine, err := buildBambuLANFanControlGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
+	case "set_nozzle_temperature":
+		gcodeLine, err := buildBambuLANNozzleTemperatureGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
+	case "set_bed_temperature":
+		gcodeLine, err := buildBambuLANBedTemperatureGCode(queuedAction.Payload)
+		if err != nil {
+			return err
+		}
+		return publishBambuLANGCodeLine(
+			ctx,
+			credentials,
+			gcodeLine,
+		)
 	default:
 		return fmt.Errorf("validation_error: unsupported bambu lan printer command %s", queuedAction.Kind)
 	}
+}
+
+func publishBambuLANGCodeLine(
+	ctx context.Context,
+	credentials bambustore.BambuLANCredentials,
+	gcodeLine string,
+) error {
+	payload, err := json.Marshal(map[string]any{
+		"print": map[string]any{
+			"command":     "gcode_line",
+			"sequence_id": strconv.FormatInt(time.Now().UnixMilli(), 10),
+			"param":       strings.TrimSpace(gcodeLine) + "\n",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal bambu gcode_line payload: %w", err)
+	}
+	return publishBambuMQTTRawFunc(
+		ctx,
+		net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
+		formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
+		bambuLANMQTTUsername,
+		strings.TrimSpace(credentials.AccessCode),
+		payload,
+		true,
+	)
+}
+
+func buildBambuLANHomeAxesGCode(payload map[string]any) (string, error) {
+	axes, err := parseBambuLANAxesPayload(payload)
+	if err != nil {
+		return "", err
+	}
+	if len(axes) == 0 || len(axes) == 3 {
+		return "G28", nil
+	}
+	return "G28 " + strings.Join(axes, " "), nil
+}
+
+func buildBambuLANJogMotionGCode(payload map[string]any) (string, error) {
+	step, err := parseBambuLANJogMotionStep(payload)
+	if err != nil {
+		return "", err
+	}
+	return buildBambuLANJogMotionProgram([]bambuLANJogMotionStep{step}), nil
+}
+
+type bambuLANJogMotionStep struct {
+	Axis     string
+	Distance float64
+	FeedRate int
+}
+
+func buildBambuLANJogMotionBatchGCode(payload map[string]any) (string, error) {
+	if len(payload) == 0 {
+		return "", errors.New("validation_error: jog_motion_batch requires payload")
+	}
+	rawSteps, ok := payload["steps"].([]any)
+	if !ok || len(rawSteps) == 0 {
+		return "", errors.New("validation_error: jog_motion_batch requires a non-empty steps array")
+	}
+	steps := make([]bambuLANJogMotionStep, 0, len(rawSteps))
+	for _, rawStep := range rawSteps {
+		stepPayload, ok := rawStep.(map[string]any)
+		if !ok {
+			return "", errors.New("validation_error: jog_motion_batch steps must be objects")
+		}
+		step, err := parseBambuLANJogMotionStep(stepPayload)
+		if err != nil {
+			return "", err
+		}
+		steps = append(steps, step)
+	}
+	return buildBambuLANJogMotionProgram(steps), nil
+}
+
+func parseBambuLANJogMotionStep(payload map[string]any) (bambuLANJogMotionStep, error) {
+	if len(payload) == 0 {
+		return bambuLANJogMotionStep{}, errors.New("validation_error: jog_motion requires payload")
+	}
+	axis := strings.ToUpper(strings.TrimSpace(bambuLANValueAsString(payload["axis"])))
+	switch axis {
+	case "X", "Y", "Z":
+	default:
+		return bambuLANJogMotionStep{}, fmt.Errorf("validation_error: unsupported jog axis %q", axis)
+	}
+
+	distance, ok := bambuLANValueAsFloat(payload["distance_mm"])
+	if !ok {
+		return bambuLANJogMotionStep{}, errors.New("validation_error: jog_motion requires numeric distance_mm")
+	}
+	switch distance {
+	case -10, -1, 1, 10:
+	default:
+		return bambuLANJogMotionStep{}, fmt.Errorf("validation_error: unsupported jog distance %.3f", distance)
+	}
+
+	feedRate := bambuLANXYJogFeedRateMMPerMin
+	if axis == "Z" {
+		feedRate = bambuLANZJogFeedRateMMPerMin
+	}
+	return bambuLANJogMotionStep{
+		Axis:     axis,
+		Distance: distance,
+		FeedRate: feedRate,
+	}, nil
+}
+
+func buildBambuLANJogMotionProgram(steps []bambuLANJogMotionStep) string {
+	lines := make([]string, 0, len(steps)+2)
+	lines = append(lines, "G91")
+	for _, step := range steps {
+		lines = append(lines, fmt.Sprintf("G0 %s%g F%d", step.Axis, step.Distance, step.FeedRate))
+	}
+	lines = append(lines, "G90")
+	return strings.Join(lines, "\n")
+}
+
+func buildBambuLANFanControlGCode(payload map[string]any) (string, error) {
+	if len(payload) == 0 {
+		return "", errors.New("validation_error: set_fan_enabled requires payload")
+	}
+	fanPort, err := parseBambuLANFanPort(payload)
+	if err != nil {
+		return "", err
+	}
+	enabled, err := parseBambuLANBoolPayload(payload, "enabled")
+	if err != nil {
+		return "", err
+	}
+	pwm := 0
+	if enabled {
+		pwm = bambuLANFanOnPWM
+	}
+	return fmt.Sprintf("M106 P%d S%d", fanPort, pwm), nil
+}
+
+func buildBambuLANNozzleTemperatureGCode(payload map[string]any) (string, error) {
+	target, err := parseBambuLANTargetTemperaturePayload(payload, "set_nozzle_temperature")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("M104 S%d", target), nil
+}
+
+func buildBambuLANBedTemperatureGCode(payload map[string]any) (string, error) {
+	target, err := parseBambuLANTargetTemperaturePayload(payload, "set_bed_temperature")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("M140 S%d", target), nil
+}
+
+func parseBambuLANTargetTemperaturePayload(payload map[string]any, fieldName string) (int, error) {
+	if len(payload) == 0 {
+		return 0, fmt.Errorf("validation_error: %s requires payload", fieldName)
+	}
+	rawTarget, exists := payload["target_c"]
+	if !exists {
+		return 0, fmt.Errorf("validation_error: %s requires target_c", fieldName)
+	}
+	target, ok := bambuLANValueAsInt(rawTarget)
+	if !ok {
+		return 0, fmt.Errorf("validation_error: %s requires numeric target_c", fieldName)
+	}
+	if target < 0 {
+		return 0, fmt.Errorf("validation_error: %s target_c must be non-negative", fieldName)
+	}
+	return target, nil
+}
+
+func parseBambuLANAxesPayload(payload map[string]any) ([]string, error) {
+	if len(payload) == 0 {
+		return []string{"X", "Y", "Z"}, nil
+	}
+	rawAxes, exists := payload["axes"]
+	if !exists || rawAxes == nil {
+		return []string{"X", "Y", "Z"}, nil
+	}
+	items, ok := rawAxes.([]any)
+	if !ok {
+		return nil, errors.New("validation_error: home_axes payload axes must be an array")
+	}
+	seen := map[string]bool{}
+	axes := make([]string, 0, len(items))
+	for _, item := range items {
+		axis := strings.ToUpper(strings.TrimSpace(bambuLANValueAsString(item)))
+		switch axis {
+		case "X", "Y", "Z":
+		default:
+			return nil, fmt.Errorf("validation_error: unsupported home axis %q", axis)
+		}
+		if seen[axis] {
+			continue
+		}
+		seen[axis] = true
+		axes = append(axes, axis)
+	}
+	return axes, nil
+}
+
+func parseBambuLANFanPort(payload map[string]any) (int, error) {
+	fanKey := strings.ToLower(strings.TrimSpace(bambuLANValueAsString(payload["fan"])))
+	switch fanKey {
+	case "part_cooling":
+		return 1, nil
+	case "auxiliary":
+		return 2, nil
+	case "chamber":
+		return 3, nil
+	default:
+		return 0, fmt.Errorf("validation_error: unsupported fan %q", fanKey)
+	}
+}
+
+func parseBambuLANBoolPayload(payload map[string]any, key string) (bool, error) {
+	raw, exists := payload[key]
+	if !exists {
+		return false, fmt.Errorf("validation_error: missing %s", key)
+	}
+	switch typed := raw.(type) {
+	case bool:
+		return typed, nil
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1", "on":
+			return true, nil
+		case "false", "0", "off":
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("validation_error: invalid boolean %s", key)
 }
 
 func (a *agent) resolveBambuLANRuntimeCredentials(ctx context.Context, printerID string) (bambustore.BambuLANCredentials, error) {
@@ -250,6 +764,30 @@ func (a *agent) currentBambuLANDiscoveryRecord(printerID string) (bambuLANDiscov
 	return record, ok
 }
 
+func (a *agent) cachedBambuLANRuntimeSnapshot(printerID string, maxAge time.Duration) (bindingSnapshot, bool) {
+	if maxAge <= 0 {
+		return bindingSnapshot{}, false
+	}
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return bindingSnapshot{}, false
+	}
+	now := time.Now().UTC()
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	if a.bambuLANRuntimeRecords == nil {
+		a.bambuLANRuntimeRecords = make(map[string]*bambuLANRuntimeRecord)
+	}
+	record, ok := a.bambuLANRuntimeRecords[key]
+	if !ok || record == nil || record.LastSuccessAt.IsZero() {
+		return bindingSnapshot{}, false
+	}
+	if now.Sub(record.LastSuccessAt) > maxAge {
+		return bindingSnapshot{}, false
+	}
+	return record.Snapshot, true
+}
+
 func (a *agent) recordBambuLANRuntimeSnapshot(printerID string, host string, snapshot bindingSnapshot) {
 	key := strings.ToLower(strings.TrimSpace(printerID))
 	if key == "" {
@@ -258,15 +796,19 @@ func (a *agent) recordBambuLANRuntimeSnapshot(printerID string, host string, sna
 	now := time.Now().UTC()
 	a.bambuLANMu.Lock()
 	defer a.bambuLANMu.Unlock()
-	if a.bambuLANRecords == nil {
-		a.bambuLANRecords = make(map[string]bambuLANDiscoveryRecord)
+	if a.bambuLANRuntimeRecords == nil {
+		a.bambuLANRuntimeRecords = make(map[string]*bambuLANRuntimeRecord)
 	}
-	a.pruneBambuLANRecordsLocked(now)
-	a.bambuLANRecords[key] = bambuLANDiscoveryRecord{
-		Snapshot: snapshot,
-		Host:     strings.TrimSpace(host),
-		LastSeen: now,
+	record, ok := a.bambuLANRuntimeRecords[key]
+	if !ok || record == nil {
+		record = &bambuLANRuntimeRecord{}
+		a.bambuLANRuntimeRecords[key] = record
 	}
+	record.Snapshot = snapshot
+	record.Host = strings.TrimSpace(host)
+	record.LastSuccessAt = now
+	record.LastAttemptAt = now
+	record.LastError = ""
 }
 
 func (a *agent) recordBambuLANRuntimeFailure(printerID string, err error) bool {
@@ -287,8 +829,45 @@ func (a *agent) recordBambuLANRuntimeFailure(printerID string, err error) bool {
 		return false
 	}
 
+	if a.bambuLANFallbackUsed[key] && a.bambuLANFailures[key] == 0 {
+		a.bambuLANFailures[key] = 1
+		delete(a.bambuLANFallbackUsed, key)
+	}
 	a.bambuLANFailures[key] = a.bambuLANFailures[key] + 1
 	return a.bambuLANFailures[key] >= bambuLANFailureThreshold
+}
+
+func (a *agent) hasBambuLANRuntimeFailure(printerID string) bool {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return false
+	}
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	return a.bambuLANFailures[key] > 0
+}
+
+func (a *agent) hasBambuLANRuntimeFallbackConsumed(printerID string) bool {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return false
+	}
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	return a.bambuLANFallbackUsed[key]
+}
+
+func (a *agent) markBambuLANRuntimeFallbackConsumed(printerID string) {
+	key := strings.ToLower(strings.TrimSpace(printerID))
+	if key == "" {
+		return
+	}
+	a.bambuLANMu.Lock()
+	defer a.bambuLANMu.Unlock()
+	if a.bambuLANFallbackUsed == nil {
+		a.bambuLANFallbackUsed = make(map[string]bool)
+	}
+	a.bambuLANFallbackUsed[key] = true
 }
 
 func (a *agent) clearBambuLANRuntimeFailure(printerID string) {
@@ -300,9 +879,13 @@ func (a *agent) clearBambuLANRuntimeFailure(printerID string) {
 	a.bambuLANMu.Lock()
 	defer a.bambuLANMu.Unlock()
 	if a.bambuLANFailures == nil {
-		return
+		a.bambuLANFailures = make(map[string]int)
 	}
 	delete(a.bambuLANFailures, key)
+	if a.bambuLANFallbackUsed == nil {
+		a.bambuLANFallbackUsed = make(map[string]bool)
+	}
+	delete(a.bambuLANFallbackUsed, key)
 }
 
 func defaultFetchBambuLANMQTTSnapshot(
@@ -473,6 +1056,7 @@ func parseBambuLANMQTTSnapshotPayload(raw []byte) (bindingSnapshot, error) {
 			"state":     ledState,
 		}
 	}
+	snapshot.ControlStatus = parseBambuLANControlStatus(payload.Print)
 
 	return snapshot, nil
 }
@@ -591,6 +1175,72 @@ func bambuLANValueAsSlice(raw any) []any {
 	return items
 }
 
+func parseBambuLANControlStatus(raw map[string]any) *printerControlStatusSnapshot {
+	if len(raw) == 0 {
+		return nil
+	}
+	status := &printerControlStatusSnapshot{
+		Nozzle:          parseBambuLANTemperatureStatus(raw["nozzle_temper"], raw["nozzle_target_temper"]),
+		Bed:             parseBambuLANTemperatureStatus(raw["bed_temper"], raw["bed_target_temper"]),
+		Chamber:         parseBambuLANTemperatureStatus(raw["chamber_temper"], nil),
+		Fans:            parseBambuLANFanStatuses(raw),
+		MotionSupported: true,
+		HomeSupported:   true,
+	}
+	if len(status.Fans) == 0 {
+		status.Fans = nil
+	}
+	return status
+}
+
+func parseBambuLANTemperatureStatus(currentRaw any, targetRaw any) printerTemperatureStatus {
+	status := printerTemperatureStatus{}
+	if current, ok := bambuLANValueAsFloat(currentRaw); ok {
+		status.Current = &current
+	}
+	if target, ok := bambuLANValueAsFloat(targetRaw); ok {
+		status.Target = &target
+	}
+	return status
+}
+
+func parseBambuLANFanStatuses(raw map[string]any) map[string]printerFanStatus {
+	fans := map[string]printerFanStatus{}
+	appendFan := func(key string, value any) {
+		if value == nil {
+			return
+		}
+		state := normalizeBambuLANFanState(value)
+		if state == "" {
+			return
+		}
+		fans[key] = printerFanStatus{
+			Supported: true,
+			State:     state,
+		}
+	}
+	appendFan("part_cooling", raw["cooling_fan_speed"])
+	appendFan("auxiliary", raw["big_fan1_speed"])
+	appendFan("chamber", raw["big_fan2_speed"])
+	return fans
+}
+
+func normalizeBambuLANFanState(raw any) string {
+	switch strings.ToLower(strings.TrimSpace(bambuLANValueAsString(raw))) {
+	case "":
+		return ""
+	case "0", "off", "false":
+		return "off"
+	}
+	if value, ok := bambuLANValueAsFloat(raw); ok {
+		if value > 0 {
+			return "on"
+		}
+		return "off"
+	}
+	return "unknown"
+}
+
 func parseBambuLANLightState(raw any) string {
 	fallback := ""
 	for _, item := range bambuLANValueAsSlice(raw) {
@@ -622,7 +1272,7 @@ func parseBambuLANFilamentTelemetry(raw any) (string, string, string, string, st
 	case filamentSourceKindExternalSpool, filamentSourceKindAMS:
 		return "loaded", filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, sourceLabel
 	case filamentSourceKindNone:
-		return "unknown", filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, ""
+		return "unloaded", filamentStateSourceBambuActiveSource, filamentConfidenceConfirmed, sourceKind, ""
 	default:
 		return "unknown", filamentStateSourceUnknown, filamentConfidenceHeuristic, filamentSourceKindUnknown, ""
 	}
