@@ -251,7 +251,7 @@ func (a *agent) handleInternalBambuCamera(w http.ResponseWriter, r *http.Request
 			"available":          err == nil,
 			"support_status":     string(handle.Support.Status),
 			"directly_tested":    handle.Support.DirectlyTested,
-			"helper_binary_path": handle.HelperBinaryPath,
+			"plugin_dir":         handle.PluginDir,
 			"plugin_library":     handle.PluginLibraryPath,
 			"reason_unavailable": nil,
 		}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -64,6 +65,24 @@ func newTestAgent(t *testing.T) *agent {
 		bambuLANRecoveryUntil: make(map[int]time.Time),
 		bambuLANProbeHosts:    make(map[string]time.Time),
 		localObservations:     newLocalObservationStore(),
+	}
+}
+
+func TestCameraStreamHTTPClientClonesBaseTransport(t *testing.T) {
+	a := newTestAgent(t)
+	baseTransport := &http.Transport{}
+	a.client = &http.Client{Transport: baseTransport}
+
+	cameraClient := a.cameraStreamHTTPClient()
+	if cameraClient == nil {
+		t.Fatalf("expected camera stream client")
+	}
+	clonedTransport, ok := cameraClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", cameraClient.Transport)
+	}
+	if clonedTransport == baseTransport {
+		t.Fatalf("expected camera stream client to use a cloned transport")
 	}
 }
 
@@ -3167,6 +3186,280 @@ func TestFetchMoonrakerCommandCapabilitiesTreatsMissingDevicePowerEndpointAsUnsu
 	}
 }
 
+func TestFetchMoonrakerCommandCapabilitiesFallsBackToLEDObjectWhenDevicePowerUnavailable(t *testing.T) {
+	a := newTestAgent(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine/device_power/devices":
+			http.NotFound(w, r)
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{
+						"led cavity_led",
+					},
+				},
+			})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"led cavity_led": map[string]any{
+							"color_data": []any{
+								[]any{0.0, 0.0, 0.0, 0.0},
+							},
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	capabilities, err := a.fetchMoonrakerCommandCapabilities(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("fetchMoonrakerCommandCapabilities failed: %v", err)
+	}
+	led, ok := capabilities["led"].(map[string]any)
+	if !ok || led["supported"] != true || led["state"] != "off" || led["device"] != "led cavity_led" {
+		t.Fatalf("led capability = %#v, want supported off led object", capabilities["led"])
+	}
+	if led["mode"] != "klipper_led" {
+		t.Fatalf("led mode = %#v, want klipper_led", led["mode"])
+	}
+}
+
+func TestOpenSnapshotLoopReaderToleratesTransientSnapshotFailures(t *testing.T) {
+	a := newTestAgent(t)
+	requestCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount <= 2 {
+			http.Error(w, "temporary camera error", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xd9})
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader, contentType, err := a.openSnapshotLoopReader(ctx, srv.URL+"/monitor.jpg?ts={ts}")
+	if err != nil {
+		t.Fatalf("openSnapshotLoopReader failed: %v", err)
+	}
+	defer reader.Close()
+
+	if contentType != "multipart/x-mixed-replace;boundary=frame" {
+		t.Fatalf("contentType = %q, want multipart/x-mixed-replace;boundary=frame", contentType)
+	}
+
+	readResult := make(chan []byte, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 128)
+		n, err := io.ReadAtLeast(reader, buf, 64)
+		if err != nil {
+			readErr <- err
+			return
+		}
+		readResult <- append([]byte(nil), buf[:n]...)
+	}()
+
+	select {
+	case err := <-readErr:
+		t.Fatalf("snapshot loop reader failed before recovery: %v", err)
+	case payload := <-readResult:
+		if !bytes.Contains(payload, []byte("--frame")) {
+			t.Fatalf("payload = %q, want multipart frame header", string(payload))
+		}
+		if !bytes.Contains(payload, []byte{0xff, 0xd8, 0xff, 0xd9}) {
+			t.Fatalf("payload missing jpeg frame bytes: %v", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for snapshot loop reader to recover")
+	}
+}
+
+func TestSendMoonrakerCameraMonitorCommandDefaultSendsStartMonitorRPC(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	payloadCh := make(chan map[string]any, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+
+		reader := bufio.NewReader(conn)
+		headers := make(http.Header)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				errCh <- readErr
+				return
+			}
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "GET ") {
+				continue
+			}
+			if trimmed == "" {
+				break
+			}
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) == 2 {
+				headers.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			}
+		}
+
+		acceptKey := computeWebSocketAcceptKey(headers.Get("Sec-WebSocket-Key"))
+		if _, err := io.WriteString(
+			conn,
+			"HTTP/1.1 101 Switching Protocols\r\n"+
+				"Upgrade: websocket\r\n"+
+				"Connection: Upgrade\r\n"+
+				"Sec-WebSocket-Accept: "+acceptKey+"\r\n\r\n",
+		); err != nil {
+			errCh <- err
+			return
+		}
+
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			errCh <- err
+			return
+		}
+		payloadLen := int(header[1] & 0x7f)
+		mask := make([]byte, 4)
+		if _, err := io.ReadFull(reader, mask); err != nil {
+			errCh <- err
+			return
+		}
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			errCh <- err
+			return
+		}
+		for idx := range payload {
+			payload[idx] ^= mask[idx%len(mask)]
+		}
+
+		var decoded map[string]any
+		if err := json.Unmarshal(payload, &decoded); err != nil {
+			errCh <- err
+			return
+		}
+		payloadCh <- decoded
+	}()
+
+	endpointURL := "http://" + listener.Addr().String()
+	if err := sendMoonrakerCameraMonitorCommandDefault(context.Background(), endpointURL, false); err != nil {
+		t.Fatalf("sendMoonrakerCameraMonitorCommandDefault failed: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("websocket capture failed: %v", err)
+	case payload := <-payloadCh:
+		if payload["method"] != "camera.start_monitor" {
+			t.Fatalf("method = %v, want camera.start_monitor", payload["method"])
+		}
+		params, ok := payload["params"].(map[string]any)
+		if !ok {
+			t.Fatalf("params = %#v, want object", payload["params"])
+		}
+		if params["domain"] != "lan" {
+			t.Fatalf("domain = %v, want lan", params["domain"])
+		}
+		if params["interval"] != float64(0) {
+			t.Fatalf("interval = %v, want 0", params["interval"])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for websocket payload")
+	}
+}
+
+func TestStartMoonrakerCameraMonitorKeepaliveSkipsNonMonitorSnapshots(t *testing.T) {
+	a := newTestAgent(t)
+	original := sendMoonrakerCameraMonitorCommand
+	defer func() {
+		sendMoonrakerCameraMonitorCommand = original
+	}()
+
+	calls := make(chan string, 4)
+	sendMoonrakerCameraMonitorCommand = func(ctx context.Context, endpointURL string, stop bool) error {
+		if stop {
+			calls <- "stop"
+		} else {
+			calls <- "start"
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.startMoonrakerCameraMonitorKeepalive(ctx, "http://moonraker.local", "http://moonraker.local/webcam/?action=snapshot")
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case call := <-calls:
+		t.Fatalf("unexpected keepalive call for non-monitor snapshot: %s", call)
+	default:
+	}
+}
+
+func TestStartMoonrakerCameraMonitorKeepaliveTriggersMonitorCommands(t *testing.T) {
+	a := newTestAgent(t)
+	original := sendMoonrakerCameraMonitorCommand
+	defer func() {
+		sendMoonrakerCameraMonitorCommand = original
+	}()
+
+	calls := make(chan string, 4)
+	sendMoonrakerCameraMonitorCommand = func(ctx context.Context, endpointURL string, stop bool) error {
+		if stop {
+			calls <- "stop"
+		} else {
+			calls <- "start"
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.startMoonrakerCameraMonitorKeepalive(ctx, "http://moonraker.local", "http://moonraker.local/server/files/camera/monitor.jpg?ts=1")
+
+	select {
+	case call := <-calls:
+		if call != "start" {
+			t.Fatalf("first keepalive call = %q, want start", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for start monitor call")
+	}
+
+	cancel()
+
+	select {
+	case call := <-calls:
+		if call != "stop" {
+			t.Fatalf("stop keepalive call = %q, want stop", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stop monitor call")
+	}
+}
+
 func TestPollPrinterCommandsOnceQueuesCommandAction(t *testing.T) {
 	a := newTestAgent(t)
 	a.bootstrap = bootstrapConfig{
@@ -3309,6 +3602,42 @@ func TestExecuteNextActionAcknowledgesSuccessfulPrinterCommand(t *testing.T) {
 	}
 }
 
+func TestExecuteMoonrakerLightActionFallsBackToLEDObjectWhenDevicePowerUnavailable(t *testing.T) {
+	a := newTestAgent(t)
+	var receivedScript string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine/device_power/devices":
+			http.NotFound(w, r)
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{
+						"led cavity_led",
+					},
+				},
+			})
+		case "/printer/gcode/script":
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode gcode script payload failed: %v", err)
+			}
+			receivedScript = payload["script"]
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	if err := a.executeMoonrakerLightAction(context.Background(), srv.URL, "light_on"); err != nil {
+		t.Fatalf("executeMoonrakerLightAction failed: %v", err)
+	}
+	if receivedScript != "SET_LED LED=cavity_led WHITE=1 SYNC=0 TRANSMIT=1" {
+		t.Fatalf("received script = %q, want cavity_led SET_LED on script", receivedScript)
+	}
+}
+
 func TestParseBambuLANMQTTSnapshotPayloadMapsPushStatus(t *testing.T) {
 	snapshot, err := parseBambuLANMQTTSnapshotPayload([]byte(`{
 		"print": {
@@ -3441,6 +3770,74 @@ func TestParseBambuLANMQTTSnapshotPayloadCapturesLightCapabilities(t *testing.T)
 	}
 	if _, exists := filament["action_state"]; exists {
 		t.Fatalf("filament action_state = %#v, want omitted when idle", filament["action_state"])
+	}
+}
+
+func TestMergeCommandCapabilitiesPreservesPreviousSupportedControlsAcrossUnsupportedFallback(t *testing.T) {
+	previous := map[string]any{
+		"led": map[string]any{
+			"supported": true,
+			"state":     "on",
+		},
+		"filament": map[string]any{
+			"state":        "loaded",
+			"action_state": filamentActionStateIdle,
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+		},
+		"load_filament": map[string]any{
+			"supported": true,
+		},
+		"unload_filament": map[string]any{
+			"supported": true,
+		},
+	}
+
+	merged := mergeCommandCapabilities(previous, unsupportedBambuCommandCapabilities())
+
+	led, ok := merged["led"].(map[string]any)
+	if !ok || led["supported"] != true || led["state"] != "on" {
+		t.Fatalf("led capability = %#v, want supported on", merged["led"])
+	}
+	load, ok := merged["load_filament"].(map[string]any)
+	if !ok || load["supported"] != true {
+		t.Fatalf("load capability = %#v, want supported", merged["load_filament"])
+	}
+	unload, ok := merged["unload_filament"].(map[string]any)
+	if !ok || unload["supported"] != true {
+		t.Fatalf("unload capability = %#v, want supported", merged["unload_filament"])
+	}
+}
+
+func TestFallbackBambuCommandCapabilitiesUsesLastRuntimeSnapshotRecord(t *testing.T) {
+	a := newTestAgent(t)
+	a.recordBambuLANRuntimeSnapshot(
+		"printer-1",
+		"192.168.1.20",
+		bindingSnapshot{
+			CommandCapabilities: map[string]any{
+				"led": map[string]any{
+					"supported": true,
+					"state":     "off",
+				},
+				"load_filament": map[string]any{
+					"supported": true,
+				},
+				"unload_filament": map[string]any{
+					"supported": true,
+				},
+			},
+		},
+	)
+
+	capabilities := a.fallbackBambuCommandCapabilities("printer-1")
+	led, ok := capabilities["led"].(map[string]any)
+	if !ok || led["supported"] != true || led["state"] != "off" {
+		t.Fatalf("led capability = %#v, want supported off", capabilities["led"])
+	}
+	load, ok := capabilities["load_filament"].(map[string]any)
+	if !ok || load["supported"] != true {
+		t.Fatalf("load capability = %#v, want supported", capabilities["load_filament"])
 	}
 }
 
@@ -3596,6 +3993,54 @@ func TestResolveRuntimeFilamentCapabilityKeepsBambuLoadRunningUntilSourceReturns
 	}
 	if filament["source_kind"] != filamentSourceKindExternalSpool {
 		t.Fatalf("filament source_kind = %v, want external_spool", filament["source_kind"])
+	}
+}
+
+func TestResolveRuntimeFilamentCapabilitySeedsBambuLoadStartTimeWhenTelemetryOmitsIt(t *testing.T) {
+	now := time.Now().UTC()
+	previous := currentStateItem{
+		PrinterID:  1,
+		ReportedAt: now.Add(-2 * time.Second),
+		CommandCapabilities: map[string]any{
+			"filament": map[string]any{
+				"state":        "unknown",
+				"state_source": filamentStateSourceBambuActiveSource,
+				"confidence":   filamentConfidenceConfirmed,
+				"source_kind":  filamentSourceKindNone,
+				"action_state": filamentActionStateLoading,
+			},
+		},
+	}
+	current := previous
+	current.CommandCapabilities = mergeCommandCapabilities(previous.CommandCapabilities, map[string]any{
+		"filament": map[string]any{
+			"state":        "unknown",
+			"state_source": filamentStateSourceBambuActiveSource,
+			"confidence":   filamentConfidenceConfirmed,
+			"source_kind":  filamentSourceKindNone,
+			"action_state": filamentActionStateLoading,
+		},
+	})
+
+	resolveRuntimeFilamentCapability(edgeBinding{AdapterFamily: "bambu"}, &current, previous, bindingSnapshot{}, now)
+
+	filament, ok := current.CommandCapabilities["filament"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing filament capability")
+	}
+	if filament["action_state"] != filamentActionStateLoading {
+		t.Fatalf("filament action_state = %v, want loading", filament["action_state"])
+	}
+	rawStartedAt := stringFromAny(filament["action_started_at"])
+	if rawStartedAt == "" {
+		t.Fatalf("expected action_started_at to be seeded")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, rawStartedAt)
+	if err != nil {
+		t.Fatalf("parse action_started_at failed: %v", err)
+	}
+	if parsed.IsZero() {
+		t.Fatalf("expected non-zero action_started_at")
 	}
 }
 

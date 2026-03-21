@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -35,7 +34,7 @@ func TestClassifySupportX1CIsUnverified(t *testing.T) {
 	}
 }
 
-func TestManagerEnsureDownloadsPinnedPluginAndCompilesHelper(t *testing.T) {
+func TestManagerEnsureDownloadsPinnedPluginBundle(t *testing.T) {
 	artifact := testPluginArtifactForRuntime()
 	archiveBytes := buildTestPluginArchive(t, artifact.SourceLibrary, artifact.NetworkingLib)
 	checksum := fmt.Sprintf("%x", sha256.Sum256(archiveBytes))
@@ -55,20 +54,7 @@ func TestManagerEnsureDownloadsPinnedPluginAndCompilesHelper(t *testing.T) {
 		return artifact, nil
 	}
 
-	var compileCall string
-	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
-		compileCall = name + " " + strings.Join(args, " ")
-		target := args[len(args)-1]
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			t.Fatalf("mkdir target dir failed: %v", err)
-		}
-		if err := os.WriteFile(target, []byte("binary"), 0o755); err != nil {
-			t.Fatalf("write target failed: %v", err)
-		}
-		return nil, nil
-	}
-
-	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), runner)
+	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), nil)
 	manager.Client = server.Client()
 	handle, err := manager.Ensure(context.Background(), EnsureRequest{
 		Serial:     "01P00C511601082",
@@ -78,9 +64,6 @@ func TestManagerEnsureDownloadsPinnedPluginAndCompilesHelper(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Ensure failed: %v", err)
-	}
-	if !strings.Contains(compileCall, "BambuP1Streamer.cpp") {
-		t.Fatalf("compile call = %q, want helper compile", compileCall)
 	}
 	if !strings.HasSuffix(handle.PluginLibraryPath, artifact.SourceLibrary) {
 		t.Fatalf("plugin library = %q, want %q", handle.PluginLibraryPath, artifact.SourceLibrary)
@@ -107,10 +90,7 @@ func TestManagerEnsureRejectsChecksumMismatch(t *testing.T) {
 		return artifact, nil
 	}
 
-	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), func(context.Context, string, ...string) ([]byte, error) {
-		t.Fatalf("helper compile should not run when checksum fails")
-		return nil, nil
-	})
+	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), nil)
 	manager.Client = server.Client()
 	_, err := manager.Ensure(context.Background(), EnsureRequest{
 		Serial:     "01P00C511601082",
@@ -127,10 +107,7 @@ func TestManagerEnsureRejectsChecksumMismatch(t *testing.T) {
 }
 
 func TestManagerEnsureRejectsUnverifiedFamilies(t *testing.T) {
-	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), func(context.Context, string, ...string) ([]byte, error) {
-		t.Fatalf("runner should not be called for unsupported family")
-		return nil, nil
-	})
+	manager := NewManager(filepath.Join(t.TempDir(), "runtime"), nil)
 
 	_, err := manager.Ensure(context.Background(), EnsureRequest{
 		Serial:     "x1c-serial",
@@ -185,5 +162,32 @@ func testPluginArtifactForRuntime() pluginArtifact {
 			SourceLibrary: "BambuSource.dll",
 			NetworkingLib: "bambu_networking.dll",
 		}
+	}
+}
+
+func TestReadNextJPEGFrameSkipsLeadingNoise(t *testing.T) {
+	frame, err := readNextJPEGFrame(bytes.NewReader(append(
+		[]byte("BambuTunnel::GetMsg(1)\n"),
+		[]byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}...,
+	)))
+	if err != nil {
+		t.Fatalf("readNextJPEGFrame failed: %v", err)
+	}
+	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}) {
+		t.Fatalf("frame = %v, want JPEG payload", frame)
+	}
+}
+
+func TestReadNextJPEGFrameStopsAtFirstFrame(t *testing.T) {
+	payload := append(
+		[]byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9},
+		[]byte{0xFF, 0xD8, 0xBB, 0xFF, 0xD9}...,
+	)
+	frame, err := readNextJPEGFrame(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("readNextJPEGFrame failed: %v", err)
+	}
+	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9}) {
+		t.Fatalf("frame = %v, want first JPEG frame", frame)
 	}
 }

@@ -14,6 +14,7 @@ make down
 - `make build`: refreshes embedded web UI assets and compiles `bin/edge-agent`.
 - `make dev`: rebuilds then runs in foreground with logs attached (defaults to `EDGE_AGENT_FLAGS=--klipper`).
 - `make down`: kills all local `edge-agent` processes by name.
+- Local builds now default to `CGO_ENABLED=1` because the in-process Bambu camera runtime uses `cgo` to call the pinned native plugin libraries.
 
 Optional test commands:
 

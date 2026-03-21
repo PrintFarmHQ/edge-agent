@@ -88,6 +88,8 @@ Examples:
 - Stock Snapmaker U1 under the Moonraker family:
   - use `server/files/camera/monitor.jpg?ts=<now>`
   - treat camera as `snapshot_poll`
+  - keep the camera pipeline alive with `camera.start_monitor` while the snapshot session is active
+  - if `device_power` is unavailable but Moonraker exposes `led cavity_led` (or another single LED object), treat light control as supported through `SET_LED`
 - Bambu P1/P1S:
   - prefer an `edge-agent`-owned local runtime that exposes a stable loopback MJPEG contract
   - do not treat blind `:322` RTSP probing as a default supported path

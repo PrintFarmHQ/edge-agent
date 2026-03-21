@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -59,6 +61,7 @@ const (
 	defaultBambuMQTTTopic        = "device/%s/request"
 	defaultBambuMQTTBrokerGlobal = "us.mqtt.bambulab.com:8883"
 	defaultBambuMQTTBrokerChina  = "cn.mqtt.bambulab.com:8883"
+	moonrakerCameraMonitorPath   = "/server/files/camera/monitor.jpg"
 )
 
 var agentSupportedSchemaVersions = []int{1, agentSchemaVersion}
@@ -86,6 +89,7 @@ var logARPCommandWarning = func(message string, args ...any) {
 var bambuAuthInputReader io.Reader = os.Stdin
 var bambuAuthOutputWriter io.Writer = os.Stdout
 var isBambuAuthInteractiveConsole = defaultIsBambuAuthInteractiveConsole
+var sendMoonrakerCameraMonitorCommand = sendMoonrakerCameraMonitorCommandDefault
 
 type bootstrapConfig struct {
 	ControlPlaneURL string    `json:"control_plane_url"`
@@ -2530,36 +2534,108 @@ func (a *agent) openMoonrakerCameraReader(ctx context.Context, binding edgeBindi
 		return resp.Body, contentType, nil
 	}
 	if strings.TrimSpace(webcam.SnapshotURL) != "" {
+		a.startMoonrakerCameraMonitorKeepalive(ctx, binding.EndpointURL, strings.TrimSpace(webcam.SnapshotURL))
 		return a.openSnapshotLoopReader(ctx, strings.TrimSpace(webcam.SnapshotURL))
 	}
 	return nil, "", errors.New("moonraker camera has neither stream_url nor snapshot_url")
 }
 
+func (a *agent) startMoonrakerCameraMonitorKeepalive(ctx context.Context, endpointURL string, snapshotURL string) {
+	if !isMoonrakerMonitorSnapshotURL(snapshotURL) {
+		return
+	}
+
+	go func() {
+		triggerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := sendMoonrakerCameraMonitorCommand(triggerCtx, endpointURL, false)
+		cancel()
+		if err != nil {
+			a.audit("moonraker_camera_monitor_start_error", map[string]any{
+				"endpoint_url": endpointURL,
+				"error":        err.Error(),
+			})
+		}
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := sendMoonrakerCameraMonitorCommand(stopCtx, endpointURL, true); err != nil {
+					a.audit("moonraker_camera_monitor_stop_error", map[string]any{
+						"endpoint_url": endpointURL,
+						"error":        err.Error(),
+					})
+				}
+				stopCancel()
+				return
+			case <-ticker.C:
+				keepaliveCtx, keepaliveCancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := sendMoonrakerCameraMonitorCommand(keepaliveCtx, endpointURL, false); err != nil {
+					a.audit("moonraker_camera_monitor_keepalive_error", map[string]any{
+						"endpoint_url": endpointURL,
+						"error":        err.Error(),
+					})
+				}
+				keepaliveCancel()
+			}
+		}
+	}()
+}
+
+func isMoonrakerMonitorSnapshotURL(snapshotURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(snapshotURL))
+	if err != nil {
+		return false
+	}
+	return parsed.Path == moonrakerCameraMonitorPath
+}
+
 func (a *agent) openSnapshotLoopReader(ctx context.Context, snapshotURL string) (io.ReadCloser, string, error) {
 	pipeReader, pipeWriter := io.Pipe()
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		const (
+			snapshotPollInterval           = 1 * time.Second
+			maxSnapshotConsecutiveFailures = 30
+		)
+		ticker := time.NewTicker(snapshotPollInterval)
 		defer ticker.Stop()
 		defer pipeWriter.Close()
+		consecutiveFailures := 0
+		var lastErr error
 		for {
 			requestURL := strings.ReplaceAll(snapshotURL, "{ts}", strconv.FormatInt(time.Now().UnixMilli(), 10))
 			snapshotBytes, err := a.fetchCameraSnapshotBytes(ctx, requestURL)
 			if err != nil {
-				_ = pipeWriter.CloseWithError(err)
-				return
-			}
-			frameHeader := fmt.Sprintf(
-				"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
-				len(snapshotBytes),
-			)
-			if _, err := pipeWriter.Write([]byte(frameHeader)); err != nil {
-				return
-			}
-			if _, err := pipeWriter.Write(snapshotBytes); err != nil {
-				return
-			}
-			if _, err := pipeWriter.Write([]byte("\r\n")); err != nil {
-				return
+				lastErr = err
+				consecutiveFailures++
+				if consecutiveFailures >= maxSnapshotConsecutiveFailures {
+					_ = pipeWriter.CloseWithError(
+						fmt.Errorf(
+							"camera snapshot polling failed after %d consecutive errors: %w",
+							consecutiveFailures,
+							lastErr,
+						),
+					)
+					return
+				}
+			} else {
+				consecutiveFailures = 0
+				frameHeader := fmt.Sprintf(
+					"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
+					len(snapshotBytes),
+				)
+				if _, err := pipeWriter.Write([]byte(frameHeader)); err != nil {
+					return
+				}
+				if _, err := pipeWriter.Write(snapshotBytes); err != nil {
+					return
+				}
+				if _, err := pipeWriter.Write([]byte("\r\n")); err != nil {
+					return
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -2588,6 +2664,178 @@ func (a *agent) fetchCameraSnapshotBytes(ctx context.Context, snapshotURL string
 		return nil, fmt.Errorf("camera snapshot returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+}
+
+func sendMoonrakerCameraMonitorCommandDefault(ctx context.Context, endpointURL string, stop bool) error {
+	websocketURL, err := moonrakerWebSocketURL(endpointURL)
+	if err != nil {
+		return err
+	}
+
+	conn, reader, acceptKey, err := dialMoonrakerWebSocket(ctx, websocketURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := completeMoonrakerWebSocketHandshake(reader, acceptKey); err != nil {
+		return err
+	}
+
+	method := "camera.start_monitor"
+	params := map[string]any{
+		"domain":   "lan",
+		"interval": 0,
+	}
+	if stop {
+		method = "camera.stop_monitor"
+		params = map[string]any{}
+	}
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+		"id":      time.Now().UnixNano(),
+	})
+	if err != nil {
+		return err
+	}
+	return writeWebSocketTextFrame(conn, payload)
+}
+
+func moonrakerWebSocketURL(endpointURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(endpointURL))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host == "" {
+		return "", errors.New("validation_error: moonraker endpoint is missing host")
+	}
+	switch parsed.Scheme {
+	case "http", "":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("validation_error: unsupported moonraker endpoint scheme %q", parsed.Scheme)
+	}
+	parsed.Path = "/websocket"
+	return parsed.String(), nil
+}
+
+func dialMoonrakerWebSocket(ctx context.Context, websocketURL string) (net.Conn, *bufio.Reader, string, error) {
+	parsed, err := url.Parse(websocketURL)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	address := parsed.Host
+	if !strings.Contains(address, ":") {
+		if parsed.Scheme == "wss" {
+			address = net.JoinHostPort(address, "443")
+		} else {
+			address = net.JoinHostPort(address, "80")
+		}
+	}
+
+	dialer := &net.Dialer{}
+	var conn net.Conn
+	switch parsed.Scheme {
+	case "ws":
+		conn, err = dialer.DialContext(ctx, "tcp", address)
+	case "wss":
+		conn, err = tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: parsed.Hostname(),
+		})
+	default:
+		err = fmt.Errorf("validation_error: unsupported websocket scheme %q", parsed.Scheme)
+	}
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		conn.Close()
+		return nil, nil, "", err
+	}
+	webSocketKey := base64.StdEncoding.EncodeToString(keyBytes)
+	requestPath := parsed.RequestURI()
+	if requestPath == "" {
+		requestPath = "/websocket"
+	}
+	handshake := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		requestPath,
+		parsed.Host,
+		webSocketKey,
+	)
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if _, err := io.WriteString(conn, handshake); err != nil {
+		conn.Close()
+		return nil, nil, "", err
+	}
+	return conn, bufio.NewReader(conn), computeWebSocketAcceptKey(webSocketKey), nil
+}
+
+func completeMoonrakerWebSocketHandshake(reader *bufio.Reader, acceptKey string) error {
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(statusLine, "101") {
+		return fmt.Errorf("moonraker websocket upgrade failed: %s", strings.TrimSpace(statusLine))
+	}
+
+	headers := make(http.Header)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		headers.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(headers.Get("Sec-WebSocket-Accept")), acceptKey) {
+		return errors.New("moonraker websocket upgrade failed: invalid accept key")
+	}
+	return nil
+}
+
+func computeWebSocketAcceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func writeWebSocketTextFrame(conn net.Conn, payload []byte) error {
+	if len(payload) > 125 {
+		return errors.New("moonraker websocket payload too large")
+	}
+
+	mask := make([]byte, 4)
+	if _, err := rand.Read(mask); err != nil {
+		return err
+	}
+
+	frame := make([]byte, 0, 2+len(mask)+len(payload))
+	frame = append(frame, 0x81, byte(0x80|len(payload)))
+	frame = append(frame, mask...)
+	for idx, b := range payload {
+		frame = append(frame, b^mask[idx%len(mask)])
+	}
+	_, err := conn.Write(frame)
+	return err
 }
 
 type bambuCameraSource struct {
@@ -2725,49 +2973,19 @@ func (a *agent) ensureBambuCameraHandle(ctx context.Context, printerID string) (
 }
 
 func openManagedBambuMJPEGReaderDefault(ctx context.Context, handle bambucamera.Handle) (io.ReadCloser, error) {
-	sourceCmd := exec.CommandContext(
-		ctx,
-		handle.HelperBinaryPath,
-		handle.PluginLibraryPath,
-		handle.Host,
-		handle.AccessCode,
-	)
-	sourceCmd.Env = append(os.Environ(),
-		"DYLD_LIBRARY_PATH="+handle.PluginDir,
-		"LD_LIBRARY_PATH="+handle.PluginDir,
-	)
-	sourceStdout, err := sourceCmd.StdoutPipe()
+	session, err := bambucamera.OpenSession(handle)
 	if err != nil {
 		return nil, err
 	}
-	sourceStderr, err := sourceCmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := sourceCmd.Start(); err != nil {
-		return nil, err
-	}
-
-	sourceErrCh := readProcessStderr(sourceStderr)
 	pipeReader, pipeWriter := io.Pipe()
 	go func() {
-		defer func() {
-			if sourceCmd.Process != nil {
-				_ = sourceCmd.Process.Kill()
-			}
-		}()
+		defer session.Close()
 
 		for {
-			frame, frameErr := readNextJPEGFrame(sourceStdout)
+			frame, frameErr := bambucamera.ReadJPEGFrame(ctx, session)
 			if frameErr != nil {
-				sourceWaitErr := sourceCmd.Wait()
-				sourceErr := <-sourceErrCh
 				switch {
 				case errors.Is(frameErr, io.EOF):
-					if sourceWaitErr != nil {
-						_ = pipeWriter.CloseWithError(firstManagedProcessError("bambu native source failed", sourceErr, sourceWaitErr))
-						return
-					}
 					_ = pipeWriter.Close()
 				default:
 					_ = pipeWriter.CloseWithError(frameErr)
@@ -2787,113 +3005,24 @@ func openManagedBambuMJPEGReaderDefault(ctx context.Context, handle bambucamera.
 			}
 		}
 	}()
-	return &managedProcessPipeReader{
-		PipeReader: pipeReader,
-		closeFn: func() {
-			if sourceCmd.Process != nil {
-				_ = sourceCmd.Process.Kill()
-			}
-		},
-	}, nil
+	return pipeReader, nil
 }
 
 func fetchManagedBambuSnapshotDefault(ctx context.Context, handle bambucamera.Handle) ([]byte, error) {
-	sourceCmd := exec.CommandContext(
-		ctx,
-		handle.HelperBinaryPath,
-		handle.PluginLibraryPath,
-		handle.Host,
-		handle.AccessCode,
-	)
-	sourceCmd.Env = append(os.Environ(),
-		"DYLD_LIBRARY_PATH="+handle.PluginDir,
-		"LD_LIBRARY_PATH="+handle.PluginDir,
-	)
-	sourceStdout, err := sourceCmd.StdoutPipe()
+	session, err := bambucamera.OpenSession(handle)
 	if err != nil {
 		return nil, err
 	}
-	sourceStderr, err := sourceCmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := sourceCmd.Start(); err != nil {
-		return nil, err
-	}
+	defer session.Close()
 
-	imageBytes, readErr := readNextJPEGFrame(sourceStdout)
-	sourceWaitErr := sourceCmd.Wait()
-	sourceErr := <-readProcessStderr(sourceStderr)
-	if sourceWaitErr != nil {
-		return nil, firstManagedProcessError("bambu native source failed", sourceErr, sourceWaitErr)
-	}
-	if readErr != nil {
-		return nil, readErr
+	imageBytes, err := bambucamera.ReadJPEGFrame(ctx, session)
+	if err != nil {
+		return nil, err
 	}
 	if len(imageBytes) == 0 {
 		return nil, errors.New("bambu snapshot failed: empty image output")
 	}
 	return imageBytes, nil
-}
-
-type managedProcessPipeReader struct {
-	*io.PipeReader
-	closeFn func()
-}
-
-func (r *managedProcessPipeReader) Close() error {
-	if r.closeFn != nil {
-		r.closeFn()
-	}
-	return r.PipeReader.Close()
-}
-
-func readNextJPEGFrame(reader io.Reader) ([]byte, error) {
-	buffer := make([]byte, 0, 128*1024)
-	chunk := make([]byte, 4096)
-	prev := byte(0x00)
-	inFrame := false
-
-	for {
-		n, err := reader.Read(chunk)
-		for i := 0; i < n; i++ {
-			current := chunk[i]
-			if !inFrame {
-				if prev == 0xFF && current == 0xD8 {
-					inFrame = true
-					buffer = append(buffer[:0], 0xFF, 0xD8)
-				}
-			} else {
-				buffer = append(buffer, current)
-				if prev == 0xFF && current == 0xD9 {
-					return append([]byte(nil), buffer...), nil
-				}
-			}
-			prev = current
-		}
-		if err != nil {
-			if len(buffer) > 0 {
-				return nil, io.ErrUnexpectedEOF
-			}
-			return nil, err
-		}
-	}
-}
-
-func readProcessStderr(stderr io.Reader) <-chan string {
-	ch := make(chan string, 1)
-	go func() {
-		msg, _ := io.ReadAll(io.LimitReader(stderr, 4096))
-		ch <- strings.TrimSpace(string(msg))
-	}()
-	return ch
-}
-
-func firstManagedProcessError(prefix string, stderr string, fallback error) error {
-	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
-		return fmt.Errorf("%s: %s", prefix, trimmed)
-	}
-	return fmt.Errorf("%s: %w", prefix, fallback)
 }
 
 func (a *agent) resolveBambuCameraSource(ctx context.Context, credentials bambustore.BambuLANCredentials) (bambuCameraSource, error) {
@@ -3114,6 +3243,9 @@ func (a *agent) cameraStreamHTTPClient() *http.Client {
 	transport := http.DefaultTransport
 	if a.client != nil && a.client.Transport != nil {
 		transport = a.client.Transport
+	}
+	if httpTransport, ok := transport.(*http.Transport); ok {
+		return &http.Client{Transport: httpTransport.Clone()}
 	}
 	return &http.Client{Transport: transport}
 }
@@ -4995,18 +5127,43 @@ func (a *agent) executeMoonrakerLightAction(ctx context.Context, endpointURL, co
 		return err
 	}
 	deviceName, _, ok := resolveMoonrakerPrimaryLightDevice(devices)
-	if !ok {
-		return errors.New("validation_error: moonraker primary light device is not configured")
-	}
 	action := "on"
 	if strings.TrimSpace(commandKey) == "light_off" {
 		action = "off"
 	}
+	if ok {
+		return a.callMoonrakerPost(
+			ctx,
+			endpointURL,
+			"/machine/device_power/device?device="+url.QueryEscape(deviceName)+"&action="+url.QueryEscape(action),
+			nil,
+		)
+	}
+
+	objects, err := a.fetchMoonrakerObjectList(ctx, endpointURL)
+	if err != nil {
+		return err
+	}
+	ledObjectName, ok := resolveMoonrakerPrimaryLEDObject(objects)
+	if !ok {
+		return errors.New("validation_error: moonraker primary light device is not configured")
+	}
+	ledConfigName := moonrakerLEDObjectConfigName(ledObjectName)
+	if ledConfigName == "" {
+		return errors.New("validation_error: moonraker led object is missing config name")
+	}
+
+	whiteValue := "1"
+	if action == "off" {
+		whiteValue = "0"
+	}
 	return a.callMoonrakerPost(
 		ctx,
 		endpointURL,
-		"/machine/device_power/device?device="+url.QueryEscape(deviceName)+"&action="+url.QueryEscape(action),
-		nil,
+		"/printer/gcode/script",
+		map[string]string{
+			"script": fmt.Sprintf("SET_LED LED=%s WHITE=%s SYNC=0 TRANSMIT=1", ledConfigName, whiteValue),
+		},
 	)
 }
 
@@ -5030,7 +5187,8 @@ func (a *agent) fetchMoonrakerCommandCapabilities(ctx context.Context, endpointU
 	devices, err := a.fetchMoonrakerDevicePowerDevices(ctx, endpointURL)
 	if err != nil {
 		errs = append(errs, err.Error())
-	} else if deviceName, ledState, ok := resolveMoonrakerPrimaryLightDevice(devices); ok {
+	}
+	if deviceName, ledState, ok := resolveMoonrakerPrimaryLightDevice(devices); ok {
 		capabilities["led"] = map[string]any{
 			"supported": true,
 			"device":    deviceName,
@@ -5043,6 +5201,19 @@ func (a *agent) fetchMoonrakerCommandCapabilities(ctx context.Context, endpointU
 		errs = append(errs, err.Error())
 	} else {
 		sensorObjects := moonrakerFilamentSensorObjects(objects)
+		if ledObjectName, ok := resolveMoonrakerPrimaryLEDObject(objects); ok {
+			ledState, ledErr := a.fetchMoonrakerLEDObjectState(ctx, endpointURL, ledObjectName)
+			if ledErr != nil {
+				errs = append(errs, ledErr.Error())
+			} else {
+				capabilities["led"] = map[string]any{
+					"supported": true,
+					"device":    ledObjectName,
+					"state":     ledState,
+					"mode":      "klipper_led",
+				}
+			}
+		}
 		filamentState, filamentErr := a.fetchMoonrakerFilamentState(ctx, endpointURL, sensorObjects)
 		if filamentErr != nil {
 			errs = append(errs, filamentErr.Error())
@@ -5200,6 +5371,90 @@ func normalizeMoonrakerPowerState(raw string) string {
 	}
 }
 
+func resolveMoonrakerPrimaryLEDObject(objects []string) (string, bool) {
+	if len(objects) == 0 {
+		return "", false
+	}
+	priority := []string{"led cavity_led", "led caselight", "led case_light", "led work_light", "led worklight", "led light"}
+	byName := make(map[string]string, len(objects))
+	for _, objectName := range objects {
+		trimmed := strings.TrimSpace(objectName)
+		normalized := strings.ToLower(trimmed)
+		if !strings.HasPrefix(normalized, "led ") {
+			continue
+		}
+		byName[normalized] = trimmed
+	}
+	for _, candidate := range priority {
+		if objectName, ok := byName[candidate]; ok {
+			return objectName, true
+		}
+	}
+
+	matches := make([]string, 0)
+	for normalized, objectName := range byName {
+		if strings.Contains(normalized, "light") || strings.Contains(normalized, "led") {
+			matches = append(matches, objectName)
+		}
+	}
+	sort.Strings(matches)
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return "", false
+}
+
+func moonrakerLEDObjectConfigName(objectName string) string {
+	trimmed := strings.TrimSpace(objectName)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, " ") {
+		return strings.TrimSpace(strings.SplitN(trimmed, " ", 2)[1])
+	}
+	return trimmed
+}
+
+func normalizeMoonrakerLEDColorState(raw any) string {
+	switch typed := raw.(type) {
+	case []any:
+		hasSample := false
+		for _, item := range typed {
+			state := normalizeMoonrakerLEDColorState(item)
+			switch state {
+			case "on":
+				return "on"
+			case "off":
+				hasSample = true
+			}
+		}
+		if hasSample {
+			return "off"
+		}
+	case []float64:
+		if len(typed) == 0 {
+			return ""
+		}
+		for _, value := range typed {
+			if value > 0 {
+				return "on"
+			}
+		}
+		return "off"
+	case float64:
+		if typed > 0 {
+			return "on"
+		}
+		return "off"
+	case int:
+		if typed > 0 {
+			return "on"
+		}
+		return "off"
+	}
+	return ""
+}
+
 func normalizeFilamentState(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "loaded", "unloaded", "unknown":
@@ -5321,6 +5576,55 @@ func moonrakerFilamentSensorObjects(objects []string) []string {
 	return out
 }
 
+func (a *agent) fetchMoonrakerLEDObjectState(ctx context.Context, endpointURL string, objectName string) (string, error) {
+	trimmedObjectName := strings.TrimSpace(objectName)
+	if trimmedObjectName == "" {
+		return "", errors.New("validation_error: missing moonraker led object name")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+	queryPath := fmt.Sprintf(
+		"/printer/objects/query?%s=color_data",
+		url.QueryEscape(trimmedObjectName),
+	)
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		resolveURL(endpointURL, queryPath),
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("moonraker led object query failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload struct {
+		Result struct {
+			Status map[string]map[string]any `json:"status"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	objectStatus := payload.Result.Status[trimmedObjectName]
+	if len(objectStatus) == 0 {
+		return "", fmt.Errorf("moonraker led object query returned no status for %s", trimmedObjectName)
+	}
+	state := normalizeMoonrakerLEDColorState(objectStatus["color_data"])
+	if state == "" {
+		return "", fmt.Errorf("moonraker led object %s reported unknown color_data", trimmedObjectName)
+	}
+	return state, nil
+}
+
 func (a *agent) fetchMoonrakerFilamentState(ctx context.Context, endpointURL string, sensorObjects []string) (string, error) {
 	if len(sensorObjects) == 0 {
 		return "", nil
@@ -5426,6 +5730,16 @@ func unsupportedBambuCommandCapabilities() map[string]any {
 	}
 }
 
+func (a *agent) fallbackBambuCommandCapabilities(printerID string) map[string]any {
+	record, ok := a.currentBambuLANDiscoveryRecord(printerID)
+	if ok {
+		if capabilities := cloneCommandCapabilities(record.Snapshot.CommandCapabilities); capabilities != nil {
+			return capabilities
+		}
+	}
+	return unsupportedBambuCommandCapabilities()
+}
+
 func cloneCommandCapabilities(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil
@@ -5487,7 +5801,55 @@ func mergeCommandCapabilities(previous map[string]any, latest map[string]any) ma
 	if len(nextFilament) > 0 {
 		merged["filament"] = nextFilament
 	}
+
+	mergeSupportedCapabilityState(merged, prev, "led", true)
+	mergeSupportedCapabilityState(merged, prev, "load_filament", false)
+	mergeSupportedCapabilityState(merged, prev, "unload_filament", false)
 	return merged
+}
+
+func mergeSupportedCapabilityState(merged map[string]any, previous map[string]any, key string, preserveState bool) {
+	prevCapability, _ := previous[key].(map[string]any)
+	if prevCapability == nil || !capabilitySupported(prevCapability) {
+		return
+	}
+
+	nextCapability, _ := merged[key].(map[string]any)
+	if nextCapability == nil {
+		nextCapability = map[string]any{}
+	}
+	if capabilitySupported(nextCapability) {
+		if preserveState && strings.TrimSpace(stringFromAny(nextCapability["state"])) == "" {
+			if previousState := strings.TrimSpace(stringFromAny(prevCapability["state"])); previousState != "" {
+				nextCapability["state"] = previousState
+			}
+		}
+		merged[key] = nextCapability
+		return
+	}
+
+	nextCapability["supported"] = true
+	if preserveState {
+		if previousState := strings.TrimSpace(stringFromAny(prevCapability["state"])); previousState != "" {
+			nextCapability["state"] = previousState
+		}
+	}
+	merged[key] = nextCapability
+}
+
+func capabilitySupported(capability map[string]any) bool {
+	if capability == nil {
+		return false
+	}
+	switch typed := capability["supported"].(type) {
+	case bool:
+		return typed
+	case string:
+		normalized := strings.TrimSpace(strings.ToLower(typed))
+		return normalized == "true"
+	default:
+		return false
+	}
 }
 
 func filamentCapability(capabilities map[string]any) map[string]any {
@@ -5602,6 +5964,16 @@ func resolveRuntimeFilamentCapability(binding edgeBinding, current *currentState
 	prevStateSource := firstNonEmpty(strings.TrimSpace(stringFromAny(filamentCapability(previousCapabilities)["state_source"])), filamentStateSourceUnknown)
 	prevSourceKind := normalizeFilamentSourceKind(stringFromAny(filamentCapability(previousCapabilities)["source_kind"]))
 	prevSourceLabel := filamentCapabilitySourceLabel(previousCapabilities)
+	prevActionState := normalizeFilamentActionState(stringFromAny(filamentCapability(previousCapabilities)["action_state"]))
+	prevStartedAt := filamentCapabilityActionStartedAt(previousCapabilities)
+
+	if (actionState == filamentActionStateLoading || actionState == filamentActionStateUnloading) && startedAt.IsZero() {
+		if prevActionState == actionState && !prevStartedAt.IsZero() {
+			startedAt = prevStartedAt
+		} else {
+			startedAt = now
+		}
+	}
 
 	setCurrent := func(nextState, nextActionState, nextStateSource, nextConfidence, nextSourceKind, nextSourceLabel string, nextStartedAt time.Time) {
 		setFilamentCapabilityState(
@@ -8611,7 +8983,7 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		}
 		lanSnapshot, lanErr := a.fetchBambuLANSnapshotFromEndpoint(ctx, binding.EndpointURL)
 		if lanErr == nil && !runtimeFailureThresholdReached {
-			lanSnapshot.CommandCapabilities = unsupportedBambuCommandCapabilities()
+			lanSnapshot.CommandCapabilities = a.fallbackBambuCommandCapabilities(printerID)
 			return lanSnapshot, nil
 		}
 		if runtimeFailureThresholdReached {
@@ -8620,7 +8992,7 @@ func (a *agent) fetchBindingSnapshotDetailed(ctx context.Context, binding edgeBi
 		if a.isBambuAuthReady() {
 			snapshot, err := a.fetchBambuCloudSnapshotFromEndpoint(ctx, binding.EndpointURL)
 			if err == nil {
-				snapshot.CommandCapabilities = unsupportedBambuCommandCapabilities()
+				snapshot.CommandCapabilities = a.fallbackBambuCommandCapabilities(printerID)
 				return snapshot, nil
 			}
 			var offlineErr *bambuCloudDeviceOfflineError

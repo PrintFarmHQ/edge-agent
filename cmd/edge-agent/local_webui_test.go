@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -789,33 +788,6 @@ func TestBambuCameraHelperMJPEGURLUsesTemplatePlaceholders(t *testing.T) {
 	}
 }
 
-func TestReadNextJPEGFrameSkipsLeadingNoise(t *testing.T) {
-	frame, err := readNextJPEGFrame(bytes.NewReader(append(
-		[]byte("BambuTunnel::GetMsg(1)\n"),
-		[]byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}...,
-	)))
-	if err != nil {
-		t.Fatalf("readNextJPEGFrame failed: %v", err)
-	}
-	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9}) {
-		t.Fatalf("frame = %v, want JPEG payload", frame)
-	}
-}
-
-func TestReadNextJPEGFrameStopsAtFirstFrame(t *testing.T) {
-	payload := append(
-		[]byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9},
-		[]byte{0xFF, 0xD8, 0xBB, 0xFF, 0xD9}...,
-	)
-	frame, err := readNextJPEGFrame(bytes.NewReader(payload))
-	if err != nil {
-		t.Fatalf("readNextJPEGFrame failed: %v", err)
-	}
-	if !bytes.Equal(frame, []byte{0xFF, 0xD8, 0xAA, 0xFF, 0xD9}) {
-		t.Fatalf("frame = %v, want first JPEG frame", frame)
-	}
-}
-
 func TestParseInternalBambuCameraPath(t *testing.T) {
 	serial, resource, ok := parseInternalBambuCameraPath("/internal/camera/v1/bambu/01P00C511601082/stream.mjpeg")
 	if !ok {
@@ -871,8 +843,8 @@ func TestInternalBambuCameraRouteProxiesRuntimeStream(t *testing.T) {
 				Host:              req.Host,
 				AccessCode:        req.AccessCode,
 				Support:           bambucamera.SupportInfo{Status: bambucamera.SupportStatusTestedSupported, DirectlyTested: true},
+				PluginDir:         "/tmp/plugins",
 				PluginLibraryPath: "/tmp/libBambuSource.dylib",
-				HelperBinaryPath:  "/tmp/BambuP1Streamer",
 			}, nil
 		},
 	}

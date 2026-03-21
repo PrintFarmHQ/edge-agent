@@ -28,6 +28,7 @@ DISCOVERY_PROBE_TIMEOUT_MS ?= 2500
 
 GOCACHE ?= $(CURDIR)/.cache/go-build
 GOMODCACHE ?= $(CURDIR)/.cache/go-mod
+CGO_ENABLED ?= 1
 
 .DEFAULT_GOAL := help
 
@@ -39,7 +40,7 @@ help: ## Show available edge-agent commands
 build: ## Build local edge-agent binary (bin/edge-agent)
 	@mkdir -p "$(BIN_DIR)" "$(GOCACHE)" "$(GOMODCACHE)"
 	@$(MAKE) --no-print-directory webui-build
-	@GOCACHE="$(GOCACHE)" GOMODCACHE="$(GOMODCACHE)" CGO_ENABLED=0 go build -o "$(BIN_PATH)" ./cmd/edge-agent
+	@GOCACHE="$(GOCACHE)" GOMODCACHE="$(GOMODCACHE)" CGO_ENABLED="$(CGO_ENABLED)" go build -o "$(BIN_PATH)" ./cmd/edge-agent
 	@echo "Built native binary: $(BIN_PATH)"
 
 webui-build: ## Refresh embedded local web UI assets

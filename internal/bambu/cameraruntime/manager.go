@@ -5,20 +5,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"embed"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
-
-//go:embed assets/**
-var assetsFS embed.FS
 
 type SupportStatus string
 
@@ -49,7 +44,6 @@ type Handle struct {
 	Support           SupportInfo
 	PluginDir         string
 	PluginLibraryPath string
-	HelperBinaryPath  string
 }
 
 type Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
@@ -65,8 +59,6 @@ type Manager struct {
 }
 
 const (
-	defaultAssetsSubdir  = "assets"
-	defaultBinSubdir     = "bin"
 	defaultPluginsSubdir = "plugins"
 	bambuPluginVersion   = "01.04.00.15"
 )
@@ -147,7 +139,7 @@ func ClassifySupport(model string) SupportInfo {
 }
 
 func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error) {
-	if m == nil || m.Runner == nil {
+	if m == nil {
 		return Handle{}, errors.New("bambu_camera_runtime_unavailable: runtime manager is not configured")
 	}
 	if strings.TrimSpace(req.Serial) == "" {
@@ -169,16 +161,9 @@ func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error)
 		)
 	}
 
-	if err := m.ensureEmbeddedAssets(); err != nil {
-		return Handle{}, fmt.Errorf("bambu_camera_runtime_init_failed: %w", err)
-	}
 	pluginDir, pluginLib, err := m.ensurePluginBundle(ctx)
 	if err != nil {
 		return Handle{}, fmt.Errorf("bambu_camera_runtime_unavailable: %w", err)
-	}
-	helperBinary, err := m.ensureHelperBinary(ctx)
-	if err != nil {
-		return Handle{}, err
 	}
 
 	return Handle{
@@ -188,87 +173,7 @@ func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error)
 		Support:           support,
 		PluginDir:         pluginDir,
 		PluginLibraryPath: pluginLib,
-		HelperBinaryPath:  helperBinary,
 	}, nil
-}
-
-func (m *Manager) ensureEmbeddedAssets() error {
-	root := filepath.Join(m.StateDir, defaultAssetsSubdir)
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return err
-	}
-	return fs.WalkDir(assetsFS, "assets", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel := strings.TrimPrefix(path, "assets")
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" {
-			return nil
-		}
-		target := filepath.Join(root, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		data, readErr := assetsFS.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0o644)
-	})
-}
-
-func (m *Manager) ensureHelperBinary(ctx context.Context) (string, error) {
-	compiler, err := findCompiler()
-	if err != nil {
-		return "", fmt.Errorf("bambu_camera_runtime_unavailable: %w", err)
-	}
-
-	binDir := filepath.Join(m.StateDir, defaultBinSubdir)
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		return "", fmt.Errorf("bambu_camera_runtime_init_failed: create runtime bin dir: %w", err)
-	}
-	target := filepath.Join(binDir, helperBinaryName())
-	if _, statErr := os.Stat(target); statErr == nil {
-		return target, nil
-	}
-
-	sourceRoot := filepath.Join(m.StateDir, defaultAssetsSubdir, "src")
-	source := filepath.Join(sourceRoot, "BambuP1Streamer.cpp")
-	if _, err := m.Runner(ctx, compiler, source, "-o", target); err != nil {
-		return "", fmt.Errorf("bambu_camera_runtime_init_failed: compile helper binary with %s: %w", compiler, err)
-	}
-	if err := os.Chmod(target, 0o755); err != nil {
-		return "", fmt.Errorf("bambu_camera_runtime_init_failed: chmod helper binary: %w", err)
-	}
-	return target, nil
-}
-
-func helperBinaryName() string {
-	if runtime.GOOS == "windows" {
-		return "BambuP1Streamer.exe"
-	}
-	return "BambuP1Streamer"
-}
-
-func findCompiler() (string, error) {
-	candidates := []string{"c++", "clang++", "g++"}
-	pathEnv := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
-	for _, candidate := range candidates {
-		for _, dir := range pathEnv {
-			if dir == "" {
-				continue
-			}
-			target := filepath.Join(dir, candidate)
-			if info, err := os.Stat(target); err == nil && !info.IsDir() {
-				return target, nil
-			}
-		}
-	}
-	return "", errors.New("no supported C++ compiler found in PATH")
 }
 
 func (m *Manager) ensurePluginBundle(ctx context.Context) (dir string, sourceLibrary string, err error) {

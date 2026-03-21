@@ -63,10 +63,6 @@ Current runtime-owned paths live under the edge state directory:
 
 - runtime root:
   - `~/.printfarmhq/bambu/camera_runtime/`
-- embedded helper source/assets:
-  - `~/.printfarmhq/bambu/camera_runtime/assets/`
-- compiled helper binary:
-  - `~/.printfarmhq/bambu/camera_runtime/bin/`
 - pinned plugin bundle cache:
   - `~/.printfarmhq/bambu/camera_runtime/plugins/<goos>/<version>/`
 
@@ -74,11 +70,6 @@ Example:
 
 ```text
 ~/.printfarmhq/bambu/camera_runtime/
-  assets/
-    src/BambuP1Streamer.cpp
-    src/BambuTunnel.h
-  bin/
-    BambuP1Streamer
   plugins/
     darwin/
       01.04.00.15/
@@ -118,20 +109,15 @@ The runtime currently pins these official plugin archives:
     - `BambuSource.dll`
     - `bambu_networking.dll`
 
-## Helper Runtime
+## Go Runtime
 
-`edge-agent` currently compiles a small native helper from embedded source:
+`edge-agent` now loads the pinned Bambu plugin libraries directly through an in-process Go runtime with a small `cgo` bridge.
 
-- `BambuP1Streamer.cpp`
-- `BambuTunnel.h`
+This means:
 
-That helper is built locally into the runtime bin directory and invoked as a child process by `edge-agent`.
-
-Important current constraint:
-
-- this means the host still needs a working C++ compiler toolchain available in `PATH`
-
-This is still preferable to a user-managed container or sidecar because the operator only launches `edge-agent`, but it is not yet a zero-toolchain distribution story.
+- there is no user-managed helper process,
+- there is no local helper compilation step,
+- the operator still runs only `edge-agent`.
 
 ## Support Matrix
 
@@ -164,8 +150,7 @@ Camera startup must fail closed for cases such as:
 - pinned plugin archive missing,
 - pinned plugin archive checksum mismatch,
 - required plugin library missing after extraction,
-- helper compile failure,
-- helper runtime launch failure,
+- native runtime initialization failure,
 - unsupported or unverified Bambu family.
 
 The user-facing error should be specific and actionable, but it must not leak secrets like access codes.
