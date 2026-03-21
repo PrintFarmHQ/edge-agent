@@ -8,19 +8,15 @@ import (
 )
 
 const (
-	ansiReset   = "\033[0m"
-	ansiBold    = "\033[1m"
-	ansiCyan    = "\033[36m"
-	ansiGreen   = "\033[32m"
-	ansiYellow  = "\033[33m"
-	ansiMagenta = "\033[35m"
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiCyan   = "\033[36m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
 )
 
 type startupBannerInfo struct {
 	DashboardURL    string
-	DashboardPort   string
-	SetupURL        string
-	ControlPlaneURL string
 	EnabledAdapters []string
 	ShowAlertOnly   bool
 	AlertMessage    string
@@ -47,10 +43,7 @@ func buildStartupBanner(info startupBannerInfo, colorize bool) string {
 		title = ansiBold + ansiCyan + title + ansiReset
 	}
 
-	setupURL := firstNonEmpty(strings.TrimSpace(info.SetupURL), "unavailable")
 	dashboardURL := firstNonEmpty(strings.TrimSpace(info.DashboardURL), "unavailable")
-	dashboardPort := firstNonEmpty(strings.TrimSpace(info.DashboardPort), "n/a")
-	controlPlaneURL := firstNonEmpty(strings.TrimSpace(info.ControlPlaneURL), "not configured")
 	adapters := strings.Join(info.EnabledAdapters, ", ")
 	if strings.TrimSpace(adapters) == "" {
 		adapters = "none"
@@ -60,16 +53,12 @@ func buildStartupBanner(info startupBannerInfo, colorize bool) string {
 	if info.ShowAlertOnly {
 		lines = append(lines,
 			fmt.Sprintf("%s %s", color(ansiGreen, "Dashboard"), dashboardURL),
-			fmt.Sprintf("%s %s", color(ansiYellow, "Port     "), dashboardPort),
 			fmt.Sprintf("%s %s", color(ansiYellow, "Alert    "), firstNonEmpty(strings.TrimSpace(info.AlertMessage), "Paste a valid API key in the dashboard.")),
 		)
 	} else {
 		lines = append(lines,
 			fmt.Sprintf("%s %s", color(ansiGreen, "Dashboard"), dashboardURL),
-			fmt.Sprintf("%s %s", color(ansiYellow, "Port     "), dashboardPort),
-			fmt.Sprintf("%s %s", color(ansiMagenta, "Entry    "), setupURL),
 			fmt.Sprintf("%s %s", color(ansiCyan, "Adapters "), adapters),
-			fmt.Sprintf("%s %s", color(ansiCyan, "Control  "), controlPlaneURL),
 		)
 	}
 
