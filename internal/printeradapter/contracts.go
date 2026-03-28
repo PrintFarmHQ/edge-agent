@@ -22,6 +22,35 @@ type RuntimeSnapshot struct {
 	DetectedModelHint string
 }
 
+type PanelKey string
+
+const (
+	PanelStatus   PanelKey = "status"
+	PanelQueue    PanelKey = "queue"
+	PanelCamera   PanelKey = "camera"
+	PanelControls PanelKey = "controls"
+)
+
+type SupportTier string
+
+const (
+	SupportTierOfficial     SupportTier = "official"
+	SupportTierCommunity    SupportTier = "community"
+	SupportTierExperimental SupportTier = "experimental"
+	SupportTierGeneric      SupportTier = "generic"
+	SupportTierUnsupported  SupportTier = "unsupported"
+)
+
+type ProfileDescriptor struct {
+	Key               string
+	Family            string
+	DisplayName       string
+	SupportTier       SupportTier
+	SupportedPanels   []PanelKey
+	UnsupportedReason string
+	DocumentationSlug string
+}
+
 type CameraMode string
 
 const (
@@ -52,22 +81,66 @@ type ActionState struct {
 	ReasonUnavailable string
 }
 
+type ControlSelectorOption struct {
+	ID    string
+	Label string
+}
+
+type ControlSelector struct {
+	ID      string
+	Label   string
+	Scope   string
+	Options []ControlSelectorOption
+}
+
+type ControlReadout struct {
+	ID       string
+	Label    string
+	Scope    string
+	Writable bool
+}
+
+type ControlAction struct {
+	ID         string
+	Label      string
+	CommandKey string
+}
+
+type ControlSection struct {
+	ID        string
+	Label     string
+	Selectors []ControlSelector
+	Readouts  []ControlReadout
+	Actions   []ControlAction
+}
+
+type ControlSchema struct {
+	Sections []ControlSection
+}
+
+type MaterialSystemDescriptor struct {
+	ID        string
+	Kind      string
+	Label     string
+	SlotCount int
+}
+
 type CommandCatalog struct {
-	PrintStart       ActionState
-	PrintPause       ActionState
-	PrintResume      ActionState
-	PrintStop        ActionState
-	LightOn          ActionState
-	LightOff         ActionState
-	LoadFilament     ActionState
-	UnloadFilament   ActionState
+	PrintStart     ActionState
+	PrintPause     ActionState
+	PrintResume    ActionState
+	PrintStop      ActionState
+	LightOn        ActionState
+	LightOff       ActionState
+	LoadFilament   ActionState
+	UnloadFilament ActionState
 }
 
 type StartPrintRequest struct {
-	ArtifactURL     string
-	ChecksumSHA256  string
-	JobID           string
-	PlateID         int
+	ArtifactURL    string
+	ChecksumSHA256 string
+	JobID          string
+	PlateID        int
 }
 
 type CoreAdapter interface {
@@ -96,6 +169,14 @@ type LightAdapter interface {
 type FilamentAdapter interface {
 	LoadFilament(ctx context.Context, binding Binding) error
 	UnloadFilament(ctx context.Context, binding Binding) error
+}
+
+type ControlAdapter interface {
+	DescribeControlSchema(ctx context.Context, binding Binding, snapshot RuntimeSnapshot) (ControlSchema, error)
+}
+
+type MaterialSystemAdapter interface {
+	DescribeMaterialSystems(ctx context.Context, binding Binding, snapshot RuntimeSnapshot) ([]MaterialSystemDescriptor, error)
 }
 
 type CapabilityAdapter interface {

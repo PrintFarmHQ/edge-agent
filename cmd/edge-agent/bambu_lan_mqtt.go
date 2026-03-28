@@ -1197,16 +1197,18 @@ func parseBambuLANTemperatureStatus(currentRaw any, targetRaw any) printerTemper
 	status := printerTemperatureStatus{}
 	if current, ok := bambuLANValueAsFloat(currentRaw); ok {
 		status.Current = &current
+		status.Available = true
 	}
 	if target, ok := bambuLANValueAsFloat(targetRaw); ok {
 		status.Target = &target
+		status.Available = true
 	}
 	return status
 }
 
 func parseBambuLANFanStatuses(raw map[string]any) map[string]printerFanStatus {
 	fans := map[string]printerFanStatus{}
-	appendFan := func(key string, value any) {
+	appendFan := func(key string, label string, value any) {
 		if value == nil {
 			return
 		}
@@ -1215,13 +1217,14 @@ func parseBambuLANFanStatuses(raw map[string]any) map[string]printerFanStatus {
 			return
 		}
 		fans[key] = printerFanStatus{
+			Label:     label,
 			Supported: true,
 			State:     state,
 		}
 	}
-	appendFan("part_cooling", raw["cooling_fan_speed"])
-	appendFan("auxiliary", raw["big_fan1_speed"])
-	appendFan("chamber", raw["big_fan2_speed"])
+	appendFan("part_cooling", "Part Cooling", raw["cooling_fan_speed"])
+	appendFan("auxiliary", "Auxiliary", raw["big_fan1_speed"])
+	appendFan("chamber", "Chamber", raw["big_fan2_speed"])
 	return fans
 }
 

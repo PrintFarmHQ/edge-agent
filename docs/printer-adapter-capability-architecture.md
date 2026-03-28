@@ -36,6 +36,7 @@ Adapter code should live under:
 Planned structure:
 - `edge-agent/internal/printeradapter/contracts.go`
 - `edge-agent/internal/printeradapter/registry.go`
+- `edge-agent/internal/printeradapter/catalog/` or equivalent profile metadata source
 - `edge-agent/internal/printeradapter/moonraker/`
 - `edge-agent/internal/printeradapter/moonraker/snapmaker/`
 - `edge-agent/internal/printeradapter/bambu/`
@@ -114,6 +115,20 @@ Every adapter must implement:
 - `Family() string`
 - `FetchRuntimeSnapshot(ctx, binding) (RuntimeSnapshot, error)`
 
+### Profile resolution
+
+The adapter layer should also resolve a stable printer support profile such as:
+- `moonraker.generic`
+- `moonraker.snapmaker_u1`
+- `bambu.p1_family`
+- `unsupported.unknown_adapter`
+
+That profile metadata should carry:
+- support tier
+- supported panels
+- documentation slug
+- truthful unsupported reason when no profile matches
+
 ### Camera capability
 
 Adapters that support camera must implement:
@@ -189,10 +204,14 @@ The same principles apply:
 - adapter-owned execution
 - truthful unavailable reasons
 
-For the current Bambu slice specifically:
+For the current shipped slices specifically:
+- Moonraker now also exposes the SaaS-side Print Jobs `Control` panel through truthfully normalized control-status telemetry and `printer/gcode/script` execution.
+- Snapmaker-specific behavior stays narrow inside the Moonraker family:
+  - camera `monitor.jpg` snapshot polling plus `camera.start_monitor`
+  - LED-object fallback such as `led cavity_led`
 - temperatures and fan read-state come from local MQTT runtime telemetry
 - motion/home and fan writes route through local MQTT `gcode_line`
-- the SaaS-side Print Jobs `Control` panel is Bambu-only until equivalent truthfully normalized contracts exist for other adapters
+- Bambu keeps its MQTT-specific execution path, but the SaaS-side `Control` contract is no longer Bambu-only
 
 ## Implementation Expectations
 

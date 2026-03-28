@@ -10,6 +10,20 @@ Intended layout:
 - `moonraker/snapmaker/`: Snapmaker-specific fallback behavior under the Moonraker family
 - `bambu/`: Bambu-family implementation and helper-backed camera support
 
+Current architecture direction:
+- `registry.go` is the profile catalog and fallback resolver
+- profiles are matched from adapter family plus detected model/runtime hints
+- the resolver publishes printer support metadata such as:
+  - `profile_key`
+  - `support_tier`
+  - `supported_panels`
+  - `documentation_slug`
+- richer extensibility should build on capability-specific contracts such as:
+  - `ControlAdapter` for schema-driven control surfaces
+  - `MaterialSystemAdapter` for AMS/toolchanger/material-system descriptions
+- edge-agent remains the source of truth for runtime support metadata
+- SaaS and frontend should consume the resolved profile instead of inferring support from business `printer_type`
+
 Current rule:
 - generic adapter behavior first
 - printer-family-specific fallback second
