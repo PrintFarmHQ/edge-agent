@@ -23,6 +23,7 @@
 3. SaaS creates or confirms printer + binding.
 4. Agent refreshes runtime state for bound printers using canonical state mapping.
 5. SaaS projects connectivity and availability in Printers UI.
+6. If a bound printer becomes unreachable while the agent is still healthy, SaaS can launch targeted discovery recovery and, when identity evidence is strong, update the effective connection target without requiring the operator to re-adopt the printer.
 
 ## Compatibility Rule
 

@@ -26,9 +26,20 @@ printer/job runtime state, but it does tell SaaS which command-center controls a
 currently supported by the selected printer and, when applicable, the last known LED state,
 filament state, and filament action progress.
 
-Bambu now also has a separate high-frequency control-status telemetry path.
+When a printer rejects an action, `edge-agent` should prefer a concise printer-facing
+message in `last_error_message` and printer-command acknowledgements, instead of forwarding
+full transport wrappers or vendor tracebacks to SaaS/UI. Full raw errors may still remain
+in edge audit logs for debugging.
+
+Supported adapters may also have a separate high-frequency control-status telemetry path.
 That path is for operator-facing live control data such as temperatures and fan states,
 not for the canonical printer/job runtime state machine.
+
+## Convergence Safety Rule
+
+When SaaS does not actively own a printer/job lifecycle, it should not publish a default
+`idle` desired target for that printer. In that state, edge-agent must treat printer-side
+activity as authoritative external activity, not as drift to correct by stopping the printer.
 
 ## Provider Mapping
 
@@ -45,6 +56,11 @@ not for the canonical printer/job runtime state machine.
   - filament load/unload support comes from the presence of `gcode_macro LOAD_FILAMENT` and `gcode_macro UNLOAD_FILAMENT`
   - a truthful single-button filament UX additionally requires a real `filament_switch_sensor` or `filament_motion_sensor`
   - filament action progress can transiently report `loading` or `unloading`; if the sensor never converges, edge-agent falls back to `unknown`
+ - control-status telemetry is now also reported separately from canonical runtime state:
+   - nozzle and optional bed/chamber temperatures come from Moonraker object queries
+   - writable fan read-state comes from standard `fan` and `fan_generic` objects
+   - motion/home and heater/fan writes use Moonraker `printer/gcode/script`
+   - edge-agent pushes Moonraker control-status telemetry to SaaS every second, and SaaS retains the last 60 seconds for the Print Jobs `Control` panel
 
 ### Bambu Cloud
 

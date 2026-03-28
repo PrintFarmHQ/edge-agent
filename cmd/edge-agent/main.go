@@ -35,10 +35,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
 	bambucamera "printfarmhq/edge-agent/internal/bambu/cameraruntime"
 	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
+	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
+	snapmakeru1 "printfarmhq/edge-agent/internal/printeradapter/moonraker/snapmaker_u1"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -56,6 +59,7 @@ const (
 	discoverySourceLocalSubnets  = "local_private_subnets"
 	discoverySourceBambuConnect  = "bambu_connect"
 	discoverySourceBambuCloud    = "bambu_cloud"
+	recoveryAppendCIDRTargetsKey = "append_cidr_targets"
 	telemetrySourceBambuCloud    = "bambu_cloud"
 	telemetrySourceBambuConnect  = "bambu_connect"
 	defaultBambuMQTTTopic        = "device/%s/request"
@@ -270,11 +274,13 @@ type currentStateItem struct {
 }
 
 type printerTemperatureStatus struct {
-	Current *float64 `json:"current,omitempty"`
-	Target  *float64 `json:"target,omitempty"`
+	Available bool     `json:"available"`
+	Current   *float64 `json:"current,omitempty"`
+	Target    *float64 `json:"target,omitempty"`
 }
 
 type printerFanStatus struct {
+	Label     string `json:"label,omitempty"`
 	Supported bool   `json:"supported"`
 	State     string `json:"state,omitempty"`
 }
@@ -2369,7 +2375,7 @@ func (a *agent) acknowledgePrinterCommand(
 
 	reqBody := printerCommandAckRequest{
 		Status: strings.TrimSpace(statusValue),
-		Error:  strings.TrimSpace(errorValue),
+		Error:  summarizePrinterCommandAckError(errorValue),
 	}
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
@@ -2405,6 +2411,49 @@ func (a *agent) acknowledgePrinterCommand(
 		return errors.New("printer command ack not accepted")
 	}
 	return nil
+}
+
+func summarizePrinterCommandAckError(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	if match := regexp.MustCompile(`WebRequestError:\s*([^"{]+)`).FindStringSubmatch(trimmed); len(match) > 1 {
+		return truncatePrinterCommandAckError(match[1])
+	}
+	if match := regexp.MustCompile(`"message"\s*:\s*"([^"]+)\"`).FindStringSubmatch(trimmed); len(match) > 1 {
+		message := strings.TrimSpace(strings.ReplaceAll(match[1], `\"`, `"`))
+		message = strings.TrimSpace(strings.TrimPrefix(message, "WebRequestError:"))
+		return truncatePrinterCommandAckError(message)
+	}
+	if bodyIdx := strings.Index(trimmed, "body="); bodyIdx >= 0 {
+		body := strings.TrimSpace(trimmed[bodyIdx+len("body="):])
+		var payload struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(body), &payload); err == nil {
+			message := strings.TrimSpace(strings.TrimPrefix(payload.Error.Message, "WebRequestError:"))
+			if message != "" {
+				return truncatePrinterCommandAckError(message)
+			}
+		}
+	}
+	return truncatePrinterCommandAckError(trimmed)
+}
+
+func truncatePrinterCommandAckError(message string) string {
+	trimmed := strings.TrimSpace(message)
+	if len(trimmed) <= 1000 {
+		return trimmed
+	}
+	return strings.TrimSpace(trimmed[:1000])
+}
+
+func summarizePrinterFacingActionError(raw string) string {
+	return summarizePrinterCommandAckError(raw)
 }
 
 func (a *agent) cameraSessionsPollLoop(ctx context.Context, wg *sync.WaitGroup) {
@@ -3764,6 +3813,8 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 	}
 
 	if err := a.executeAction(ctx, queuedAction, binding); err != nil {
+		rawErrorMessage := strings.TrimSpace(err.Error())
+		printerFacingErrorMessage := summarizePrinterFacingActionError(rawErrorMessage)
 		code, retryable := classifyActionError(err)
 		if code == "connectivity_error" {
 			if a.tryRecoverUncertainConnectivityAction(ctx, queuedAction, binding) {
@@ -3775,10 +3826,19 @@ func (a *agent) executeNextAction(ctx context.Context) error {
 				return nil
 			}
 		}
+		if rawErrorMessage != "" && rawErrorMessage != printerFacingErrorMessage {
+			a.audit("action_failure_raw", map[string]any{
+				"printer_id":         queuedAction.PrinterID,
+				"kind":               queuedAction.Kind,
+				"command_request_id": queuedAction.CommandRequestID,
+				"error_code":         code,
+				"raw_error_message":  rawErrorMessage,
+			})
+		}
 		terminalFailure := !retryable || queuedAction.Attempts >= a.cfg.ActionMaxAttempts
-		a.handleActionFailure(queuedAction, code, err.Error(), retryable)
+		a.handleActionFailure(queuedAction, code, printerFacingErrorMessage, retryable)
 		if queuedAction.CommandRequestID != 0 && terminalFailure {
-			if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "failed", err.Error()); ackErr != nil {
+			if ackErr := a.acknowledgePrinterCommand(ctx, bootstrap, queuedAction.CommandRequestID, "failed", printerFacingErrorMessage); ackErr != nil {
 				return ackErr
 			}
 		}
@@ -4113,6 +4173,8 @@ func (a *agent) executeMoonrakerAction(ctx context.Context, queuedAction action,
 		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "LOAD_FILAMENT")
 	case "unload_filament":
 		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "UNLOAD_FILAMENT")
+	case "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
+		return a.executeMoonrakerPrinterCommand(ctx, binding.EndpointURL, queuedAction)
 	default:
 		return fmt.Errorf("unsupported action kind: %s", queuedAction.Kind)
 	}
@@ -5141,7 +5203,24 @@ func (a *agent) executePrintAction(ctx context.Context, queuedAction action, bin
 }
 
 func (a *agent) callMoonrakerPost(ctx context.Context, endpointURL, path string, payload any) error {
-	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	return a.callMoonrakerPostWithTimeout(ctx, endpointURL, path, payload, a.cfg.MoonrakerRequestTimeout)
+}
+
+func (a *agent) callMoonrakerPostWithTimeout(
+	ctx context.Context,
+	endpointURL string,
+	path string,
+	payload any,
+	timeout time.Duration,
+) error {
+	requestTimeout := timeout
+	if requestTimeout <= 0 {
+		requestTimeout = a.cfg.MoonrakerRequestTimeout
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = 8 * time.Second
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
 	body := bytes.NewBuffer(nil)
@@ -5168,6 +5247,20 @@ func (a *agent) callMoonrakerPost(ctx context.Context, endpointURL, path string,
 		return fmt.Errorf("moonraker %s failed: status=%d body=%s", path, resp.StatusCode, string(msg))
 	}
 	return nil
+}
+
+func (a *agent) isSnapmakerU1Printer(printerID int) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	current, ok := a.currentState[printerID]
+	if !ok || current.CommandCapabilities == nil {
+		return false
+	}
+	rawSupport, ok := current.CommandCapabilities["printer_support"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(stringFromAny(rawSupport["profile_key"])), snapmakeru1.ProfileKey)
 }
 
 type moonrakerPowerDevice struct {
@@ -5228,6 +5321,323 @@ func (a *agent) executeMoonrakerGCodeMacroAction(ctx context.Context, endpointUR
 		"/printer/gcode/script",
 		map[string]string{"script": strings.TrimSpace(macroName)},
 	)
+}
+
+func (a *agent) executeMoonrakerPrinterCommand(ctx context.Context, endpointURL string, queuedAction action) error {
+	var (
+		script         string
+		err            error
+		requestTimeout time.Duration
+	)
+	switch strings.TrimSpace(queuedAction.Kind) {
+	case "home_axes":
+		if a.isSnapmakerU1Printer(queuedAction.PrinterID) {
+			script, err = buildSnapmakerU1HomeAxesScript(queuedAction.Payload)
+		} else {
+			script, err = buildMoonrakerHomeAxesScript(queuedAction.Payload)
+		}
+		requestTimeout = moonrakerHomeRequestTimeout(a.cfg.MoonrakerRequestTimeout)
+	case "jog_motion":
+		script, err = buildMoonrakerJogMotionProgram(queuedAction.Payload)
+	case "jog_motion_batch":
+		script, err = buildMoonrakerJogMotionBatchProgram(queuedAction.Payload)
+	case "set_fan_enabled":
+		script, err = buildMoonrakerFanControlGCode(queuedAction.Payload)
+	case "set_nozzle_temperature":
+		var heaterName string
+		heaterName, err = a.fetchMoonrakerActiveExtruderName(ctx, endpointURL)
+		if err == nil {
+			script, err = buildMoonrakerHeaterTemperatureGCode(heaterName, queuedAction.Payload, "set_nozzle_temperature")
+		}
+	case "set_bed_temperature":
+		script, err = buildMoonrakerHeaterTemperatureGCode("heater_bed", queuedAction.Payload, "set_bed_temperature")
+	default:
+		return fmt.Errorf("unsupported moonraker printer command kind: %s", queuedAction.Kind)
+	}
+	if err != nil {
+		return err
+	}
+	if requestTimeout > 0 {
+		return a.callMoonrakerPostWithTimeout(
+			ctx,
+			endpointURL,
+			"/printer/gcode/script",
+			map[string]string{"script": script},
+			requestTimeout,
+		)
+	}
+	return a.callMoonrakerPost(
+		ctx,
+		endpointURL,
+		"/printer/gcode/script",
+		map[string]string{"script": script},
+	)
+}
+
+type moonrakerJogMotionStep struct {
+	Axis     string
+	Distance float64
+	FeedRate int
+}
+
+const (
+	moonrakerXYJogFeedRateMMPerMin = 6000
+	moonrakerZJogFeedRateMMPerMin  = 300
+)
+
+func buildMoonrakerHomeAxesScript(payload map[string]any) (string, error) {
+	axes := []string{"X", "Y", "Z"}
+	if len(payload) > 0 {
+		rawAxes, exists := payload["axes"]
+		if exists {
+			typedAxes, ok := rawAxes.([]any)
+			if !ok || len(typedAxes) == 0 {
+				return "", errors.New("validation_error: home_axes requires a non-empty axes array")
+			}
+			axes = axes[:0]
+			seen := map[string]struct{}{}
+			for _, rawAxis := range typedAxes {
+				axis := strings.ToUpper(strings.TrimSpace(stringFromAny(rawAxis)))
+				switch axis {
+				case "X", "Y", "Z":
+				default:
+					return "", fmt.Errorf("validation_error: unsupported home axis %q", axis)
+				}
+				if _, exists := seen[axis]; exists {
+					continue
+				}
+				seen[axis] = struct{}{}
+				axes = append(axes, axis)
+			}
+			if len(axes) == 0 {
+				return "", errors.New("validation_error: home_axes requires at least one valid axis")
+			}
+		}
+	}
+	if len(axes) == 3 {
+		return "G28", nil
+	}
+	return "G28 " + strings.Join(axes, " "), nil
+}
+
+func buildSnapmakerU1HomeAxesScript(payload map[string]any) (string, error) {
+	axes := []string{"X", "Y", "Z"}
+	if len(payload) > 0 {
+		rawAxes, exists := payload["axes"]
+		if exists {
+			typedAxes, ok := rawAxes.([]any)
+			if !ok || len(typedAxes) == 0 {
+				return "", errors.New("validation_error: home_axes requires a non-empty axes array")
+			}
+			axes = axes[:0]
+			seen := map[string]struct{}{}
+			for _, rawAxis := range typedAxes {
+				axis := strings.ToUpper(strings.TrimSpace(stringFromAny(rawAxis)))
+				switch axis {
+				case "X", "Y", "Z":
+				default:
+					return "", fmt.Errorf("validation_error: unsupported home axis %q", axis)
+				}
+				if _, exists := seen[axis]; exists {
+					continue
+				}
+				seen[axis] = struct{}{}
+				axes = append(axes, axis)
+			}
+			if len(axes) == 0 {
+				return "", errors.New("validation_error: home_axes requires at least one valid axis")
+			}
+		}
+	}
+	return snapmakeru1.BuildHomeScript(axes), nil
+}
+
+func buildMoonrakerJogMotionProgram(payload map[string]any) (string, error) {
+	step, err := parseMoonrakerJogMotionStep(payload)
+	if err != nil {
+		return "", err
+	}
+	return buildMoonrakerJogMotionProgramFromSteps([]moonrakerJogMotionStep{step}), nil
+}
+
+func buildMoonrakerJogMotionBatchProgram(payload map[string]any) (string, error) {
+	if len(payload) == 0 {
+		return "", errors.New("validation_error: jog_motion_batch requires payload")
+	}
+	rawSteps, exists := payload["steps"]
+	if !exists {
+		return "", errors.New("validation_error: jog_motion_batch requires steps")
+	}
+	typedSteps, ok := rawSteps.([]any)
+	if !ok || len(typedSteps) == 0 {
+		return "", errors.New("validation_error: jog_motion_batch requires a non-empty steps array")
+	}
+	steps := make([]moonrakerJogMotionStep, 0, len(typedSteps))
+	for _, rawStep := range typedSteps {
+		stepPayload, ok := rawStep.(map[string]any)
+		if !ok {
+			return "", errors.New("validation_error: jog_motion_batch steps must be objects")
+		}
+		step, err := parseMoonrakerJogMotionStep(stepPayload)
+		if err != nil {
+			return "", err
+		}
+		steps = append(steps, step)
+	}
+	return buildMoonrakerJogMotionProgramFromSteps(steps), nil
+}
+
+func parseMoonrakerJogMotionStep(payload map[string]any) (moonrakerJogMotionStep, error) {
+	if len(payload) == 0 {
+		return moonrakerJogMotionStep{}, errors.New("validation_error: jog_motion requires payload")
+	}
+	axis := strings.ToUpper(strings.TrimSpace(stringFromAny(payload["axis"])))
+	switch axis {
+	case "X", "Y", "Z":
+	default:
+		return moonrakerJogMotionStep{}, fmt.Errorf("validation_error: unsupported jog axis %q", axis)
+	}
+	distance, ok := moonrakerNumericValue(payload["distance_mm"])
+	if !ok {
+		return moonrakerJogMotionStep{}, errors.New("validation_error: jog_motion requires numeric distance_mm")
+	}
+	switch distance {
+	case -10, -1, 1, 10:
+	default:
+		return moonrakerJogMotionStep{}, fmt.Errorf("validation_error: unsupported jog distance %.3f", distance)
+	}
+	feedRate := moonrakerXYJogFeedRateMMPerMin
+	if axis == "Z" {
+		feedRate = moonrakerZJogFeedRateMMPerMin
+	}
+	return moonrakerJogMotionStep{Axis: axis, Distance: distance, FeedRate: feedRate}, nil
+}
+
+func buildMoonrakerJogMotionProgramFromSteps(steps []moonrakerJogMotionStep) string {
+	lines := make([]string, 0, len(steps)+4)
+	lines = append(lines, "SAVE_GCODE_STATE NAME=pfh_motion")
+	lines = append(lines, "G91")
+	for _, step := range steps {
+		lines = append(lines, fmt.Sprintf("G0 %s%g F%d", step.Axis, step.Distance, step.FeedRate))
+	}
+	lines = append(lines, "RESTORE_GCODE_STATE NAME=pfh_motion")
+	return strings.Join(lines, "\n")
+}
+
+func buildMoonrakerFanControlGCode(payload map[string]any) (string, error) {
+	if len(payload) == 0 {
+		return "", errors.New("validation_error: set_fan_enabled requires payload")
+	}
+	fanName := strings.ToLower(strings.TrimSpace(stringFromAny(payload["fan"])))
+	if fanName == "" {
+		return "", errors.New("validation_error: set_fan_enabled requires fan")
+	}
+	enabled, err := parseMoonrakerBoolPayload(payload, "enabled")
+	if err != nil {
+		return "", err
+	}
+	switch fanName {
+	case "fan":
+		if enabled {
+			return "M106 S255", nil
+		}
+		return "M107", nil
+	default:
+		if !strings.HasPrefix(fanName, "fan_generic ") {
+			return "", fmt.Errorf("validation_error: unsupported moonraker fan %q", fanName)
+		}
+		configName := strings.TrimSpace(strings.TrimPrefix(fanName, "fan_generic "))
+		if configName == "" {
+			return "", fmt.Errorf("validation_error: invalid moonraker fan %q", fanName)
+		}
+		speed := 0
+		if enabled {
+			speed = 1
+		}
+		return fmt.Sprintf("SET_FAN_SPEED FAN=%s SPEED=%d", configName, speed), nil
+	}
+}
+
+func buildMoonrakerHeaterTemperatureGCode(heaterName string, payload map[string]any, fieldName string) (string, error) {
+	trimmedHeaterName := strings.TrimSpace(heaterName)
+	if trimmedHeaterName == "" {
+		return "", fmt.Errorf("validation_error: %s heater is not available", fieldName)
+	}
+	target, err := parseMoonrakerTargetTemperaturePayload(payload, fieldName)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SET_HEATER_TEMPERATURE HEATER=%s TARGET=%d", trimmedHeaterName, target), nil
+}
+
+func parseMoonrakerBoolPayload(payload map[string]any, key string) (bool, error) {
+	rawValue, exists := payload[key]
+	if !exists {
+		return false, fmt.Errorf("validation_error: missing %s", key)
+	}
+	typedValue, ok := rawValue.(bool)
+	if !ok {
+		return false, fmt.Errorf("validation_error: %s must be boolean", key)
+	}
+	return typedValue, nil
+}
+
+func parseMoonrakerTargetTemperaturePayload(payload map[string]any, fieldName string) (int, error) {
+	if len(payload) == 0 {
+		return 0, fmt.Errorf("validation_error: %s requires payload", fieldName)
+	}
+	rawTarget, exists := payload["target_c"]
+	if !exists {
+		return 0, fmt.Errorf("validation_error: %s requires target_c", fieldName)
+	}
+	target, ok := moonrakerNumericValue(rawTarget)
+	if !ok {
+		return 0, fmt.Errorf("validation_error: %s requires numeric target_c", fieldName)
+	}
+	if target < 0 {
+		return 0, fmt.Errorf("validation_error: %s target_c must be >= 0", fieldName)
+	}
+	return int(target), nil
+}
+
+func moonrakerHomeRequestTimeout(defaultTimeout time.Duration) time.Duration {
+	if defaultTimeout >= snapmakeru1.HomeRequestTimeout {
+		return defaultTimeout
+	}
+	return snapmakeru1.HomeRequestTimeout
+}
+
+func moonrakerNumericValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		floatValue, err := typed.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return floatValue, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, false
+		}
+		floatValue, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return 0, false
+		}
+		return floatValue, true
+	default:
+		return 0, false
+	}
 }
 
 func (a *agent) fetchMoonrakerCommandCapabilities(ctx context.Context, endpointURL string) (map[string]any, error) {
@@ -5301,6 +5711,310 @@ func (a *agent) fetchMoonrakerCommandCapabilities(ctx context.Context, endpointU
 		return capabilities, errors.New(strings.Join(errs, "; "))
 	}
 	return capabilities, nil
+}
+
+type moonrakerWritableFan struct {
+	Key   string
+	Label string
+}
+
+type moonrakerControlLayout struct {
+	ToolheadPresent bool
+	ExtruderObjects []string
+	BedSupported    bool
+	ChamberSensor   string
+	Fans            []moonrakerWritableFan
+}
+
+func (a *agent) fetchMoonrakerControlStatus(ctx context.Context, endpointURL string) (printerControlStatusSnapshot, error) {
+	objects, err := a.fetchMoonrakerObjectList(ctx, endpointURL)
+	if err != nil {
+		return printerControlStatusSnapshot{}, err
+	}
+	layout := buildMoonrakerControlLayout(objects)
+	objectFields := map[string][]string{
+		"toolhead": {"extruder"},
+	}
+	for _, extruderObject := range layout.ExtruderObjects {
+		objectFields[extruderObject] = []string{"temperature", "target"}
+	}
+	if layout.BedSupported {
+		objectFields["heater_bed"] = []string{"temperature", "target"}
+	}
+	if strings.TrimSpace(layout.ChamberSensor) != "" {
+		objectFields[layout.ChamberSensor] = []string{"temperature"}
+	}
+	for _, fan := range layout.Fans {
+		objectFields[fan.Key] = []string{"speed"}
+	}
+
+	statusByObject, err := a.fetchMoonrakerObjectStatus(ctx, endpointURL, objectFields)
+	if err != nil {
+		return printerControlStatusSnapshot{}, err
+	}
+
+	selectedExtruder := moonrakerSelectedExtruderName(statusByObject, layout.ExtruderObjects)
+	fans := make(map[string]printerFanStatus, len(layout.Fans))
+	for _, fan := range layout.Fans {
+		fans[fan.Key] = moonrakerFanStatusFromObjectStatus(statusByObject[fan.Key], fan.Label)
+	}
+
+	return printerControlStatusSnapshot{
+		Nozzle:          moonrakerTemperatureStatusFromObjectStatus(statusByObject[selectedExtruder], true),
+		Bed:             moonrakerTemperatureStatusFromObjectStatus(statusByObject["heater_bed"], true),
+		Chamber:         moonrakerTemperatureStatusFromObjectStatus(statusByObject[layout.ChamberSensor], false),
+		Fans:            fans,
+		MotionSupported: layout.ToolheadPresent,
+		HomeSupported:   layout.ToolheadPresent,
+	}, nil
+}
+
+func buildMoonrakerControlLayout(objects []string) moonrakerControlLayout {
+	return moonrakerControlLayout{
+		ToolheadPresent: moonrakerObjectListContains(objects, "toolhead"),
+		ExtruderObjects: moonrakerExtruderObjects(objects),
+		BedSupported:    moonrakerObjectListContains(objects, "heater_bed"),
+		ChamberSensor:   resolveMoonrakerChamberTemperatureSensor(objects),
+		Fans:            moonrakerWritableFanObjects(objects),
+	}
+}
+
+func moonrakerObjectListContains(objects []string, want string) bool {
+	normalizedWant := strings.ToLower(strings.TrimSpace(want))
+	for _, objectName := range objects {
+		if strings.ToLower(strings.TrimSpace(objectName)) == normalizedWant {
+			return true
+		}
+	}
+	return false
+}
+
+func moonrakerExtruderObjects(objects []string) []string {
+	out := make([]string, 0)
+	for _, objectName := range objects {
+		trimmed := strings.TrimSpace(objectName)
+		normalized := strings.ToLower(trimmed)
+		if normalized == "extruder" {
+			out = append(out, trimmed)
+			continue
+		}
+		if strings.HasPrefix(normalized, "extruder") {
+			suffix := strings.TrimPrefix(normalized, "extruder")
+			if suffix != "" && strings.Trim(suffix, "0123456789") == "" {
+				out = append(out, trimmed)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func resolveMoonrakerChamberTemperatureSensor(objects []string) string {
+	priority := []string{
+		"temperature_sensor chamber",
+		"temperature_sensor chamber_temp",
+		"temperature_sensor enclosure",
+		"temperature_sensor enclosure_temp",
+		"temperature_sensor cabinet",
+		"temperature_sensor ambient",
+	}
+	byName := make(map[string]string, len(objects))
+	for _, objectName := range objects {
+		trimmed := strings.TrimSpace(objectName)
+		if trimmed == "" {
+			continue
+		}
+		byName[strings.ToLower(trimmed)] = trimmed
+	}
+	for _, candidate := range priority {
+		if objectName, ok := byName[candidate]; ok {
+			return objectName
+		}
+	}
+	return ""
+}
+
+func moonrakerWritableFanObjects(objects []string) []moonrakerWritableFan {
+	fans := make([]moonrakerWritableFan, 0)
+	if moonrakerObjectListContains(objects, "fan") {
+		fans = append(fans, moonrakerWritableFan{Key: "fan", Label: "Part Cooling"})
+	}
+	for _, objectName := range objects {
+		trimmed := strings.TrimSpace(objectName)
+		normalized := strings.ToLower(trimmed)
+		if !strings.HasPrefix(normalized, "fan_generic ") {
+			continue
+		}
+		configName := strings.TrimSpace(strings.TrimPrefix(trimmed, "fan_generic "))
+		if configName == "" {
+			continue
+		}
+		fans = append(fans, moonrakerWritableFan{
+			Key:   strings.ToLower(trimmed),
+			Label: moonrakerDisplayLabel(configName),
+		})
+	}
+	sort.Slice(fans, func(i, j int) bool {
+		return fans[i].Key < fans[j].Key
+	})
+	return fans
+}
+
+func moonrakerDisplayLabel(raw string) string {
+	normalized := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(raw, "_", " "), "-", " "))
+	if normalized == "" {
+		return ""
+	}
+	words := strings.Fields(normalized)
+	for idx, word := range words {
+		runes := []rune(strings.ToLower(word))
+		if len(runes) == 0 {
+			continue
+		}
+		runes[0] = unicode.ToUpper(runes[0])
+		words[idx] = string(runes)
+	}
+	return strings.Join(words, " ")
+}
+
+func (a *agent) fetchMoonrakerObjectStatus(ctx context.Context, endpointURL string, objects map[string][]string) (map[string]map[string]any, error) {
+	queryPath, err := buildMoonrakerObjectQueryPath(objects)
+	if err != nil {
+		return nil, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, resolveURL(endpointURL, queryPath), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("moonraker object query failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Result struct {
+			Status map[string]map[string]any `json:"status"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.Result.Status == nil {
+		return map[string]map[string]any{}, nil
+	}
+	return payload.Result.Status, nil
+}
+
+func buildMoonrakerObjectQueryPath(objects map[string][]string) (string, error) {
+	if len(objects) == 0 {
+		return "", errors.New("validation_error: moonraker object query requires at least one object")
+	}
+	keys := make([]string, 0, len(objects))
+	for key := range objects {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		keys = append(keys, trimmed)
+	}
+	if len(keys) == 0 {
+		return "", errors.New("validation_error: moonraker object query requires at least one valid object")
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		fields := objects[key]
+		if len(fields) == 0 {
+			parts = append(parts, url.QueryEscape(key))
+			continue
+		}
+		parts = append(parts, url.QueryEscape(key)+"="+url.QueryEscape(strings.Join(fields, ",")))
+	}
+	return "/printer/objects/query?" + strings.Join(parts, "&"), nil
+}
+
+func moonrakerSelectedExtruderName(statusByObject map[string]map[string]any, extruderObjects []string) string {
+	toolheadStatus := statusByObject["toolhead"]
+	selected := strings.TrimSpace(stringFromAny(toolheadStatus["extruder"]))
+	if selected != "" {
+		for _, objectName := range extruderObjects {
+			if strings.EqualFold(strings.TrimSpace(objectName), selected) {
+				return objectName
+			}
+		}
+	}
+	if len(extruderObjects) > 0 {
+		return extruderObjects[0]
+	}
+	return ""
+}
+
+func moonrakerTemperatureStatusFromObjectStatus(objectStatus map[string]any, includeTarget bool) printerTemperatureStatus {
+	status := printerTemperatureStatus{}
+	if len(objectStatus) == 0 {
+		return status
+	}
+	if current, ok := moonrakerNumericValue(objectStatus["temperature"]); ok {
+		value := current
+		status.Current = &value
+		status.Available = true
+	}
+	if includeTarget {
+		if target, ok := moonrakerNumericValue(objectStatus["target"]); ok {
+			value := target
+			status.Target = &value
+			status.Available = true
+		}
+	}
+	return status
+}
+
+func moonrakerFanStatusFromObjectStatus(objectStatus map[string]any, label string) printerFanStatus {
+	status := printerFanStatus{
+		Label:     strings.TrimSpace(label),
+		Supported: true,
+		State:     "unknown",
+	}
+	if len(objectStatus) == 0 {
+		return status
+	}
+	if speed, ok := moonrakerNumericValue(objectStatus["speed"]); ok {
+		if speed > 0 {
+			status.State = "on"
+		} else {
+			status.State = "off"
+		}
+	}
+	return status
+}
+
+func (a *agent) fetchMoonrakerActiveExtruderName(ctx context.Context, endpointURL string) (string, error) {
+	objects, err := a.fetchMoonrakerObjectList(ctx, endpointURL)
+	if err != nil {
+		return "", err
+	}
+	extruderObjects := moonrakerExtruderObjects(objects)
+	if len(extruderObjects) == 0 {
+		return "", errors.New("validation_error: moonraker extruder is not configured")
+	}
+	statusByObject, err := a.fetchMoonrakerObjectStatus(ctx, endpointURL, map[string][]string{
+		"toolhead": {"extruder"},
+	})
+	if err != nil {
+		if len(extruderObjects) == 1 {
+			return extruderObjects[0], nil
+		}
+		return "", err
+	}
+	return moonrakerSelectedExtruderName(statusByObject, extruderObjects), nil
 }
 
 func (a *agent) fetchMoonrakerDevicePowerDevices(ctx context.Context, endpointURL string) ([]moonrakerPowerDevice, error) {
@@ -5904,6 +6618,42 @@ func capabilitySupported(capability map[string]any) bool {
 	default:
 		return false
 	}
+}
+
+func ensurePrinterSupportCapability(binding edgeBinding, snapshot bindingSnapshot, capabilities map[string]any) map[string]any {
+	if capabilities == nil {
+		capabilities = map[string]any{}
+	}
+	profile := printeradapter.ResolveProfile(
+		printeradapter.Binding{
+			PrinterID:     binding.PrinterID,
+			AdapterFamily: binding.AdapterFamily,
+			EndpointURL:   binding.EndpointURL,
+		},
+		printeradapter.RuntimeSnapshot{
+			PrinterState:      snapshot.PrinterState,
+			JobState:          snapshot.JobState,
+			ProgressPct:       snapshot.ProgressPct,
+			RemainingSeconds:  snapshot.RemainingSeconds,
+			TelemetrySource:   snapshot.TelemetrySource,
+			DetectedName:      snapshot.DetectedName,
+			DetectedModelHint: snapshot.DetectedModelHint,
+		},
+	)
+	panels := make([]string, 0, len(profile.SupportedPanels))
+	for _, panel := range profile.SupportedPanels {
+		panels = append(panels, string(panel))
+	}
+	capabilities["printer_support"] = map[string]any{
+		"profile_key":        profile.Key,
+		"profile_family":     profile.Family,
+		"display_name":       profile.DisplayName,
+		"support_tier":       string(profile.SupportTier),
+		"panels":             panels,
+		"unsupported_reason": strings.TrimSpace(profile.UnsupportedReason),
+		"documentation_slug": strings.TrimSpace(profile.DocumentationSlug),
+	}
+	return capabilities
 }
 
 func filamentCapability(capabilities map[string]any) map[string]any {
@@ -6955,7 +7705,7 @@ func (a *agent) controlStatusPushLoop(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !a.isClaimed() || !a.cfg.EnableBambu {
+			if !a.isClaimed() {
 				continue
 			}
 			if err := a.pushPrinterControlStatusOnce(ctx); err != nil {
@@ -6979,7 +7729,8 @@ func (a *agent) pushPrinterControlStatusOnce(ctx context.Context) error {
 	a.mu.RLock()
 	bindings := make([]bindingState, 0, len(a.bindings))
 	for printerID, binding := range a.bindings {
-		if normalizeAdapterFamily(binding.AdapterFamily) != "bambu" {
+		adapterFamily := normalizeAdapterFamily(binding.AdapterFamily)
+		if adapterFamily != "bambu" && adapterFamily != "moonraker" {
 			continue
 		}
 		bindings = append(bindings, bindingState{printerID: printerID, binding: binding})
@@ -6996,31 +7747,53 @@ func (a *agent) pushPrinterControlStatusOnce(ctx context.Context) error {
 
 	items := make([]printerControlStatusItem, 0, len(bindings))
 	for _, item := range bindings {
-		printerID, err := parseBambuPrinterEndpointID(item.binding.EndpointURL)
-		if err != nil {
-			a.audit("bambu_control_status_printer_id_error", map[string]any{
-				"printer_id":   item.printerID,
-				"endpoint_url": item.binding.EndpointURL,
-				"error":        err.Error(),
-			})
+		adapterFamily := normalizeAdapterFamily(item.binding.AdapterFamily)
+		var controlStatus *printerControlStatusSnapshot
+		switch adapterFamily {
+		case "bambu":
+			printerID, err := parseBambuPrinterEndpointID(item.binding.EndpointURL)
+			if err != nil {
+				a.audit("bambu_control_status_printer_id_error", map[string]any{
+					"printer_id":   item.printerID,
+					"endpoint_url": item.binding.EndpointURL,
+					"error":        err.Error(),
+				})
+				continue
+			}
+			snapshot, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
+			if err != nil {
+				a.audit("bambu_control_status_snapshot_error", map[string]any{
+					"printer_id":   item.printerID,
+					"endpoint_url": item.binding.EndpointURL,
+					"error":        err.Error(),
+				})
+				continue
+			}
+			if snapshot.ControlStatus == nil {
+				continue
+			}
+			controlStatus = snapshot.ControlStatus
+		case "moonraker":
+			snapshot, err := a.fetchMoonrakerControlStatus(ctx, item.binding.EndpointURL)
+			if err != nil {
+				a.audit("moonraker_control_status_snapshot_error", map[string]any{
+					"printer_id":   item.printerID,
+					"endpoint_url": item.binding.EndpointURL,
+					"error":        err.Error(),
+				})
+				continue
+			}
+			controlStatus = &snapshot
+		default:
 			continue
 		}
-		snapshot, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
-		if err != nil {
-			a.audit("bambu_control_status_snapshot_error", map[string]any{
-				"printer_id":   item.printerID,
-				"endpoint_url": item.binding.EndpointURL,
-				"error":        err.Error(),
-			})
-			continue
-		}
-		if snapshot.ControlStatus == nil {
+		if controlStatus == nil {
 			continue
 		}
 		items = append(items, printerControlStatusItem{
 			PrinterID:     item.printerID,
-			AdapterFamily: "bambu",
-			Status:        *snapshot.ControlStatus,
+			AdapterFamily: adapterFamily,
+			Status:        *controlStatus,
 			ReportedAt:    time.Now().UTC(),
 		})
 	}
@@ -8286,6 +9059,10 @@ func (a *agent) discoveryMaxTargets(job discoveryJobItem) int {
 
 func (a *agent) discoveryTargetsForJob(job discoveryJobItem) []discoveryProbeTarget {
 	maxTargets := a.discoveryMaxTargets(job)
+	appendCIDRTargets := false
+	if job.RuntimeCapsOverrides != nil {
+		appendCIDRTargets = job.RuntimeCapsOverrides[recoveryAppendCIDRTargetsKey] > 0
+	}
 	seen := map[string]struct{}{}
 	targets := make([]discoveryProbeTarget, 0, maxTargets)
 	appendTarget := func(raw string, source string) {
@@ -8325,7 +9102,7 @@ func (a *agent) discoveryTargetsForJob(job discoveryJobItem) []discoveryProbeTar
 		}
 	}
 
-	if len(targets) > 0 {
+	if len(targets) > 0 && !appendCIDRTargets {
 		return targets
 	}
 
@@ -8999,6 +9776,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.ManualIntervention = snapshot.ManualIntervention
 		current.CommandCapabilities = mergeCommandCapabilities(current.CommandCapabilities, snapshot.CommandCapabilities)
 		resolveRuntimeFilamentCapability(item.binding, &current, previousCurrent, snapshot, observedAt)
+		current.CommandCapabilities = ensurePrinterSupportCapability(item.binding, snapshot, current.CommandCapabilities)
 		current.IsCanceled = snapshot.JobState == "canceled"
 		current.ReportedAt = observedAt
 		if snapshot.PrinterState == "queued" {
@@ -10108,13 +10886,17 @@ func hostnameFromURL(endpointURL string) string {
 }
 
 func mapMoonrakerPrintStatsState(state string) (printerState string, jobState string, err error) {
-	switch state {
+	normalizedState := strings.ToLower(strings.TrimSpace(state))
+	switch normalizedState {
 	case "printing":
 		return "printing", "printing", nil
 	case "paused":
 		return "paused", "printing", nil
-	case "complete", "completed", "finished", "standby", "ready", "idle":
+	case "complete", "completed", "finished":
 		return "idle", "completed", nil
+	case "standby", "ready", "idle", "":
+		// Idle-like Moonraker states should not imply that a job just completed.
+		return "idle", "", nil
 	case "cancelled", "canceled":
 		return "idle", "canceled", nil
 	case "error":
@@ -10122,7 +10904,7 @@ func mapMoonrakerPrintStatsState(state string) (printerState string, jobState st
 	case "queued":
 		return "queued", "pending", nil
 	default:
-		return "idle", "completed", nil
+		return "idle", "", nil
 	}
 }
 

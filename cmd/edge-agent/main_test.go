@@ -26,6 +26,7 @@ import (
 
 	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
 	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
+	snapmakeru1 "printfarmhq/edge-agent/internal/printeradapter/moonraker/snapmaker_u1"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -1248,6 +1249,27 @@ func TestReconcileSkipsEnqueueWhenEquivalentActionInflight(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotStopActivePrinterWithoutDesiredState(t *testing.T) {
+	a := newTestAgent(t)
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "moonraker",
+		EndpointURL:   "http://printer.local:7125",
+	}
+	a.currentState[1] = currentStateItem{
+		PrinterID:           1,
+		CurrentPrinterState: "printing",
+		CurrentJobState:     "printing",
+		ReportedAt:          time.Now().UTC(),
+	}
+
+	a.reconcileOnce()
+
+	if len(a.actionQueue[1]) != 0 {
+		t.Fatalf("expected no stop action without desired state, got %d queued actions", len(a.actionQueue[1]))
+	}
+}
+
 func TestRefreshCurrentStateFromBindingsBambuLANMissMarksAuthError(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.EnableBambu = true
@@ -2447,6 +2469,45 @@ func TestExecuteDiscoveryJobUsesBindingSeedTargets(t *testing.T) {
 	}
 }
 
+func TestDiscoveryTargetsForJobAppendsCIDRTargetsForRecovery(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.DiscoveryAllowedAdapters = []string{"moonraker"}
+	a.cfg.DiscoveryNetworkMode = "bridge"
+
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "moonraker",
+		EndpointURL:   "http://192.168.1.50:7125",
+	}
+
+	targets := a.discoveryTargetsForJob(discoveryJobItem{
+		JobID:         "scan_recovery_targets",
+		Profile:       "hybrid",
+		Adapters:      []string{"moonraker"},
+		CIDRAllowlist: []string{"192.168.1.0/30"},
+		RuntimeCapsOverrides: map[string]int{
+			recoveryAppendCIDRTargetsKey: 1,
+		},
+	})
+
+	if len(targets) != 3 {
+		t.Fatalf("target count = %d, want 3", len(targets))
+	}
+	got := map[string]string{}
+	for _, target := range targets {
+		got[target.EndpointURL] = target.Source
+	}
+	if got["http://192.168.1.50:7125"] != discoverySourceSeedManual {
+		t.Fatalf("seed target source = %q, want %q", got["http://192.168.1.50:7125"], discoverySourceSeedManual)
+	}
+	if got["http://192.168.1.1:7125"] != discoverySourceCIDRAllowlist {
+		t.Fatalf("cidr target .1 source = %q, want %q", got["http://192.168.1.1:7125"], discoverySourceCIDRAllowlist)
+	}
+	if got["http://192.168.1.2:7125"] != discoverySourceCIDRAllowlist {
+		t.Fatalf("cidr target .2 source = %q, want %q", got["http://192.168.1.2:7125"], discoverySourceCIDRAllowlist)
+	}
+}
+
 func TestExecuteDiscoveryJobUsesHistorySeedTargets(t *testing.T) {
 	a := newTestAgent(t)
 	a.cfg.DiscoveryAllowedAdapters = []string{"moonraker"}
@@ -3363,6 +3424,85 @@ func TestFetchMoonrakerCommandCapabilitiesFallsBackToLEDObjectWhenDevicePowerUna
 	}
 }
 
+func TestFetchMoonrakerControlStatusIncludesTemperaturesAndWritableFans(t *testing.T) {
+	a := newTestAgent(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{
+						"toolhead",
+						"extruder",
+						"heater_bed",
+						"fan",
+						"fan_generic chamber",
+						"temperature_sensor chamber",
+					},
+				},
+			})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"toolhead": map[string]any{
+							"extruder": "extruder",
+						},
+						"extruder": map[string]any{
+							"temperature": 205.0,
+							"target":      210.0,
+						},
+						"heater_bed": map[string]any{
+							"temperature": 60.0,
+							"target":      60.0,
+						},
+						"temperature_sensor chamber": map[string]any{
+							"temperature": 34.0,
+						},
+						"fan": map[string]any{
+							"speed": 0.0,
+						},
+						"fan_generic chamber": map[string]any{
+							"speed": 1.0,
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	status, err := a.fetchMoonrakerControlStatus(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("fetchMoonrakerControlStatus failed: %v", err)
+	}
+	if !status.Nozzle.Available || status.Nozzle.Current == nil || *status.Nozzle.Current != 205.0 {
+		t.Fatalf("nozzle status = %#v, want available current 205", status.Nozzle)
+	}
+	if status.Nozzle.Target == nil || *status.Nozzle.Target != 210.0 {
+		t.Fatalf("nozzle target = %#v, want 210", status.Nozzle)
+	}
+	if !status.Bed.Available || status.Bed.Target == nil || *status.Bed.Target != 60.0 {
+		t.Fatalf("bed status = %#v, want available target 60", status.Bed)
+	}
+	if !status.Chamber.Available || status.Chamber.Current == nil || *status.Chamber.Current != 34.0 {
+		t.Fatalf("chamber status = %#v, want available current 34", status.Chamber)
+	}
+	partCooling, ok := status.Fans["fan"]
+	if !ok || partCooling.Label != "Part Cooling" || partCooling.State != "off" {
+		t.Fatalf("fan status = %#v, want part cooling off", status.Fans["fan"])
+	}
+	chamberFan, ok := status.Fans["fan_generic chamber"]
+	if !ok || chamberFan.Label != "Chamber" || chamberFan.State != "on" {
+		t.Fatalf("fan_generic chamber status = %#v, want chamber on", status.Fans["fan_generic chamber"])
+	}
+	if !status.MotionSupported || !status.HomeSupported {
+		t.Fatalf("motion/home support = (%v,%v), want true,true", status.MotionSupported, status.HomeSupported)
+	}
+}
+
 func TestOpenSnapshotLoopReaderToleratesTransientSnapshotFailures(t *testing.T) {
 	a := newTestAgent(t)
 	requestCount := 0
@@ -3767,6 +3907,181 @@ func TestExecuteMoonrakerLightActionFallsBackToLEDObjectWhenDevicePowerUnavailab
 	}
 	if receivedScript != "SET_LED LED=cavity_led WHITE=1 SYNC=0 TRANSMIT=1" {
 		t.Fatalf("received script = %q, want cavity_led SET_LED on script", receivedScript)
+	}
+}
+
+func TestExecuteMoonrakerPrinterCommandSetNozzleTemperatureUsesActiveExtruder(t *testing.T) {
+	a := newTestAgent(t)
+	var receivedScript string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/printer/objects/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"objects": []string{"toolhead", "extruder", "extruder1"},
+				},
+			})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"toolhead": map[string]any{
+							"extruder": "extruder1",
+						},
+					},
+				},
+			})
+		case "/printer/gcode/script":
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode moonraker gcode payload failed: %v", err)
+			}
+			receivedScript = payload["script"]
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	err := a.executeMoonrakerAction(
+		context.Background(),
+		action{PrinterID: 1, Kind: "set_nozzle_temperature", Payload: map[string]any{"target_c": 235}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: srv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerAction(set_nozzle_temperature) failed: %v", err)
+	}
+	if receivedScript != "SET_HEATER_TEMPERATURE HEATER=extruder1 TARGET=235" {
+		t.Fatalf("received script = %q, want active extruder heater setpoint command", receivedScript)
+	}
+}
+
+func TestExecuteMoonrakerPrinterCommandSetFanEnabledUsesFanGeneric(t *testing.T) {
+	a := newTestAgent(t)
+	var receivedScript string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/printer/gcode/script" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode moonraker fan gcode payload failed: %v", err)
+		}
+		receivedScript = payload["script"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := a.executeMoonrakerAction(
+		context.Background(),
+		action{PrinterID: 1, Kind: "set_fan_enabled", Payload: map[string]any{"fan": "fan_generic chamber", "enabled": true}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: srv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerAction(set_fan_enabled) failed: %v", err)
+	}
+	if receivedScript != "SET_FAN_SPEED FAN=chamber SPEED=1" {
+		t.Fatalf("received script = %q, want fan_generic chamber speed command", receivedScript)
+	}
+}
+
+func TestExecuteMoonrakerPrinterCommandJogMotionBatchUsesSavedGCodeState(t *testing.T) {
+	a := newTestAgent(t)
+	var receivedScript string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/printer/gcode/script" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode moonraker jog gcode payload failed: %v", err)
+		}
+		receivedScript = payload["script"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := a.executeMoonrakerAction(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "jog_motion_batch",
+			Payload: map[string]any{
+				"steps": []any{
+					map[string]any{"axis": "y", "distance_mm": 1},
+					map[string]any{"axis": "z", "distance_mm": -10},
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: srv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerAction(jog_motion_batch) failed: %v", err)
+	}
+	expected := "SAVE_GCODE_STATE NAME=pfh_motion\nG91\nG0 Y1 F6000\nG0 Z-10 F300\nRESTORE_GCODE_STATE NAME=pfh_motion"
+	if receivedScript != expected {
+		t.Fatalf("received script = %q, want %q", receivedScript, expected)
+	}
+}
+
+func TestBuildSnapmakerU1HomeAxesScriptUsesSnapmakerMacros(t *testing.T) {
+	script, err := buildSnapmakerU1HomeAxesScript(map[string]any{
+		"axes": []any{"x", "y", "z"},
+	})
+	if err != nil {
+		t.Fatalf("buildSnapmakerU1HomeAxesScript failed: %v", err)
+	}
+	expected := "_HOMING_PRECISE_COREXY_ADVANCED\nSENSORLESS_HOME_Z"
+	if script != expected {
+		t.Fatalf("script = %q, want %q", script, expected)
+	}
+}
+
+func TestExecuteMoonrakerPrinterCommandHomeAxesUsesSnapmakerProfileAndExtendedTimeout(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.MoonrakerRequestTimeout = 100 * time.Millisecond
+
+	var receivedScript string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/printer/gcode/script" {
+			http.NotFound(w, r)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode moonraker home gcode payload failed: %v", err)
+		}
+		receivedScript = payload["script"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a.mu.Lock()
+	a.currentState[1] = currentStateItem{
+		PrinterID: 1,
+		CommandCapabilities: map[string]any{
+			"printer_support": map[string]any{
+				"profile_key": snapmakeru1.ProfileKey,
+			},
+		},
+	}
+	a.mu.Unlock()
+
+	err := a.executeMoonrakerAction(
+		context.Background(),
+		action{PrinterID: 1, Kind: "home_axes", Payload: map[string]any{"axes": []any{"x", "y", "z"}}},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: srv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerAction(home_axes) failed: %v", err)
+	}
+	expected := "_HOMING_PRECISE_COREXY_ADVANCED\nSENSORLESS_HOME_Z"
+	if receivedScript != expected {
+		t.Fatalf("received script = %q, want %q", receivedScript, expected)
 	}
 }
 
@@ -7627,6 +7942,33 @@ func TestCallMoonrakerPostHonorsTimeoutBudget(t *testing.T) {
 	}
 }
 
+func TestMapMoonrakerPrintStatsStateDoesNotTreatIdleLikeStatesAsCompleted(t *testing.T) {
+	tests := []struct {
+		name        string
+		rawState    string
+		wantPrinter string
+		wantJob     string
+	}{
+		{name: "completed remains terminal", rawState: "completed", wantPrinter: "idle", wantJob: "completed"},
+		{name: "idle omits active job state", rawState: "idle", wantPrinter: "idle", wantJob: ""},
+		{name: "ready omits active job state", rawState: " ready ", wantPrinter: "idle", wantJob: ""},
+		{name: "standby omits active job state", rawState: "standby", wantPrinter: "idle", wantJob: ""},
+		{name: "unknown omits active job state", rawState: "mystery", wantPrinter: "idle", wantJob: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			printerState, jobState, err := mapMoonrakerPrintStatsState(tc.rawState)
+			if err != nil {
+				t.Fatalf("mapMoonrakerPrintStatsState failed: %v", err)
+			}
+			if printerState != tc.wantPrinter || jobState != tc.wantJob {
+				t.Fatalf("mapMoonrakerPrintStatsState(%q)=(%q,%q), want (%q,%q)", tc.rawState, printerState, jobState, tc.wantPrinter, tc.wantJob)
+			}
+		})
+	}
+}
+
 func TestFetchMoonrakerSnapshotMapping(t *testing.T) {
 	a := newTestAgent(t)
 	tests := []struct {
@@ -7638,8 +7980,8 @@ func TestFetchMoonrakerSnapshotMapping(t *testing.T) {
 		{name: "printing", rawState: "printing", wantState: "printing", wantJob: "printing"},
 		{name: "paused", rawState: "paused", wantState: "paused", wantJob: "printing"},
 		{name: "canceled", rawState: "cancelled", wantState: "idle", wantJob: "canceled"},
-		{name: "ready treated as completed", rawState: "ready", wantState: "idle", wantJob: "completed"},
-		{name: "unknown treated as completed", rawState: "mystery", wantState: "idle", wantJob: "completed"},
+		{name: "completed stays completed", rawState: "ready", wantState: "idle", wantJob: ""},
+		{name: "unknown omits active job state", rawState: "mystery", wantState: "idle", wantJob: ""},
 	}
 
 	for _, tc := range tests {

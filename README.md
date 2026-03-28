@@ -15,6 +15,10 @@ make down
 - `make dev`: rebuilds then runs in foreground with logs attached (defaults to `EDGE_AGENT_FLAGS=--klipper`).
 - `make down`: kills all local `edge-agent` processes by name.
 - Local builds now default to `CGO_ENABLED=1` because the in-process Bambu camera runtime uses `cgo` to call the pinned native plugin libraries.
+- Edge-managed printer recovery now reuses discovery to recover moved printer endpoints:
+  - Moonraker/Klipper recovery can probe the bound endpoint plus subnet targets and rotate the live binding only when the same printer MAC is rediscovered.
+  - Bambu recovery keeps the serial binding stable and refreshes the resolved LAN host from new discovery evidence when the same serial is rediscovered.
+  - recovery must not stop a manual printer-side action; if SaaS does not currently own an active print lifecycle, edge-agent now treats printer-side activity as external authority instead of converging it back to `idle`.
 
 Optional test commands:
 
@@ -99,9 +103,12 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
   - directly tested Bambu camera support currently exists only for `P1S`.
   - unverified families such as `X1C` must remain truthfully unavailable until they are directly validated and implemented.
 - Print Jobs command-center runtime commands are enabled for edge-managed printers:
-  - Moonraker supports LED on/off through `device_power` and filament load/unload through `LOAD_FILAMENT` / `UNLOAD_FILAMENT` macros when those printer-side capabilities exist.
+  - edge-agent now also resolves a printer support profile and publishes metadata such as `profile_key`, `support_tier`, and supported panels so SaaS/frontend can gate UI from a stable contract instead of raw adapter checks.
+  - Moonraker supports LED on/off through `device_power`, Snapmaker-style `led <name>` fallback when `device_power` is absent, filament load/unload through `LOAD_FILAMENT` / `UNLOAD_FILAMENT` macros, and the broader `Control` panel through Moonraker object queries plus `printer/gcode/script`.
   - adopted Bambu LAN printers support LED on/off and external-spool load/unload over local MQTT when local credentials are available and the printer is reachable.
+  - Moonraker now also pushes live control-status telemetry every second for nozzle/bed plus optional chamber temperatures and writable fan state, and reuses the same buffered `jog_motion_batch` UX as Bambu.
   - the command-center filament button now uses edge-reported `filament_state` plus `filament_action_state`; Moonraker needs a real filament sensor for a trustworthy single-button filament UX, and Bambu prefers `ams.tray_now` active-source detection with command-memory fallback plus `needs_user_confirmation` when load/unload flows still require operator completion on the printer.
+  - when a printer rejects a command, edge-agent now summarizes the printer-facing error message before acknowledging it back to SaaS so the UI can show the real reason instead of a huge traceback blob.
 - MQTT command auth resolves username from the current Bambu access-token claims (`user_id`/`uid`/`sub`) at action time.
 - Print start success is verified against Bambu cloud telemetry (`queued`/`printing`) before the action is marked successful.
 - If the upload response does not include a printable `file_url`, print-start fails fast with a validation error (no signed-upload-URL guessing).
