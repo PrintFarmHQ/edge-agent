@@ -8,7 +8,7 @@ var supportCatalog = []ProfileDescriptor{
 		Family:            "moonraker",
 		DisplayName:       "Snapmaker U1",
 		SupportTier:       SupportTierOfficial,
-		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls},
+		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls, PanelFiles},
 		DocumentationSlug: "moonraker-snapmaker-u1",
 	},
 	{
@@ -16,7 +16,7 @@ var supportCatalog = []ProfileDescriptor{
 		Family:            "moonraker",
 		DisplayName:       "Generic Moonraker / Klipper",
 		SupportTier:       SupportTierGeneric,
-		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls},
+		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls, PanelFiles},
 		DocumentationSlug: "moonraker-klipper-generic",
 	},
 	{
@@ -24,7 +24,7 @@ var supportCatalog = []ProfileDescriptor{
 		Family:            "bambu",
 		DisplayName:       "Bambu P1 Family",
 		SupportTier:       SupportTierOfficial,
-		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls},
+		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls, PanelFiles},
 		DocumentationSlug: "bambu-p1-family",
 	},
 	{
@@ -32,7 +32,7 @@ var supportCatalog = []ProfileDescriptor{
 		Family:            "bambu",
 		DisplayName:       "Generic Bambu",
 		SupportTier:       SupportTierExperimental,
-		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls},
+		SupportedPanels:   []PanelKey{PanelStatus, PanelQueue, PanelCamera, PanelControls, PanelFiles},
 		DocumentationSlug: "bambu-generic",
 	},
 	{

@@ -42,6 +42,10 @@ type bambuLANRuntimeRecord struct {
 }
 
 func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterID(ctx context.Context, printerID string) (bindingSnapshot, error) {
+	return a.fetchBambuLANRuntimeSnapshotByPrinterIDWithTimeout(ctx, printerID, 0)
+}
+
+func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterIDWithTimeout(ctx context.Context, printerID string, requestTimeoutOverride time.Duration) (bindingSnapshot, error) {
 	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
 	if err != nil {
 		return bindingSnapshot{}, err
@@ -80,7 +84,10 @@ func (a *agent) fetchBambuLANRuntimeSnapshotByPrinterID(ctx context.Context, pri
 			}
 		}
 
-		requestTimeout := a.cfg.BambuLANRuntimeTimeout
+		requestTimeout := requestTimeoutOverride
+		if requestTimeout <= 0 {
+			requestTimeout = a.cfg.BambuLANRuntimeTimeout
+		}
 		if requestTimeout <= 0 {
 			requestTimeout = defaultBambuLANRuntimeTimeout
 		}
@@ -1008,6 +1015,7 @@ func parseBambuLANMQTTSnapshotPayload(raw []byte) (bindingSnapshot, error) {
 		JobState:         jobState,
 		TelemetrySource:  telemetrySourceBambuLANMQTT,
 		RawPrinterStatus: gcodeState,
+		ActiveFilePath:   normalizeBambuLANRemoteStartFilename(gcodeFile),
 	}
 
 	if progressPct, ok := bambuLANValueAsFloat(payload.Print["mc_percent"]); ok {

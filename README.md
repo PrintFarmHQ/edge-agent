@@ -30,6 +30,9 @@ make test
 - Reuse is supported for:
   - Moonraker via file metadata plus remote SHA256 verification
   - adopted Bambu LAN printers via FTPS `SIZE` plus streamed MD5 verification
+- Edge-managed printer files can now be refreshed and reported back to SaaS for the Print Jobs printer side panel:
+  - Moonraker lists printable files from the `gcodes` root and supports start/delete of existing files.
+  - adopted Bambu LAN mirrors the printer SD-card view using `.3mf` / `.gcode` entries backed by `/cache`, hides paired `.bbl` internals from the UI, starts existing cache-backed files by computing remote MD5 before `project_file`, and now enriches delete actions with the same native Bambu file-control identity the official client uses so delete can update the printer-side SD-card index before FTPS cleanup/verification runs.
 
 ## Dev defaults
 

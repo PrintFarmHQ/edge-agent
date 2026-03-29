@@ -29,6 +29,7 @@ const (
 	PanelQueue    PanelKey = "queue"
 	PanelCamera   PanelKey = "camera"
 	PanelControls PanelKey = "controls"
+	PanelFiles    PanelKey = "files"
 )
 
 type SupportTier string

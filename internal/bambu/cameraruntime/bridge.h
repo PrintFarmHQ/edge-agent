@@ -75,9 +75,11 @@ typedef int (*PFHBambuCreateFn)(Bambu_Tunnel* tunnel, char const* path);
 typedef void (*PFHBambuSetLoggerFn)(Bambu_Tunnel tunnel, Logger logger, void * context);
 typedef int (*PFHBambuOpenFn)(Bambu_Tunnel tunnel);
 typedef int (*PFHBambuStartStreamFn)(Bambu_Tunnel tunnel, bool video);
+typedef int (*PFHBambuStartStreamExFn)(Bambu_Tunnel tunnel, int type);
 typedef int (*PFHBambuGetStreamCountFn)(Bambu_Tunnel tunnel);
 typedef int (*PFHBambuGetStreamInfoFn)(Bambu_Tunnel tunnel, int index, struct Bambu_StreamInfo* info);
 typedef int (*PFHBambuReadSampleFn)(Bambu_Tunnel tunnel, struct Bambu_Sample* sample);
+typedef int (*PFHBambuSendMessageFn)(Bambu_Tunnel tunnel, int ctrl, char const* data, int len);
 typedef void (*PFHBambuCloseFn)(Bambu_Tunnel tunnel);
 typedef void (*PFHBambuDestroyFn)(Bambu_Tunnel tunnel);
 typedef void (*PFHBambuFreeLogMsgFn)(tchar const* msg);
@@ -90,9 +92,11 @@ typedef struct PFHBambuRuntime {
     PFHBambuSetLoggerFn set_logger_fn;
     PFHBambuOpenFn open_fn;
     PFHBambuStartStreamFn start_stream_fn;
+    PFHBambuStartStreamExFn start_stream_ex_fn;
     PFHBambuGetStreamCountFn get_stream_count_fn;
     PFHBambuGetStreamInfoFn get_stream_info_fn;
     PFHBambuReadSampleFn read_sample_fn;
+    PFHBambuSendMessageFn send_message_fn;
     PFHBambuCloseFn close_fn;
     PFHBambuDestroyFn destroy_fn;
     PFHBambuFreeLogMsgFn free_log_msg_fn;
@@ -106,6 +110,9 @@ enum PFHBambuStatus {
 
 int pfh_bambu_runtime_open(const char* library_path, const char* printer_address, const char* access_code, PFHBambuRuntime** out_runtime, char** out_error);
 int pfh_bambu_runtime_read_sample(PFHBambuRuntime* runtime, unsigned char** out_data, int* out_size, int* out_status, char** out_error);
+int pfh_bambu_control_open(const char* library_path, const char* printer_address, const char* access_code, PFHBambuRuntime** out_runtime, char** out_error);
+int pfh_bambu_control_send_message(PFHBambuRuntime* runtime, const unsigned char* data, int size, char** out_error);
+int pfh_bambu_control_read_message(PFHBambuRuntime* runtime, unsigned char** out_data, int* out_size, int* out_status, char** out_error);
 void pfh_bambu_runtime_close(PFHBambuRuntime* runtime);
 void pfh_bambu_runtime_free_bytes(unsigned char* data);
 void pfh_bambu_runtime_free_string(char* value);

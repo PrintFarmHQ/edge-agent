@@ -17,8 +17,26 @@ type Session interface {
 	Close()
 }
 
+type ControlSession interface {
+	SendMessage(message []byte) error
+	ReadMessage() ([]byte, error)
+	Close()
+}
+
 func OpenSession(handle Handle) (Session, error) {
 	return openNativeSession(handle.PluginLibraryPath, handle.Host, handle.AccessCode)
+}
+
+func OpenControlSession(pluginLibraryPath string, host string, accessCode string) (ControlSession, error) {
+	return openNativeControlSession(pluginLibraryPath, host, accessCode)
+}
+
+func IsWouldBlock(err error) bool {
+	return errors.Is(err, errWouldBlock)
+}
+
+func IsStreamEnd(err error) bool {
+	return errors.Is(err, errStreamEnd)
 }
 
 func ReadJPEGFrame(ctx context.Context, session Session) ([]byte, error) {

@@ -18,6 +18,7 @@ Current architecture direction:
   - `support_tier`
   - `supported_panels`
   - `documentation_slug`
+- supported panels now also include the Print Jobs printer-side `Files` panel for supported Moonraker and Bambu profiles
 - richer extensibility should build on capability-specific contracts such as:
   - `ControlAdapter` for schema-driven control surfaces
   - `MaterialSystemAdapter` for AMS/toolchanger/material-system descriptions

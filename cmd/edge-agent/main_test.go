@@ -207,17 +207,25 @@ func (f *fakeBambuMQTTPublisher) PublishPrintCommand(ctx context.Context, req ba
 type fakeBambuLANArtifactClient struct {
 	loginErr             error
 	setBinaryModeErr     error
+	cwdErr               error
 	deleteErr            error
 	sizeErr              error
 	retrieveErr          error
+	listErr              error
+	modTimeErr           error
 	quitErr              error
 	closeErr             error
 	retrieveData         []byte
 	sizeValue            int64
+	listNames            []string
+	modTimeValue         *time.Time
+	preserveListOnDelete bool
 	storeErrs            []error
 	storedRemoteNames    []string
 	deletedRemoteNames   []string
 	retrievedRemoteNames []string
+	listedRemoteDirs     []string
+	cwdDirs              []string
 }
 
 func (f *fakeBambuLANArtifactClient) login(_ string, _ string) error {
@@ -226,6 +234,11 @@ func (f *fakeBambuLANArtifactClient) login(_ string, _ string) error {
 
 func (f *fakeBambuLANArtifactClient) setBinaryMode() error {
 	return f.setBinaryModeErr
+}
+
+func (f *fakeBambuLANArtifactClient) cwd(remoteDir string) error {
+	f.cwdDirs = append(f.cwdDirs, remoteDir)
+	return f.cwdErr
 }
 
 func (f *fakeBambuLANArtifactClient) store(remoteName string, _ []byte) error {
@@ -240,6 +253,17 @@ func (f *fakeBambuLANArtifactClient) store(remoteName string, _ []byte) error {
 
 func (f *fakeBambuLANArtifactClient) delete(remoteName string) error {
 	f.deletedRemoteNames = append(f.deletedRemoteNames, remoteName)
+	trimmedRemoteName := filepath.Base(strings.TrimSpace(remoteName))
+	if !f.preserveListOnDelete && trimmedRemoteName != "" && len(f.listNames) > 0 {
+		filtered := make([]string, 0, len(f.listNames))
+		for _, candidate := range f.listNames {
+			if strings.TrimSpace(candidate) == trimmedRemoteName {
+				continue
+			}
+			filtered = append(filtered, candidate)
+		}
+		f.listNames = filtered
+	}
 	return f.deleteErr
 }
 
@@ -257,6 +281,23 @@ func (f *fakeBambuLANArtifactClient) retrieve(remoteName string, writer io.Write
 	}
 	written, err := writer.Write(f.retrieveData)
 	return int64(written), err
+}
+
+func (f *fakeBambuLANArtifactClient) list(remoteDir string) ([]string, error) {
+	f.listedRemoteDirs = append(f.listedRemoteDirs, remoteDir)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]string, len(f.listNames))
+	copy(out, f.listNames)
+	return out, nil
+}
+
+func (f *fakeBambuLANArtifactClient) modTime(_ string) (*time.Time, error) {
+	if f.modTimeErr != nil {
+		return nil, f.modTimeErr
+	}
+	return f.modTimeValue, nil
 }
 
 func (f *fakeBambuLANArtifactClient) quit() error {
@@ -888,12 +929,12 @@ func TestMapDesiredToAction(t *testing.T) {
 		want    string
 	}{
 		{name: "start print", current: "idle", desired: "printing", want: "print"},
-		{name: "pause print", current: "printing", desired: "paused", want: "pause"},
+		{name: "pause print uses explicit command", current: "printing", desired: "paused", want: "noop"},
 		{name: "wait to pause while queued", current: "queued", desired: "paused", want: "noop"},
-		{name: "resume print", current: "paused", desired: "printing", want: "resume"},
-		{name: "stop print", current: "printing", desired: "idle", want: "stop"},
+		{name: "resume print uses explicit command", current: "paused", desired: "printing", want: "noop"},
+		{name: "stop print uses explicit command", current: "printing", desired: "idle", want: "noop"},
 		{name: "noop printing", current: "printing", desired: "printing", want: "noop"},
-		{name: "invalid pause from idle", current: "idle", desired: "paused", want: "invalid"},
+		{name: "idle pause remains noop", current: "idle", desired: "paused", want: "noop"},
 	}
 
 	for _, tc := range tests {
@@ -903,6 +944,38 @@ func TestMapDesiredToAction(t *testing.T) {
 				t.Fatalf("mapDesiredToAction(%q, %q) = %q, want %q", tc.current, tc.desired, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestConvergeDoesNotAutoResumePausedPrinterFromDesiredPrinting(t *testing.T) {
+	a := newTestAgent(t)
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-1",
+	}
+	a.desiredState[1] = desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       5,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             11,
+		ArtifactURL:         "http://artifacts.local/plate.gcode",
+	}
+	a.currentState[1] = currentStateItem{
+		PrinterID:            1,
+		CurrentPrinterState:  "paused",
+		CurrentJobState:      "printing",
+		JobID:                "job-1",
+		PlateID:              11,
+		IntentVersionApplied: 4,
+	}
+
+	a.reconcileOnce()
+
+	if len(a.actionQueue[1]) != 0 {
+		t.Fatalf("expected no auto-resume action from desired-state reconciliation")
 	}
 }
 
@@ -933,9 +1006,46 @@ func TestDetectExternalAuthorityManualInterventionMarksMoonrakerPausedAsManual(t
 		desired,
 		prev,
 		snapshot,
+		90*time.Second,
 	)
 	if got != "paused" {
 		t.Fatalf("manual intervention = %q, want paused", got)
+	}
+}
+
+func TestDetectExternalAuthorityManualInterventionIgnoresBambuIdlePendingDuringManagedStartWindow(t *testing.T) {
+	desired := desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       4,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             7,
+	}
+	prev := currentStateItem{
+		PrinterID:            1,
+		CurrentPrinterState:  "queued",
+		CurrentJobState:      "pending",
+		JobID:                "job-1",
+		PlateID:              7,
+		IntentVersionApplied: 4,
+		ReportedAt:           time.Now().UTC(),
+	}
+	snapshot := bindingSnapshot{
+		PrinterState:     "idle",
+		JobState:         "pending",
+		RawPrinterStatus: "IDLE",
+	}
+
+	got := detectExternalAuthorityManualIntervention(
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer-1"},
+		desired,
+		prev,
+		snapshot,
+		90*time.Second,
+	)
+	if got != "" {
+		t.Fatalf("manual intervention = %q, want empty during managed start window", got)
 	}
 }
 
@@ -967,6 +1077,7 @@ func TestDetectExternalAuthorityManualInterventionKeepsBambuStoppedStickyAcrossI
 		desired,
 		prev,
 		firstSnapshot,
+		90*time.Second,
 	)
 	if first != "stopped" {
 		t.Fatalf("first manual intervention = %q, want stopped", first)
@@ -985,6 +1096,7 @@ func TestDetectExternalAuthorityManualInterventionKeepsBambuStoppedStickyAcrossI
 			ManualIntervention:   "stopped",
 		},
 		firstSnapshot,
+		90*time.Second,
 	)
 	if second != "stopped" {
 		t.Fatalf("second manual intervention = %q, want stopped", second)
@@ -1191,6 +1303,19 @@ func TestBambuPrintStartVerificationTimeoutHasHigherFloor(t *testing.T) {
 	a.cfg.MoonrakerRequestTimeout = 120 * time.Second
 	if got := a.bambuPrintStartVerificationTimeout(); got != 120*time.Second {
 		t.Fatalf("bambuPrintStartVerificationTimeout() = %s, want 120s", got)
+	}
+}
+
+func TestBambuVerificationSnapshotRequestTimeoutHasFloor(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.BambuLANRuntimeTimeout = 250 * time.Millisecond
+	if got := a.bambuVerificationSnapshotRequestTimeout(); got != 5*time.Second {
+		t.Fatalf("bambuVerificationSnapshotRequestTimeout() = %s, want 5s floor", got)
+	}
+
+	a.cfg.BambuLANRuntimeTimeout = 8 * time.Second
+	if got := a.bambuVerificationSnapshotRequestTimeout(); got != 8*time.Second {
+		t.Fatalf("bambuVerificationSnapshotRequestTimeout() = %s, want configured timeout", got)
 	}
 }
 
@@ -1717,6 +1842,95 @@ func TestRefreshCurrentStateFromBindingsBambuInflightPrintSuppressesTransientCon
 	}
 }
 
+func TestPushPrinterControlStatusOnceBambuInflightPrintUsesCachedSnapshot(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-lan-runtime",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+	a.bindings[1] = edgeBinding{
+		PrinterID:     1,
+		AdapterFamily: "bambu",
+		EndpointURL:   "bambu://printer-lan-runtime",
+	}
+	a.inflightActions[1] = action{
+		PrinterID: 1,
+		Kind:      "print",
+		Target: desiredStateItem{
+			PrinterID:           1,
+			DesiredPrinterState: "printing",
+			DesiredJobState:     "printing",
+			JobID:               "job-1",
+			PlateID:             7,
+			IntentVersion:       3,
+		},
+	}
+
+	controlStatus := &printerControlStatusSnapshot{
+		Nozzle: printerTemperatureStatus{Available: true},
+		Fans: map[string]printerFanStatus{
+			"part_cooling": {Supported: true, State: "on"},
+		},
+		MotionSupported: true,
+		HomeSupported:   true,
+	}
+	a.recordBambuLANRuntimeSnapshot("printer-lan-runtime", "192.168.100.172", bindingSnapshot{
+		PrinterState:     "queued",
+		JobState:         "pending",
+		TelemetrySource:  telemetrySourceBambuLANMQTT,
+		RawPrinterStatus: "PREPARE",
+		ControlStatus:    controlStatus,
+	})
+	record := a.bambuLANRuntimeRecords["printer-lan-runtime"]
+	record.LastSuccessAt = time.Now().UTC().Add(-2 * time.Second)
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		return bindingSnapshot{}, errors.New("bambu lan mqtt read failed: read tcp 192.168.100.157:51394->192.168.100.172:8883: i/o timeout")
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	var received pushPrinterControlStatusRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/edge/agents/agent-test/control-status" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	a.bootstrap = bootstrapConfig{
+		ControlPlaneURL: server.URL,
+		SaaSAPIKey:      "test-key",
+		AgentID:         "agent-test",
+	}
+
+	if err := a.pushPrinterControlStatusOnce(context.Background()); err != nil {
+		t.Fatalf("pushPrinterControlStatusOnce failed: %v", err)
+	}
+	if len(received.Items) != 1 {
+		t.Fatalf("control-status items = %d, want 1 cached item", len(received.Items))
+	}
+	if fan := received.Items[0].Status.Fans["part_cooling"]; fan.State != "on" {
+		t.Fatalf("part cooling state = %q, want cached on state", fan.State)
+	}
+}
+
 func TestShouldSuppressBambuRuntimeConnectivityFailureForRuntimeCommandGraceWindow(t *testing.T) {
 	a := newTestAgent(t)
 	a.extendBambuRuntimeConnectivitySuppression(23, 5*time.Second)
@@ -1734,6 +1948,13 @@ func TestShouldSuppressBambuRuntimeConnectivityFailureForQueuedRuntimeCommand(t 
 
 	if !a.shouldSuppressBambuRuntimeConnectivityFailure(23, errors.New("read tcp: i/o timeout")) {
 		t.Fatalf("expected queued runtime command suppression to be active")
+	}
+}
+
+func TestSummarizePrinterFacingActionErrorRewritesBambuVerificationTimeout(t *testing.T) {
+	message := summarizePrinterFacingActionError("bambu print start verification timeout after 90s waiting for queued/printing state (last_error=bambu lan mqtt read failed: read tcp 1.2.3.4:123->5.6.7.8:8883: i/o timeout)")
+	if message != "Bambu print start timed out waiting for the printer to confirm queued/printing state." {
+		t.Fatalf("message = %q, want concise printer-facing timeout summary", message)
 	}
 }
 
@@ -1778,6 +1999,55 @@ func TestFetchBambuLANRuntimeSnapshotByPrinterIDUsesConfiguredTimeout(t *testing
 
 	if _, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(context.Background(), "printer-lan-runtime"); err != nil {
 		t.Fatalf("fetchBambuLANRuntimeSnapshotByPrinterID failed: %v", err)
+	}
+}
+
+func TestVerifyBambuPrintStartUsesVerificationSnapshotTimeoutFloor(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+	a.cfg.BambuLANRuntimeTimeout = 250 * time.Millisecond
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer-lan-runtime",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	var calls int
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(ctx context.Context, host string, printerID string, accessCode string) (bindingSnapshot, error) {
+		calls++
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("expected verification snapshot context deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining > 6*time.Second || remaining < 4*time.Second {
+			t.Fatalf("verification snapshot timeout = %v, want approximately 5s", remaining)
+		}
+		return bindingSnapshot{
+			PrinterState:     "queued",
+			JobState:         "pending",
+			TelemetrySource:  telemetrySourceBambuLANMQTT,
+			RawPrinterStatus: "PREPARE",
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	if err := a.verifyBambuPrintStart(context.Background(), "printer-lan-runtime"); err != nil {
+		t.Fatalf("verifyBambuPrintStart failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("fetchBambuLANMQTTSnapshot calls = %d, want 1", calls)
 	}
 }
 
@@ -7231,6 +7501,817 @@ func TestDefaultUploadBambuLANArtifactDeletesThenRetriesOnOverwrite(t *testing.T
 	}
 	if len(fakeClient.deletedRemoteNames) != 1 || fakeClient.deletedRemoteNames[0] != "pfh-test.gcode.3mf" {
 		t.Fatalf("deleted remote names = %#v, want overwrite delete", fakeClient.deletedRemoteNames)
+	}
+}
+
+func TestListMoonrakerPrinterFilesFiltersPrintableAndMarksActive(t *testing.T) {
+	a := newTestAgent(t)
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/list":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": []map[string]any{
+					{"path": "folder/plate_a.gcode", "size": 123, "modified": 1710000000},
+					{"path": "notes.txt", "size": 10, "modified": 1710000001},
+				},
+			})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"print_stats": map[string]any{"filename": "folder/plate_a.gcode"},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	files, err := a.listMoonrakerPrinterFiles(context.Background(), moonrakerSrv.URL)
+	if err != nil {
+		t.Fatalf("listMoonrakerPrinterFiles failed: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("file count = %d, want 1 printable file", len(files))
+	}
+	if files[0].Path != "folder/plate_a.gcode" {
+		t.Fatalf("path = %q, want folder/plate_a.gcode", files[0].Path)
+	}
+	if !files[0].IsActiveFile {
+		t.Fatalf("expected moonraker file to be marked active")
+	}
+}
+
+func TestExecuteMoonrakerStartExistingFileUsesSelectedPath(t *testing.T) {
+	a := newTestAgent(t)
+	var startedFilename string
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"size": 321, "modified": 1710000000}})
+		case "/printer/print/start":
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode start payload failed: %v", err)
+			}
+			startedFilename = payload["filename"]
+			w.WriteHeader(http.StatusOK)
+		case "/server/files/list":
+			writeJSON(w, http.StatusOK, map[string]any{"result": []map[string]any{}})
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"print_stats": map[string]any{"filename": ""},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	modifiedAt := time.Unix(1710000000, 0).UTC()
+	err := a.executeMoonrakerStartExistingFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "start_existing_file",
+			Payload: map[string]any{
+				"path": "folder/plate_a.gcode",
+				"expected_fingerprint": map[string]any{
+					"path":        "folder/plate_a.gcode",
+					"size_bytes":  321,
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: moonrakerSrv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerStartExistingFile failed: %v", err)
+	}
+	if startedFilename != "folder/plate_a.gcode" {
+		t.Fatalf("started filename = %q, want folder/plate_a.gcode", startedFilename)
+	}
+}
+
+func TestExecuteMoonrakerDeleteFileDeletesSelectedPath(t *testing.T) {
+	a := newTestAgent(t)
+	var deletePath string
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"size": 321, "modified": 1710000000}})
+		case "/server/files/gcodes/folder/plate_a.gcode":
+			deletePath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"print_stats": map[string]any{"filename": ""},
+					},
+				},
+			})
+		case "/server/files/list":
+			writeJSON(w, http.StatusOK, map[string]any{"result": []map[string]any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	modifiedAt := time.Unix(1710000000, 0).UTC()
+	err := a.executeMoonrakerDeleteFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "delete_file",
+			Payload: map[string]any{
+				"path": "folder/plate_a.gcode",
+				"expected_fingerprint": map[string]any{
+					"path":        "folder/plate_a.gcode",
+					"size_bytes":  321,
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: moonrakerSrv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerDeleteFile failed: %v", err)
+	}
+	if deletePath == "" {
+		t.Fatalf("expected moonraker delete endpoint to be called")
+	}
+}
+
+func TestExecuteMoonrakerDeleteAllFilesDeletesEveryTarget(t *testing.T) {
+	a := newTestAgent(t)
+	var deletePaths []string
+
+	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/files/metadata":
+			filename := r.URL.Query().Get("filename")
+			if filename == "folder/a.gcode" || filename == "folder/b.gcode" {
+				writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"size": 321, "modified": 1710000000}})
+				return
+			}
+			http.NotFound(w, r)
+		case "/server/files/gcodes/folder/a.gcode", "/server/files/gcodes/folder/b.gcode":
+			deletePaths = append(deletePaths, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		case "/printer/objects/query":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result": map[string]any{
+					"status": map[string]any{
+						"print_stats": map[string]any{"filename": ""},
+					},
+				},
+			})
+		case "/server/files/list":
+			writeJSON(w, http.StatusOK, map[string]any{"result": []map[string]any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer moonrakerSrv.Close()
+
+	modifiedAt := time.Unix(1710000000, 0).UTC()
+	err := a.executeMoonrakerDeleteAllFiles(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "delete_all_files",
+			Payload: map[string]any{
+				"files": []any{
+					map[string]any{
+						"path":         "folder/a.gcode",
+						"display_name": "a.gcode",
+						"expected_fingerprint": map[string]any{
+							"path":        "folder/a.gcode",
+							"size_bytes":  321,
+							"modified_at": modifiedAt.Format(time.RFC3339Nano),
+						},
+					},
+					map[string]any{
+						"path":         "folder/b.gcode",
+						"display_name": "b.gcode",
+						"expected_fingerprint": map[string]any{
+							"path":        "folder/b.gcode",
+							"size_bytes":  321,
+							"modified_at": modifiedAt.Format(time.RFC3339Nano),
+						},
+					},
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: moonrakerSrv.URL},
+	)
+	if err != nil {
+		t.Fatalf("executeMoonrakerDeleteAllFiles failed: %v", err)
+	}
+	if len(deletePaths) != 2 {
+		t.Fatalf("delete paths = %#v, want both targets deleted", deletePaths)
+	}
+}
+
+func TestDefaultListBambuLANPrinterFilesFiltersPrintableAndMarksActive(t *testing.T) {
+	now := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		listNames:    []string{"pfh-a.3mf", "pfh-a_plate_1.gcode", "1_pfh-a.gcode.bbl", "notes.txt"},
+		sizeValue:    456,
+		modTimeValue: &now,
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	files, err := defaultListBambuLANPrinterFiles(
+		context.Background(),
+		bambustore.BambuLANCredentials{Host: "192.168.0.10", AccessCode: "12345678"},
+		"pfh-a.gcode.3mf",
+	)
+	if err != nil {
+		t.Fatalf("defaultListBambuLANPrinterFiles failed: %v", err)
+	}
+	if len(fakeClient.cwdDirs) != 1 || fakeClient.cwdDirs[0] != "cache" {
+		t.Fatalf("cwd dirs = %#v, want [\"cache\"]", fakeClient.cwdDirs)
+	}
+	if len(files) != 2 {
+		t.Fatalf("file count = %d, want 2 visible cache-backed rows", len(files))
+	}
+	if files[0].Path != "pfh-a.3mf" || files[0].Location != "sdcard" || files[0].Kind != "bambu_cache_3mf" {
+		t.Fatalf("unexpected 3mf row = %#v", files[0])
+	}
+	if !files[0].IsActiveFile || !files[1].IsActiveFile {
+		t.Fatalf("expected both logical bambu rows sharing the same cache key to be marked active")
+	}
+	deleteDescriptor := files[1].DeleteDescriptor
+	companionPaths, ok := deleteDescriptor["companion_ftps_paths"].([]string)
+	if !ok {
+		t.Fatalf("delete descriptor companion paths = %#v, want []string", deleteDescriptor["companion_ftps_paths"])
+	}
+	if len(companionPaths) != 1 || companionPaths[0] != "/cache/1_pfh-a.gcode.bbl" {
+		t.Fatalf("companion paths = %#v, want paired bbl companion", companionPaths)
+	}
+}
+
+func TestDefaultListBambuLANPrinterFilesShowsBBLOnlySurvivorRows(t *testing.T) {
+	now := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		listNames:    []string{"1_printer_23_plate_13_1772891362502083000.gcode.bbl"},
+		sizeValue:    146,
+		modTimeValue: &now,
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	files, err := defaultListBambuLANPrinterFiles(
+		context.Background(),
+		bambustore.BambuLANCredentials{Host: "192.168.0.10", AccessCode: "12345678"},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("defaultListBambuLANPrinterFiles failed: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("file count = %d, want 1 bbl-backed survivor row", len(files))
+	}
+	if files[0].Path != "1_printer_23_plate_13_1772891362502083000.gcode.bbl" {
+		t.Fatalf("path = %q, want raw bbl identity", files[0].Path)
+	}
+	if files[0].DisplayPath != "printer_23_plate_13_1772891362502083000_plate_1.gcode" {
+		t.Fatalf("display_path = %q, want synthesized gcode-facing survivor path", files[0].DisplayPath)
+	}
+	if files[0].Kind != "bambu_cache_project" {
+		t.Fatalf("kind = %q, want bambu_cache_project", files[0].Kind)
+	}
+	if files[0].Format != ".bbl" {
+		t.Fatalf("format = %q, want .bbl", files[0].Format)
+	}
+	if files[0].Startable {
+		t.Fatalf("expected bbl-only survivor row to be non-startable")
+	}
+	deleteDescriptor := files[0].DeleteDescriptor
+	if deleteDescriptor["primary_ftps_path"] != "/cache/1_printer_23_plate_13_1772891362502083000.gcode.bbl" {
+		t.Fatalf("delete descriptor = %#v, want bbl primary path", deleteDescriptor)
+	}
+}
+
+func TestEnrichBambuLANDeleteDescriptorsWithControlTargetsAddsTunnelIdentity(t *testing.T) {
+	a := newTestAgent(t)
+	previousEnsure := ensureBambuLANPluginLibrary
+	previousList := listBambuLANControlModelFiles
+	t.Cleanup(func() {
+		ensureBambuLANPluginLibrary = previousEnsure
+		listBambuLANControlModelFiles = previousList
+	})
+	ensureBambuLANPluginLibrary = func(context.Context, string) (string, error) {
+		return "/tmp/libBambuSource.dylib", nil
+	}
+	listBambuLANControlModelFiles = func(context.Context, string, bambustore.BambuLANCredentials) ([]bambuLANControlModelFile, error) {
+		return []bambuLANControlModelFile{
+			{
+				Name: "pfh-a_plate_1.gcode",
+				Path: "cache/pfh-a_plate_1.gcode",
+			},
+		}, nil
+	}
+
+	files := a.enrichBambuLANDeleteDescriptorsWithControlTargets(
+		context.Background(),
+		bambustore.BambuLANCredentials{Host: "192.168.0.10", AccessCode: "12345678"},
+		[]printerFileEntry{{
+			Path:        "pfh-a_plate_1.gcode",
+			DisplayPath: "pfh-a_plate_1.gcode",
+			DisplayName: "pfh-a_plate_1.gcode",
+			Format:      ".gcode",
+			DeleteDescriptor: map[string]any{
+				"primary_ftps_path":    "/cache/pfh-a_plate_1.gcode",
+				"companion_ftps_paths": []string{"/cache/1_pfh-a.gcode.bbl"},
+			},
+		}},
+	)
+
+	deleteDescriptor := files[0].DeleteDescriptor
+	if deleteDescriptor["control_delete_path"] != "cache/pfh-a_plate_1.gcode" {
+		t.Fatalf("control delete path = %#v, want cache control path", deleteDescriptor["control_delete_path"])
+	}
+	if deleteDescriptor["control_delete_name"] != "pfh-a_plate_1.gcode" {
+		t.Fatalf("control delete name = %#v, want visible control name", deleteDescriptor["control_delete_name"])
+	}
+}
+
+func TestExecuteBambuLANStartExistingFileDispatchesSelectedRemoteFile(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifactBytes := []byte("3mf-bytes")
+	modifiedAt := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:    int64(len(artifactBytes)),
+		retrieveData: artifactBytes,
+		modTimeValue: &modifiedAt,
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	var dispatched bambuLANProjectFileRequest
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, req bambuLANProjectFileRequest) error {
+		dispatched = req
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{PrinterState: "idle", JobState: "pending", TelemetrySource: telemetrySourceBambuLANMQTT}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	err = a.executeBambuLANStartExistingFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "start_existing_file",
+			Payload: map[string]any{
+				"path": "pfh-a.3mf",
+				"expected_fingerprint": map[string]any{
+					"path":        "pfh-a.3mf",
+					"size_bytes":  len(artifactBytes),
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+				"start_descriptor": map[string]any{
+					"ftps_path":           "/cache/pfh-a.3mf",
+					"project_remote_name": "cache/pfh-a.3mf",
+					"project_path":        "Metadata/plate_1.gcode",
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANStartExistingFile failed: %v", err)
+	}
+	if dispatched.RemoteName != "cache/pfh-a.3mf" {
+		t.Fatalf("dispatch remote name = %q, want cache-relative start name", dispatched.RemoteName)
+	}
+	if dispatched.FileMD5 == "" {
+		t.Fatalf("expected remote file md5 to be provided")
+	}
+}
+
+func TestExecuteBambuLANGCodeStartExistingFileDispatchesCacheGCode(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	artifactBytes := []byte("gcode-bytes")
+	modifiedAt := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:    int64(len(artifactBytes)),
+		retrieveData: artifactBytes,
+		modTimeValue: &modifiedAt,
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	var dispatched bambuLANProjectFileRequest
+	previousDispatch := dispatchBambuLANProjectFile
+	dispatchBambuLANProjectFile = func(_ context.Context, _ bambustore.BambuLANCredentials, req bambuLANProjectFileRequest) error {
+		dispatched = req
+		return nil
+	}
+	t.Cleanup(func() {
+		dispatchBambuLANProjectFile = previousDispatch
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{PrinterState: "idle", JobState: "pending", TelemetrySource: telemetrySourceBambuLANMQTT}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	err = a.executeBambuLANStartExistingFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "start_existing_file",
+			Payload: map[string]any{
+				"path": "pfh-a_plate_1.gcode",
+				"expected_fingerprint": map[string]any{
+					"path":        "pfh-a_plate_1.gcode",
+					"size_bytes":  len(artifactBytes),
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+				"start_descriptor": map[string]any{
+					"ftps_path":           "/cache/pfh-a_plate_1.gcode",
+					"project_remote_name": "cache/pfh-a_plate_1.gcode",
+					"project_path":        "",
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANStartExistingFile failed: %v", err)
+	}
+	if dispatched.RemoteName != "cache/pfh-a_plate_1.gcode" {
+		t.Fatalf("dispatch remote name = %q, want cache gcode path", dispatched.RemoteName)
+	}
+	if dispatched.ProjectPath != "" {
+		t.Fatalf("dispatch project path = %q, want empty for cache gcode start", dispatched.ProjectPath)
+	}
+}
+
+func TestExecuteBambuLANDeleteFileDeletesSelectedRemoteFile(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	modifiedAt := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:    456,
+		modTimeValue: &modifiedAt,
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{PrinterState: "idle", JobState: "pending", TelemetrySource: telemetrySourceBambuLANMQTT}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	var controlTargets []bambuLANControlDeleteTarget
+	previousEnsure := ensureBambuLANPluginLibrary
+	previousControlDelete := deleteBambuLANControlFiles
+	ensureBambuLANPluginLibrary = func(context.Context, string) (string, error) {
+		return "/tmp/libBambuSource.dylib", nil
+	}
+	deleteBambuLANControlFiles = func(_ context.Context, _ string, _ bambustore.BambuLANCredentials, targets []bambuLANControlDeleteTarget) error {
+		controlTargets = append(controlTargets, targets...)
+		return nil
+	}
+	t.Cleanup(func() {
+		ensureBambuLANPluginLibrary = previousEnsure
+		deleteBambuLANControlFiles = previousControlDelete
+	})
+
+	err = a.executeBambuLANDeleteFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "delete_file",
+			Payload: map[string]any{
+				"path": "pfh-a_plate_1.gcode",
+				"expected_fingerprint": map[string]any{
+					"path":        "pfh-a_plate_1.gcode",
+					"size_bytes":  456,
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+				"delete_descriptor": map[string]any{
+					"primary_ftps_path":    "/cache/pfh-a_plate_1.gcode",
+					"companion_ftps_paths": []any{"/cache/1_pfh-a.gcode.bbl"},
+					"control_delete_path":  "cache/pfh-a_plate_1.gcode",
+					"control_delete_name":  "pfh-a_plate_1.gcode",
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANDeleteFile failed: %v", err)
+	}
+	if len(controlTargets) != 1 || controlTargets[0].Path != "cache/pfh-a_plate_1.gcode" {
+		t.Fatalf("control delete targets = %#v, want one control delete path", controlTargets)
+	}
+	if len(fakeClient.deletedRemoteNames) != 2 {
+		t.Fatalf("deleted remote names = %#v, want primary cache gcode plus hidden companion", fakeClient.deletedRemoteNames)
+	}
+	if fakeClient.deletedRemoteNames[0] != "/cache/pfh-a_plate_1.gcode" || fakeClient.deletedRemoteNames[1] != "/cache/1_pfh-a.gcode.bbl" {
+		t.Fatalf("deleted remote names = %#v, want cache-backed delete targets", fakeClient.deletedRemoteNames)
+	}
+}
+
+func TestExecuteBambuLANDeleteAllFilesDeletesEveryTargetUnderOneCommand(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	modifiedAt := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:    456,
+		modTimeValue: &modifiedAt,
+		listNames:    []string{"pfh-a_plate_1.gcode", "1_pfh-a.gcode.bbl", "pfh-b.3mf"},
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{PrinterState: "idle", JobState: "pending", TelemetrySource: telemetrySourceBambuLANMQTT}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	previousEnsure := ensureBambuLANPluginLibrary
+	previousList := listBambuLANControlModelFiles
+	ensureBambuLANPluginLibrary = func(context.Context, string) (string, error) {
+		return "", errors.New("skip control plugin in bulk delete test")
+	}
+	listBambuLANControlModelFiles = func(context.Context, string, bambustore.BambuLANCredentials) ([]bambuLANControlModelFile, error) {
+		return nil, errors.New("skip control list in bulk delete test")
+	}
+	t.Cleanup(func() {
+		ensureBambuLANPluginLibrary = previousEnsure
+		listBambuLANControlModelFiles = previousList
+	})
+
+	err = a.executeBambuLANDeleteAllFiles(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "delete_all_files",
+			Payload: map[string]any{
+				"files": []any{
+					map[string]any{
+						"path":         "pfh-a_plate_1.gcode",
+						"display_name": "pfh-a_plate_1.gcode",
+						"expected_fingerprint": map[string]any{
+							"path":        "pfh-a_plate_1.gcode",
+							"size_bytes":  456,
+							"modified_at": modifiedAt.Format(time.RFC3339Nano),
+						},
+						"delete_descriptor": map[string]any{
+							"primary_ftps_path":    "/cache/pfh-a_plate_1.gcode",
+							"companion_ftps_paths": []any{"/cache/1_pfh-a.gcode.bbl"},
+						},
+					},
+					map[string]any{
+						"path":         "pfh-b.3mf",
+						"display_name": "pfh-b.3mf",
+						"expected_fingerprint": map[string]any{
+							"path":        "pfh-b.3mf",
+							"size_bytes":  456,
+							"modified_at": modifiedAt.Format(time.RFC3339Nano),
+						},
+						"delete_descriptor": map[string]any{
+							"primary_ftps_path":    "/cache/pfh-b.3mf",
+							"companion_ftps_paths": []any{},
+						},
+					},
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err != nil {
+		t.Fatalf("executeBambuLANDeleteAllFiles failed: %v", err)
+	}
+	if len(fakeClient.deletedRemoteNames) != 3 {
+		t.Fatalf("deleted remote names = %#v, want three total deletes across one bulk command", fakeClient.deletedRemoteNames)
+	}
+}
+
+func TestExecuteBambuLANDeleteFileFailsWhenRowStillExistsAfterVerification(t *testing.T) {
+	a := newTestAgent(t)
+	a.cfg.EnableBambu = true
+
+	store, err := bambustore.NewBambuLANCredentialsFileStore(filepath.Join(t.TempDir(), "bambu", "lan_credentials.json"))
+	if err != nil {
+		t.Fatalf("NewBambuLANCredentialsFileStore failed: %v", err)
+	}
+	if err := store.Upsert(context.Background(), bambustore.BambuLANCredentials{
+		Serial:     "printer_1",
+		Host:       "192.168.100.172",
+		AccessCode: "12345678",
+	}); err != nil {
+		t.Fatalf("store.Upsert failed: %v", err)
+	}
+	a.bambuLANStore = store
+
+	modifiedAt := time.Now().UTC()
+	fakeClient := &fakeBambuLANArtifactClient{
+		sizeValue:            456,
+		modTimeValue:         &modifiedAt,
+		preserveListOnDelete: true,
+		listNames:            []string{"pfh-a_plate_1.gcode", "1_pfh-a.gcode.bbl"},
+	}
+	previousDial := dialBambuLANArtifactClient
+	dialBambuLANArtifactClient = func(context.Context, string) (bambuLANArtifactClient, error) {
+		return fakeClient, nil
+	}
+	t.Cleanup(func() {
+		dialBambuLANArtifactClient = previousDial
+	})
+
+	previousFetch := fetchBambuLANMQTTSnapshot
+	fetchBambuLANMQTTSnapshot = func(_ context.Context, _ string, _ string, _ string) (bindingSnapshot, error) {
+		return bindingSnapshot{PrinterState: "idle", JobState: "pending", TelemetrySource: telemetrySourceBambuLANMQTT}, nil
+	}
+	t.Cleanup(func() {
+		fetchBambuLANMQTTSnapshot = previousFetch
+	})
+
+	err = a.executeBambuLANDeleteFile(
+		context.Background(),
+		action{
+			PrinterID: 1,
+			Kind:      "delete_file",
+			Payload: map[string]any{
+				"path": "pfh-a_plate_1.gcode",
+				"expected_fingerprint": map[string]any{
+					"path":        "pfh-a_plate_1.gcode",
+					"size_bytes":  456,
+					"modified_at": modifiedAt.Format(time.RFC3339Nano),
+				},
+				"delete_descriptor": map[string]any{
+					"primary_ftps_path":    "/cache/pfh-a_plate_1.gcode",
+					"companion_ftps_paths": []any{"/cache/1_pfh-a.gcode.bbl"},
+				},
+			},
+		},
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer_1"},
+	)
+	if err == nil {
+		t.Fatalf("expected delete verification to fail when the visible row still rebuilds")
+	}
+	if !strings.Contains(err.Error(), "still present after delete verification") {
+		t.Fatalf("error = %v, want verification failure", err)
+	}
+}
+
+func TestPrinterFileFingerprintMatchesAcceptsSameInstantAtSecondPrecision(t *testing.T) {
+	modifiedAt := time.Date(2026, 3, 29, 13, 0, 0, 0, time.UTC)
+	expectedAt := modifiedAt.Add(250 * time.Millisecond)
+	sizeBytes := int64(456)
+	if !printerFileFingerprintMatches(
+		"pfh-a.gcode.3mf",
+		&sizeBytes,
+		&modifiedAt,
+		printerFileFingerprint{
+			Path:       "pfh-a.gcode.3mf",
+			SizeBytes:  &sizeBytes,
+			ModifiedAt: &expectedAt,
+		},
+	) {
+		t.Fatalf("expected fingerprint comparison to accept equivalent timestamps within the same second")
+	}
+}
+
+func TestPrinterFileFingerprintMatchesRejectsDifferentSecond(t *testing.T) {
+	modifiedAt := time.Date(2026, 3, 29, 13, 0, 0, 0, time.UTC)
+	expectedAt := modifiedAt.Add(2 * time.Second)
+	sizeBytes := int64(456)
+	if printerFileFingerprintMatches(
+		"pfh-a.gcode.3mf",
+		&sizeBytes,
+		&modifiedAt,
+		printerFileFingerprint{
+			Path:       "pfh-a.gcode.3mf",
+			SizeBytes:  &sizeBytes,
+			ModifiedAt: &expectedAt,
+		},
+	) {
+		t.Fatalf("expected fingerprint comparison to reject different-second timestamps")
 	}
 }
 

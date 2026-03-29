@@ -176,6 +176,17 @@ func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error)
 	}, nil
 }
 
+func (m *Manager) EnsurePluginBundle(ctx context.Context) (dir string, sourceLibrary string, err error) {
+	if m == nil {
+		return "", "", errors.New("bambu_camera_runtime_unavailable: runtime manager is not configured")
+	}
+	pluginDir, pluginLib, err := m.ensurePluginBundle(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("bambu_camera_runtime_unavailable: %w", err)
+	}
+	return pluginDir, pluginLib, nil
+}
+
 func (m *Manager) ensurePluginBundle(ctx context.Context) (dir string, sourceLibrary string, err error) {
 	artifact, err := currentPluginArtifactFn()
 	if err != nil {

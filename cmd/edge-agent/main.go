@@ -231,6 +231,46 @@ type printerCommandAckResponse struct {
 	Accepted bool `json:"accepted"`
 }
 
+type printerFileFingerprint struct {
+	Path       string     `json:"path"`
+	SizeBytes  *int64     `json:"size_bytes,omitempty"`
+	ModifiedAt *time.Time `json:"modified_at,omitempty"`
+}
+
+type printerFileEntry struct {
+	Path                string                 `json:"path"`
+	DisplayPath         string                 `json:"display_path,omitempty"`
+	DisplayName         string                 `json:"display_name"`
+	SizeBytes           *int64                 `json:"size_bytes,omitempty"`
+	ModifiedAt          *time.Time             `json:"modified_at,omitempty"`
+	Format              string                 `json:"format,omitempty"`
+	Origin              string                 `json:"origin,omitempty"`
+	Kind                string                 `json:"kind,omitempty"`
+	Location            string                 `json:"location,omitempty"`
+	Startable           bool                   `json:"startable"`
+	Deletable           bool                   `json:"deletable"`
+	IsActiveFile        bool                   `json:"is_active_file"`
+	StartDescriptor     map[string]any         `json:"start_descriptor,omitempty"`
+	DeleteDescriptor    map[string]any         `json:"delete_descriptor,omitempty"`
+	ExpectedFingerprint printerFileFingerprint `json:"expected_fingerprint"`
+}
+
+type printerFilesSnapshotItem struct {
+	PrinterID     int                `json:"printer_id"`
+	AdapterFamily string             `json:"adapter_family,omitempty"`
+	Files         []printerFileEntry `json:"files"`
+	ReportedAt    edgeTimestamp      `json:"reported_at"`
+	Error         string             `json:"error,omitempty"`
+}
+
+type printerFilesReportRequest struct {
+	Items []printerFilesSnapshotItem `json:"items"`
+}
+
+type printerFilesReportResponse struct {
+	Accepted int `json:"accepted"`
+}
+
 type bambuCredentialRecoveryRequest struct {
 	PrinterID   int    `json:"printer_id"`
 	EndpointURL string `json:"endpoint_url"`
@@ -539,6 +579,7 @@ type bindingSnapshot struct {
 	RemainingSeconds    *float64
 	TelemetrySource     string
 	RawPrinterStatus    string
+	ActiveFilePath      string
 	ManualIntervention  string
 	CommandCapabilities map[string]any
 	ControlStatus       *printerControlStatusSnapshot
@@ -580,6 +621,7 @@ type appConfig struct {
 	BambuControlStatusPushInterval    time.Duration
 	BindingsPollInterval              time.Duration
 	ConfigCommandsPollInterval        time.Duration
+	PrinterCommandsPollInterval       time.Duration
 	DesiredStatePollInterval          time.Duration
 	StatePushInterval                 time.Duration
 	ConvergenceTickInterval           time.Duration
@@ -1359,6 +1401,7 @@ func loadConfig() appConfig {
 		BambuControlStatusPushInterval:    parseDurationMS("BAMBU_CONTROL_STATUS_PUSH_INTERVAL_MS", 1000),
 		BindingsPollInterval:              parseDurationMS("BINDINGS_POLL_INTERVAL_MS", 5000),
 		ConfigCommandsPollInterval:        parseDurationMS("CONFIG_COMMANDS_POLL_INTERVAL_MS", 5000),
+		PrinterCommandsPollInterval:       parseDurationMS("PRINTER_COMMANDS_POLL_INTERVAL_MS", 1000),
 		DesiredStatePollInterval:          parseDurationMS("DESIRED_STATE_POLL_INTERVAL_MS", 3000),
 		StatePushInterval:                 parseDurationMS("STATE_PUSH_INTERVAL_MS", 3000),
 		ConvergenceTickInterval:           parseDurationMS("CONVERGENCE_TICK_INTERVAL_MS", 500),
@@ -2209,9 +2252,9 @@ func (a *agent) acknowledgeConfigCommand(
 
 func (a *agent) printerCommandsPollLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	interval := a.cfg.ConfigCommandsPollInterval
+	interval := a.cfg.PrinterCommandsPollInterval
 	if interval <= 0 {
-		interval = 5 * time.Second
+		interval = 1 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -2317,7 +2360,7 @@ func (a *agent) enqueuePrinterCommand(command printerCommandItem) error {
 		return errors.New("validation_error: printer command is missing printer_id")
 	}
 	switch commandKey {
-	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
+	case "pause", "resume", "stop", "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature", "refresh_file_index", "start_existing_file", "delete_file", "delete_all_files":
 	default:
 		return fmt.Errorf("validation_error: unsupported printer command key %q", commandKey)
 	}
@@ -2453,7 +2496,16 @@ func truncatePrinterCommandAckError(message string) string {
 }
 
 func summarizePrinterFacingActionError(raw string) string {
-	return summarizePrinterCommandAckError(raw)
+	trimmed := strings.TrimSpace(raw)
+	lowered := strings.ToLower(trimmed)
+	switch {
+	case strings.Contains(lowered, "bambu print start verification timeout"):
+		return "Bambu print start timed out waiting for the printer to confirm queued/printing state."
+	case strings.Contains(lowered, "bambu command verification timeout"):
+		return "Bambu command timed out waiting for the printer to confirm the requested state."
+	default:
+		return summarizePrinterCommandAckError(raw)
+	}
 }
 
 func (a *agent) cameraSessionsPollLoop(ctx context.Context, wg *sync.WaitGroup) {
@@ -3605,31 +3657,13 @@ func mapDesiredToAction(current, desired string) string {
 	switch desired {
 	case "printing":
 		switch current {
-		case "paused":
-			return "resume"
-		case "printing", "queued":
+		case "paused", "printing", "queued":
 			return "noop"
 		default:
 			return "print"
 		}
-	case "paused":
-		switch current {
-		case "printing":
-			return "pause"
-		case "queued":
-			return "noop"
-		case "paused":
-			return "noop"
-		default:
-			return "invalid"
-		}
-	case "idle":
-		switch current {
-		case "printing", "paused", "queued":
-			return "stop"
-		default:
-			return "noop"
-		}
+	case "paused", "idle":
+		return "noop"
 	default:
 		return "invalid"
 	}
@@ -3637,7 +3671,7 @@ func mapDesiredToAction(current, desired string) string {
 
 func isPrinterRuntimeCommandKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
+	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature", "refresh_file_index", "start_existing_file", "delete_file", "delete_all_files":
 		return true
 	default:
 		return false
@@ -4176,6 +4210,14 @@ func (a *agent) executeMoonrakerAction(ctx context.Context, queuedAction action,
 		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "LOAD_FILAMENT")
 	case "unload_filament":
 		return a.executeMoonrakerGCodeMacroAction(ctx, binding.EndpointURL, "UNLOAD_FILAMENT")
+	case "refresh_file_index":
+		return a.refreshMoonrakerPrinterFiles(ctx, queuedAction, binding)
+	case "start_existing_file":
+		return a.executeMoonrakerStartExistingFile(ctx, queuedAction, binding)
+	case "delete_file":
+		return a.executeMoonrakerDeleteFile(ctx, queuedAction, binding)
+	case "delete_all_files":
+		return a.executeMoonrakerDeleteAllFiles(ctx, queuedAction, binding)
 	case "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
 		return a.executeMoonrakerPrinterCommand(ctx, binding.EndpointURL, queuedAction)
 	default:
@@ -4195,6 +4237,14 @@ func (a *agent) executeBambuAction(ctx context.Context, queuedAction action, bin
 			return err
 		}
 		return a.executeBambuCloudAction(ctx, queuedAction, binding)
+	case "refresh_file_index":
+		return a.refreshBambuPrinterFiles(ctx, queuedAction, binding)
+	case "start_existing_file":
+		return a.executeBambuLANStartExistingFile(ctx, queuedAction, binding)
+	case "delete_file":
+		return a.executeBambuLANDeleteFile(ctx, queuedAction, binding)
+	case "delete_all_files":
+		return a.executeBambuLANDeleteAllFiles(ctx, queuedAction, binding)
 	case "light_on", "light_off", "load_filament", "unload_filament", "home_axes", "jog_motion", "jog_motion_batch", "set_fan_enabled", "set_nozzle_temperature", "set_bed_temperature":
 		return a.executeBambuLANPrinterCommand(ctx, queuedAction, binding)
 	default:
@@ -4304,6 +4354,7 @@ func (a *agent) executeBambuConnectPrintAction(ctx context.Context, queuedAction
 		"transport":      "bambu_connect_uri",
 		"adapter_family": "bambu",
 	})
+	a.extendBambuRuntimeConnectivitySuppression(queuedAction.PrinterID, a.bambuPrintStartVerificationTimeout())
 
 	if err := a.verifyBambuPrintStart(ctx, strings.TrimSpace(printerID)); err != nil {
 		return fmt.Errorf(
@@ -4499,6 +4550,7 @@ func (a *agent) executeBambuCloudPrintAction(ctx context.Context, queuedAction a
 		a.audit("bambu_print_start_dispatch_failure", details)
 		return fmt.Errorf("bambu print start cloud dispatch failed: %w", err)
 	}
+	a.extendBambuRuntimeConnectivitySuppression(queuedAction.PrinterID, a.bambuPrintStartVerificationTimeout())
 	if err := a.verifyBambuPrintStart(ctx, strings.TrimSpace(printerID)); err != nil {
 		return fmt.Errorf("bambu_start_verification_timeout: %w", err)
 	}
@@ -4908,8 +4960,20 @@ func (a *agent) bambuPrintStartVerificationTimeout() time.Duration {
 	return timeout
 }
 
+func (a *agent) bambuVerificationSnapshotRequestTimeout() time.Duration {
+	timeout := a.cfg.BambuLANRuntimeTimeout
+	if timeout <= 0 {
+		timeout = defaultBambuLANRuntimeTimeout
+	}
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	return timeout
+}
+
 func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) error {
 	timeout := a.bambuPrintStartVerificationTimeout()
+	verificationSnapshotTimeout := a.bambuVerificationSnapshotRequestTimeout()
 	deadline := time.Now().UTC().Add(timeout)
 	lastPrinterState := ""
 	lastJobState := ""
@@ -4922,7 +4986,7 @@ func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) err
 		if time.Now().UTC().After(deadline) {
 			if lastPrinterState != "" || lastJobState != "" {
 				return fmt.Errorf(
-					"connection error: bambu print start verification timeout after %s (last_printer_state=%s last_job_state=%s last_cloud_status=%s last_error=%s)",
+					"bambu print start verification timeout after %s waiting for queued/printing state (last_printer_state=%s last_job_state=%s last_cloud_status=%s last_error=%s)",
 					timeout,
 					lastPrinterState,
 					lastJobState,
@@ -4931,12 +4995,12 @@ func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) err
 				)
 			}
 			if lastErrMessage != "" {
-				return fmt.Errorf("connection error: bambu print start verification timeout after %s (last_error=%s)", timeout, lastErrMessage)
+				return fmt.Errorf("bambu print start verification timeout after %s waiting for queued/printing state (last_error=%s)", timeout, lastErrMessage)
 			}
-			return fmt.Errorf("connection error: bambu print start verification timeout after %s", timeout)
+			return fmt.Errorf("bambu print start verification timeout after %s waiting for queued/printing state", timeout)
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, timeout)
-		snapshot, err := a.fetchBambuVerificationSnapshotByPrinterID(requestCtx, printerID)
+		requestCtx, cancel := context.WithTimeout(ctx, verificationSnapshotTimeout)
+		snapshot, err := a.fetchBambuVerificationSnapshotByPrinterIDWithLANTimeout(requestCtx, printerID, verificationSnapshotTimeout)
 		cancel()
 		if err == nil {
 			lastPrinterState = snapshot.PrinterState
@@ -4954,7 +5018,11 @@ func (a *agent) verifyBambuPrintStart(ctx context.Context, printerID string) err
 }
 
 func (a *agent) fetchBambuVerificationSnapshotByPrinterID(ctx context.Context, printerID string) (bindingSnapshot, error) {
-	lanSnapshot, lanErr := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
+	return a.fetchBambuVerificationSnapshotByPrinterIDWithLANTimeout(ctx, printerID, 0)
+}
+
+func (a *agent) fetchBambuVerificationSnapshotByPrinterIDWithLANTimeout(ctx context.Context, printerID string, lanRequestTimeout time.Duration) (bindingSnapshot, error) {
+	lanSnapshot, lanErr := a.fetchBambuLANRuntimeSnapshotByPrinterIDWithTimeout(ctx, printerID, lanRequestTimeout)
 	if lanErr == nil {
 		return lanSnapshot, nil
 	}
@@ -5003,6 +5071,7 @@ func matchesBambuPrintStartExpectation(printerState string, jobState string) boo
 
 func (a *agent) verifyBambuControlAction(ctx context.Context, printerID string, command string) error {
 	timeout := a.bambuActionVerificationTimeout()
+	verificationSnapshotTimeout := a.bambuVerificationSnapshotRequestTimeout()
 	deadline := time.Now().UTC().Add(timeout)
 	for {
 		if ctx.Err() != nil {
@@ -5011,8 +5080,8 @@ func (a *agent) verifyBambuControlAction(ctx context.Context, printerID string, 
 		if time.Now().UTC().After(deadline) {
 			return fmt.Errorf("bambu command verification timeout after %s", timeout)
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, timeout)
-		snapshot, err := a.fetchBambuVerificationSnapshotByPrinterID(requestCtx, printerID)
+		requestCtx, cancel := context.WithTimeout(ctx, verificationSnapshotTimeout)
+		snapshot, err := a.fetchBambuVerificationSnapshotByPrinterIDWithLANTimeout(requestCtx, printerID, verificationSnapshotTimeout)
 		cancel()
 		if err == nil && matchesBambuControlExpectation(snapshot.PrinterState, snapshot.JobState, command) {
 			return nil
@@ -7765,6 +7834,13 @@ func (a *agent) pushPrinterControlStatusOnce(ctx context.Context) error {
 			}
 			snapshot, err := a.fetchBambuLANRuntimeSnapshotByPrinterID(ctx, printerID)
 			if err != nil {
+				if a.shouldSuppressBambuRuntimeConnectivityFailure(item.printerID, err) {
+					if previousSnapshot, ok := a.lastBambuLANRuntimeSnapshot(printerID); ok && previousSnapshot.ControlStatus != nil {
+						controlStatus = previousSnapshot.ControlStatus
+						break
+					}
+					continue
+				}
 				a.audit("bambu_control_status_snapshot_error", map[string]any{
 					"printer_id":   item.printerID,
 					"endpoint_url": item.binding.EndpointURL,
@@ -9772,6 +9848,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 			desired,
 			previousCurrent,
 			snapshot,
+			a.bambuPrintStartVerificationTimeout(),
 		)
 		if shouldMarkBambuIdleTransitionCompleted(item.binding, prevState, current, snapshot, detectedManualIntervention) {
 			current.CurrentJobState = "completed"
@@ -9882,11 +9959,41 @@ func shouldPersistPreviousAuthorityManualIntervention(
 	}
 }
 
+func isBambuManagedStartIdlePendingSnapshot(
+	binding edgeBinding,
+	desired desiredStateItem,
+	prev currentStateItem,
+	snapshot bindingSnapshot,
+	startWindow time.Duration,
+	now time.Time,
+) bool {
+	if normalizeAdapterFamily(binding.AdapterFamily) != "bambu" {
+		return false
+	}
+	if snapshot.PrinterState != "idle" || snapshot.JobState != "pending" {
+		return false
+	}
+	if !desiredOwnsActiveLifecycle(desired) {
+		return false
+	}
+	if !previousCurrentMatchesDesiredTarget(prev, desired) {
+		return false
+	}
+	if prev.CurrentPrinterState != "queued" || prev.CurrentJobState != "pending" {
+		return false
+	}
+	if startWindow <= 0 || prev.ReportedAt.IsZero() {
+		return false
+	}
+	return now.UTC().Sub(prev.ReportedAt.UTC()) <= startWindow
+}
+
 func detectExternalAuthorityManualIntervention(
 	binding edgeBinding,
 	desired desiredStateItem,
 	prev currentStateItem,
 	snapshot bindingSnapshot,
+	startWindow time.Duration,
 ) string {
 	explicitAuthority := normalizeAuthorityManualIntervention(snapshot.ManualIntervention)
 	if explicitAuthority != "" {
@@ -9899,6 +10006,9 @@ func detectExternalAuthorityManualIntervention(
 		return raw
 	}
 	if desiredIntentIsNewerThanCurrent(prev, desired) {
+		return ""
+	}
+	if isBambuManagedStartIdlePendingSnapshot(binding, desired, prev, snapshot, startWindow, time.Now().UTC()) {
 		return ""
 	}
 	if shouldPersistPreviousAuthorityManualIntervention(prev, snapshot, desired) {

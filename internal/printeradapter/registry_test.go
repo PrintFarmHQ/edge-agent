@@ -13,6 +13,9 @@ func TestResolveProfileMatchesSnapmakerU1Profile(t *testing.T) {
 	if profile.SupportTier != SupportTierOfficial {
 		t.Fatalf("support tier = %q, want official", profile.SupportTier)
 	}
+	if len(profile.SupportedPanels) == 0 || profile.SupportedPanels[len(profile.SupportedPanels)-1] != PanelFiles {
+		t.Fatalf("supported panels = %#v, want files panel included", profile.SupportedPanels)
+	}
 }
 
 func TestResolveProfileFallsBackToGenericMoonraker(t *testing.T) {
