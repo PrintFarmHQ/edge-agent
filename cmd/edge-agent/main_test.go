@@ -906,6 +906,126 @@ func TestMapDesiredToAction(t *testing.T) {
 	}
 }
 
+func TestDetectExternalAuthorityManualInterventionMarksMoonrakerPausedAsManual(t *testing.T) {
+	desired := desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       4,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             7,
+	}
+	prev := currentStateItem{
+		PrinterID:            1,
+		CurrentPrinterState:  "printing",
+		CurrentJobState:      "printing",
+		JobID:                "job-1",
+		PlateID:              7,
+		IntentVersionApplied: 4,
+	}
+	snapshot := bindingSnapshot{
+		PrinterState: "paused",
+		JobState:     "printing",
+	}
+
+	got := detectExternalAuthorityManualIntervention(
+		edgeBinding{PrinterID: 1, AdapterFamily: "moonraker", EndpointURL: "http://moonraker.local:7125"},
+		desired,
+		prev,
+		snapshot,
+	)
+	if got != "paused" {
+		t.Fatalf("manual intervention = %q, want paused", got)
+	}
+}
+
+func TestDetectExternalAuthorityManualInterventionKeepsBambuStoppedStickyAcrossIdleSnapshots(t *testing.T) {
+	desired := desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       4,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             7,
+	}
+	prev := currentStateItem{
+		PrinterID:            1,
+		CurrentPrinterState:  "printing",
+		CurrentJobState:      "printing",
+		JobID:                "job-1",
+		PlateID:              7,
+		IntentVersionApplied: 4,
+	}
+	firstSnapshot := bindingSnapshot{
+		PrinterState:     "idle",
+		JobState:         "pending",
+		RawPrinterStatus: "IDLE",
+	}
+
+	first := detectExternalAuthorityManualIntervention(
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer-1"},
+		desired,
+		prev,
+		firstSnapshot,
+	)
+	if first != "stopped" {
+		t.Fatalf("first manual intervention = %q, want stopped", first)
+	}
+
+	second := detectExternalAuthorityManualIntervention(
+		edgeBinding{PrinterID: 1, AdapterFamily: "bambu", EndpointURL: "bambu://printer-1"},
+		desired,
+		currentStateItem{
+			PrinterID:            1,
+			CurrentPrinterState:  "idle",
+			CurrentJobState:      "pending",
+			JobID:                "job-1",
+			PlateID:              7,
+			IntentVersionApplied: 4,
+			ManualIntervention:   "stopped",
+		},
+		firstSnapshot,
+	)
+	if second != "stopped" {
+		t.Fatalf("second manual intervention = %q, want stopped", second)
+	}
+}
+
+func TestShouldSuppressConvergenceForAuthorityManualInterventionSuppressesResumeUntilNewerIntent(t *testing.T) {
+	current := currentStateItem{
+		PrinterID:            1,
+		CurrentPrinterState:  "paused",
+		CurrentJobState:      "printing",
+		JobID:                "job-1",
+		PlateID:              7,
+		IntentVersionApplied: 4,
+		ManualIntervention:   "paused",
+	}
+	sameIntent := desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       4,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             7,
+	}
+	if !shouldSuppressConvergenceForAuthorityManualIntervention(current, sameIntent) {
+		t.Fatalf("expected suppression for same-intent manual pause")
+	}
+
+	newerIntent := desiredStateItem{
+		PrinterID:           1,
+		IntentVersion:       5,
+		DesiredPrinterState: "printing",
+		DesiredJobState:     "printing",
+		JobID:               "job-1",
+		PlateID:             7,
+	}
+	if shouldSuppressConvergenceForAuthorityManualIntervention(current, newerIntent) {
+		t.Fatalf("expected newer explicit print intent to clear suppression")
+	}
+}
+
 func TestNormalizeAdapterFamily(t *testing.T) {
 	tests := []struct {
 		name string

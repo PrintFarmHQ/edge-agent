@@ -3503,6 +3503,9 @@ func (a *agent) reconcileOnce() {
 		if current.CurrentPrinterState == desired.DesiredPrinterState && current.IntentVersionApplied >= desired.IntentVersion {
 			continue
 		}
+		if shouldSuppressConvergenceForAuthorityManualIntervention(current, desired) {
+			continue
+		}
 
 		// Desired printing while printer reports queued is a wait-only state.
 		if desired.DesiredPrinterState == "printing" && current.CurrentPrinterState == "queued" && current.LastErrorCode != "connectivity_error" {
@@ -9764,7 +9767,13 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.CurrentPrinterState = snapshot.PrinterState
 		current.CurrentJobState = snapshot.JobState
 		hydrateActiveIntentIdentity(desired, &current, snapshot)
-		if shouldMarkBambuIdleTransitionCompleted(item.binding, prevState, current, snapshot) {
+		detectedManualIntervention := detectExternalAuthorityManualIntervention(
+			item.binding,
+			desired,
+			previousCurrent,
+			snapshot,
+		)
+		if shouldMarkBambuIdleTransitionCompleted(item.binding, prevState, current, snapshot, detectedManualIntervention) {
 			current.CurrentJobState = "completed"
 		}
 		current.LastErrorCode = ""
@@ -9773,7 +9782,7 @@ func (a *agent) refreshCurrentStateFromBindings(ctx context.Context) {
 		current.ProgressPct = snapshot.ProgressPct
 		current.RemainingSeconds = snapshot.RemainingSeconds
 		current.TelemetrySource = snapshot.TelemetrySource
-		current.ManualIntervention = snapshot.ManualIntervention
+		current.ManualIntervention = detectedManualIntervention
 		current.CommandCapabilities = mergeCommandCapabilities(current.CommandCapabilities, snapshot.CommandCapabilities)
 		resolveRuntimeFilamentCapability(item.binding, &current, previousCurrent, snapshot, observedAt)
 		current.CommandCapabilities = ensurePrinterSupportCapability(item.binding, snapshot, current.CommandCapabilities)
@@ -9813,11 +9822,133 @@ func hydrateActiveIntentIdentity(desired desiredStateItem, current *currentState
 	current.IntentVersionApplied = desired.IntentVersion
 }
 
+func normalizeAuthorityManualIntervention(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "pause", "paused":
+		return "paused"
+	case "stop", "stopped":
+		return "stopped"
+	case "cancel", "canceled", "cancelled":
+		return "canceled"
+	default:
+		return ""
+	}
+}
+
+func desiredOwnsActiveLifecycle(desired desiredStateItem) bool {
+	return (desired.DesiredPrinterState == "printing" || desired.DesiredPrinterState == "paused") &&
+		strings.TrimSpace(desired.JobID) != "" &&
+		desired.PlateID != 0
+}
+
+func desiredIntentIsNewerThanCurrent(prev currentStateItem, desired desiredStateItem) bool {
+	return desiredOwnsActiveLifecycle(desired) && desired.IntentVersion > prev.IntentVersionApplied
+}
+
+func previousCurrentMatchesDesiredTarget(prev currentStateItem, desired desiredStateItem) bool {
+	if !desiredOwnsActiveLifecycle(desired) {
+		return false
+	}
+	if strings.TrimSpace(prev.JobID) != "" && prev.PlateID != 0 {
+		return prev.JobID == desired.JobID && prev.PlateID == desired.PlateID
+	}
+	return prev.IntentVersionApplied == desired.IntentVersion
+}
+
+func runtimeLookedActive(prev currentStateItem) bool {
+	return prev.CurrentPrinterState == "queued" ||
+		prev.CurrentPrinterState == "printing" ||
+		prev.CurrentPrinterState == "paused" ||
+		prev.CurrentJobState == "printing"
+}
+
+func shouldPersistPreviousAuthorityManualIntervention(
+	prev currentStateItem,
+	snapshot bindingSnapshot,
+	desired desiredStateItem,
+) bool {
+	if desiredIntentIsNewerThanCurrent(prev, desired) {
+		return false
+	}
+	switch normalizeAuthorityManualIntervention(prev.ManualIntervention) {
+	case "paused":
+		return snapshot.PrinterState == "paused"
+	case "stopped", "canceled":
+		return snapshot.PrinterState != "printing" &&
+			snapshot.PrinterState != "queued" &&
+			snapshot.PrinterState != "paused"
+	default:
+		return false
+	}
+}
+
+func detectExternalAuthorityManualIntervention(
+	binding edgeBinding,
+	desired desiredStateItem,
+	prev currentStateItem,
+	snapshot bindingSnapshot,
+) string {
+	explicitAuthority := normalizeAuthorityManualIntervention(snapshot.ManualIntervention)
+	if explicitAuthority != "" {
+		if desiredIntentIsNewerThanCurrent(prev, desired) {
+			return ""
+		}
+		return explicitAuthority
+	}
+	if raw := strings.ToLower(strings.TrimSpace(snapshot.ManualIntervention)); raw != "" {
+		return raw
+	}
+	if desiredIntentIsNewerThanCurrent(prev, desired) {
+		return ""
+	}
+	if shouldPersistPreviousAuthorityManualIntervention(prev, snapshot, desired) {
+		return normalizeAuthorityManualIntervention(prev.ManualIntervention)
+	}
+	if !previousCurrentMatchesDesiredTarget(prev, desired) {
+		return ""
+	}
+	if snapshot.PrinterState == "paused" && desired.DesiredPrinterState == "printing" {
+		return "paused"
+	}
+	if snapshot.JobState == "canceled" {
+		return "canceled"
+	}
+	if normalizeAdapterFamily(binding.AdapterFamily) == "bambu" &&
+		snapshot.PrinterState == "idle" &&
+		snapshot.JobState == "pending" &&
+		runtimeLookedActive(prev) {
+		return "stopped"
+	}
+	return ""
+}
+
+func shouldSuppressConvergenceForAuthorityManualIntervention(
+	current currentStateItem,
+	desired desiredStateItem,
+) bool {
+	intervention := normalizeAuthorityManualIntervention(current.ManualIntervention)
+	if intervention == "" {
+		return false
+	}
+	if desiredIntentIsNewerThanCurrent(current, desired) {
+		return false
+	}
+	switch intervention {
+	case "paused":
+		return desired.DesiredPrinterState == "printing"
+	case "stopped", "canceled":
+		return desired.DesiredPrinterState == "printing" || desired.DesiredPrinterState == "paused"
+	default:
+		return false
+	}
+}
+
 func shouldMarkBambuIdleTransitionCompleted(
 	binding edgeBinding,
 	prevPrinterState string,
 	current currentStateItem,
 	snapshot bindingSnapshot,
+	manualIntervention string,
 ) bool {
 	if normalizeAdapterFamily(binding.AdapterFamily) != "bambu" {
 		return false
@@ -9825,7 +9956,7 @@ func shouldMarkBambuIdleTransitionCompleted(
 	if snapshot.PrinterState != "idle" || snapshot.JobState != "pending" {
 		return false
 	}
-	if strings.TrimSpace(snapshot.ManualIntervention) != "" {
+	if strings.TrimSpace(manualIntervention) != "" {
 		return false
 	}
 	if prev := strings.ToLower(strings.TrimSpace(prevPrinterState)); prev != "printing" && prev != "paused" && prev != "queued" {

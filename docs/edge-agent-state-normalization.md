@@ -17,8 +17,8 @@ These values are provider-agnostic and stable.
 
 Auxiliary state fields can remain provider-specific when they do not affect the canonical
 runtime state machine. `manual_intervention` is one of those fields: it should be sent as a
-lowercase snake_case token such as `canceled`, `stopped`, `hms_alert`, or `print_error`.
-SaaS may assign special behavior to `canceled` and `stopped`, but it must preserve other
+lowercase snake_case token such as `paused`, `stopped`, `canceled`, `hms_alert`, or `print_error`.
+SaaS may assign special behavior to `paused`, `stopped`, and `canceled`, but it must preserve other
 vendor-specific tokens instead of rejecting the whole state batch.
 
 `command_capabilities` is another auxiliary field. It does not alter the canonical
@@ -40,6 +40,14 @@ not for the canonical printer/job runtime state machine.
 When SaaS does not actively own a printer/job lifecycle, it should not publish a default
 `idle` desired target for that printer. In that state, edge-agent must treat printer-side
 activity as authoritative external activity, not as drift to correct by stopping the printer.
+
+When edge-agent detects a printer-side manual intervention for a SaaS-owned lifecycle, it should
+report that through `manual_intervention` and yield convergence until SaaS issues a newer explicit
+operator intent:
+
+- `paused`: do not auto-resume
+- `stopped`: do not auto-restart
+- `canceled`: do not auto-restart
 
 ## Provider Mapping
 
