@@ -21,6 +21,19 @@ type fakeBambuCameraRuntime struct {
 	ensureFn func(ctx context.Context, req bambucamera.EnsureRequest) (bambucamera.Handle, error)
 }
 
+func newIPv4HTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
+}
+
 func (f fakeBambuCameraRuntime) Ensure(ctx context.Context, req bambucamera.EnsureRequest) (bambucamera.Handle, error) {
 	if f.ensureFn == nil {
 		return bambucamera.Handle{}, errors.New("ensure not implemented")
@@ -578,7 +591,7 @@ func TestLocalPrinterCameraRouteProxiesMoonrakerStream(t *testing.T) {
 func TestFetchMoonrakerPrimaryWebcamFallsBackToMonitorSnapshot(t *testing.T) {
 	a := newTestAgent(t)
 
-	moonrakerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	moonrakerSrv := newIPv4HTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/server/webcams/list":
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -593,7 +606,6 @@ func TestFetchMoonrakerPrimaryWebcamFallsBackToMonitorSnapshot(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer moonrakerSrv.Close()
 
 	webcam, err := a.fetchMoonrakerPrimaryWebcam(context.Background(), moonrakerSrv.URL)
 	if err != nil {

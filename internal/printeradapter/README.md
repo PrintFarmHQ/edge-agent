@@ -12,6 +12,7 @@ Intended layout:
 
 Current architecture direction:
 - `registry.go` is the profile catalog and fallback resolver
+- `moonraker/camera.go` is now the adapter-owned home for generic Moonraker camera behavior
 - profiles are matched from adapter family plus detected model/runtime hints
 - the resolver publishes printer support metadata such as:
   - `profile_key`

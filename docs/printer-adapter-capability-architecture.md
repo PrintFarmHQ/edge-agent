@@ -166,6 +166,11 @@ This keeps SaaS and frontend reading from one normalized command/capability mode
 
 Camera is the first migration slice because it already demonstrates the need for multiple capability levels.
 
+Current implementation checkpoint:
+- generic Moonraker webcam discovery, stream vs snapshot selection, snapshot polling, and Snapmaker `monitor.jpg` keepalive routing have started moving into `internal/printeradapter/moonraker/`
+- the camera-session path and local web UI now reuse the same Moonraker adapter-owned camera logic
+- Bambu camera still uses the current internal runtime path and remains the next extraction slice
+
 ### `live_stream`
 
 Use when the adapter can expose a stable live feed:

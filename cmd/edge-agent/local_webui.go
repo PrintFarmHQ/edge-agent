@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	moonrakeradapter "printfarmhq/edge-agent/internal/printeradapter/moonraker"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -51,13 +52,7 @@ type localControlPlaneConnectRequest struct {
 	APIKey     string `json:"api_key"`
 }
 
-type moonrakerWebcamConfig struct {
-	Name        string
-	StreamURL   string
-	SnapshotURL string
-	Enabled     bool
-	IsDefault   bool
-}
+type moonrakerWebcamConfig = moonrakeradapter.WebcamConfig
 
 const (
 	bambuCameraRTSPPort = "6000"
@@ -392,134 +387,7 @@ func (a *agent) proxyLocalPrinterCamera(w http.ResponseWriter, r *http.Request, 
 }
 
 func (a *agent) fetchMoonrakerPrimaryWebcam(ctx context.Context, endpointURL string) (moonrakerWebcamConfig, error) {
-	requestTimeout := a.cfg.MoonrakerRequestTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = 8 * time.Second
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, resolveURL(endpointURL, "/server/webcams/list"), nil)
-	if err != nil {
-		return moonrakerWebcamConfig{}, err
-	}
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return moonrakerWebcamConfig{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return moonrakerWebcamConfig{}, fmt.Errorf("moonraker webcams failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var payload struct {
-		Webcams []struct {
-			Name          string `json:"name"`
-			StreamURL     string `json:"stream_url"`
-			SnapshotURL   string `json:"snapshot_url"`
-			Enabled       *bool  `json:"enabled"`
-			Default       bool   `json:"default"`
-			DefaultCamera bool   `json:"default_camera"`
-		} `json:"webcams"`
-		Result struct {
-			Webcams []struct {
-				Name          string `json:"name"`
-				StreamURL     string `json:"stream_url"`
-				SnapshotURL   string `json:"snapshot_url"`
-				Enabled       *bool  `json:"enabled"`
-				Default       bool   `json:"default"`
-				DefaultCamera bool   `json:"default_camera"`
-			} `json:"webcams"`
-		} `json:"result"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return moonrakerWebcamConfig{}, err
-	}
-
-	rawWebcams := payload.Webcams
-	if len(rawWebcams) == 0 {
-		rawWebcams = payload.Result.Webcams
-	}
-	webcams := make([]moonrakerWebcamConfig, 0, len(rawWebcams))
-	for _, item := range rawWebcams {
-		enabled := true
-		if item.Enabled != nil {
-			enabled = *item.Enabled
-		}
-		webcams = append(webcams, moonrakerWebcamConfig{
-			Name:        strings.TrimSpace(item.Name),
-			StreamURL:   normalizeMoonrakerCameraURL(endpointURL, item.StreamURL),
-			SnapshotURL: normalizeMoonrakerCameraURL(endpointURL, item.SnapshotURL),
-			Enabled:     enabled,
-			IsDefault:   item.Default || item.DefaultCamera,
-		})
-	}
-
-	webcam, ok := pickMoonrakerPrimaryWebcam(webcams)
-	if !ok {
-		fallback, fallbackErr := a.fetchMoonrakerSnapshotFallback(ctx, endpointURL)
-		if fallbackErr == nil {
-			return fallback, nil
-		}
-		return moonrakerWebcamConfig{}, errors.New("no enabled moonraker webcams expose a stream or snapshot url")
-	}
-	return webcam, nil
-}
-
-func (a *agent) fetchMoonrakerSnapshotFallback(ctx context.Context, endpointURL string) (moonrakerWebcamConfig, error) {
-	snapshotURLTemplate := resolveURL(
-		endpointURL,
-		fmt.Sprintf("/server/files/camera/monitor.jpg?ts=%d", time.Now().UnixMilli()),
-	)
-	if _, err := a.fetchCameraSnapshotBytes(ctx, snapshotURLTemplate); err != nil {
-		return moonrakerWebcamConfig{}, err
-	}
-	return moonrakerWebcamConfig{
-		Name:        "snapshot_fallback",
-		SnapshotURL: resolveURL(endpointURL, "/server/files/camera/monitor.jpg?ts={ts}"),
-		Enabled:     true,
-		IsDefault:   true,
-	}, nil
-}
-
-func pickMoonrakerPrimaryWebcam(webcams []moonrakerWebcamConfig) (moonrakerWebcamConfig, bool) {
-	if len(webcams) == 0 {
-		return moonrakerWebcamConfig{}, false
-	}
-	var firstEnabled *moonrakerWebcamConfig
-	var firstUsable *moonrakerWebcamConfig
-	for idx := range webcams {
-		webcam := webcams[idx]
-		usable := strings.TrimSpace(webcam.StreamURL) != "" || strings.TrimSpace(webcam.SnapshotURL) != ""
-		if webcam.Enabled && usable && webcam.IsDefault {
-			return webcam, true
-		}
-		if webcam.Enabled && usable && firstEnabled == nil {
-			candidate := webcam
-			firstEnabled = &candidate
-		}
-		if usable && firstUsable == nil {
-			candidate := webcam
-			firstUsable = &candidate
-		}
-	}
-	if firstEnabled != nil {
-		return *firstEnabled, true
-	}
-	if firstUsable != nil {
-		return *firstUsable, true
-	}
-	return moonrakerWebcamConfig{}, false
-}
-
-func normalizeMoonrakerCameraURL(endpointURL string, rawURL string) string {
-	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" {
-		return ""
-	}
-	return resolveURL(endpointURL, trimmed)
+	return a.moonrakerCameraAdapter().FetchPrimaryWebcam(ctx, endpointURL)
 }
 
 func (a *agent) proxyLocalCameraResponse(w http.ResponseWriter, r *http.Request, targetURL string, stream bool) error {

@@ -6,9 +6,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -41,6 +39,7 @@ import (
 	bambucamera "printfarmhq/edge-agent/internal/bambu/cameraruntime"
 	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
 	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
+	moonrakeradapter "printfarmhq/edge-agent/internal/printeradapter/moonraker"
 	snapmakeru1 "printfarmhq/edge-agent/internal/printeradapter/moonraker/snapmaker_u1"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
@@ -2733,7 +2732,15 @@ func (a *agent) finishCameraSessionWorker(sessionID string) {
 func (a *agent) openCameraSessionReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
 	switch normalizeAdapterFamily(binding.AdapterFamily) {
 	case "moonraker":
-		return a.openMoonrakerCameraReader(ctx, binding)
+		stream, err := a.moonrakerCameraAdapter().OpenCameraStream(ctx, printeradapter.Binding{
+			PrinterID:     binding.PrinterID,
+			AdapterFamily: binding.AdapterFamily,
+			EndpointURL:   binding.EndpointURL,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return stream.Reader, stream.ContentType, nil
 	case "bambu":
 		return a.openBambuCameraReader(ctx, binding)
 	default:
@@ -2742,334 +2749,45 @@ func (a *agent) openCameraSessionReader(ctx context.Context, binding edgeBinding
 }
 
 func (a *agent) openMoonrakerCameraReader(ctx context.Context, binding edgeBinding) (io.ReadCloser, string, error) {
-	webcam, err := a.fetchMoonrakerPrimaryWebcam(ctx, binding.EndpointURL)
+	stream, err := a.moonrakerCameraAdapter().OpenCameraStream(ctx, printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 	if err != nil {
 		return nil, "", err
 	}
-	if strings.TrimSpace(webcam.StreamURL) != "" {
-		client := a.cameraStreamHTTPClient()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(webcam.StreamURL), nil)
-		if err != nil {
-			return nil, "", err
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, "", err
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			return nil, "", fmt.Errorf("moonraker camera stream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-		if contentType == "" {
-			contentType = "multipart/x-mixed-replace"
-		}
-		return resp.Body, contentType, nil
-	}
-	if strings.TrimSpace(webcam.SnapshotURL) != "" {
-		a.startMoonrakerCameraMonitorKeepalive(ctx, binding.EndpointURL, strings.TrimSpace(webcam.SnapshotURL))
-		return a.openSnapshotLoopReader(ctx, strings.TrimSpace(webcam.SnapshotURL))
-	}
-	return nil, "", errors.New("moonraker camera has neither stream_url nor snapshot_url")
+	return stream.Reader, stream.ContentType, nil
 }
 
 func (a *agent) startMoonrakerCameraMonitorKeepalive(ctx context.Context, endpointURL string, snapshotURL string) {
-	if !isMoonrakerMonitorSnapshotURL(snapshotURL) {
-		return
-	}
-
-	go func() {
-		triggerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := sendMoonrakerCameraMonitorCommand(triggerCtx, endpointURL, false)
-		cancel()
-		if err != nil {
-			a.audit("moonraker_camera_monitor_start_error", map[string]any{
-				"endpoint_url": endpointURL,
-				"error":        err.Error(),
-			})
-		}
-
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := sendMoonrakerCameraMonitorCommand(stopCtx, endpointURL, true); err != nil {
-					a.audit("moonraker_camera_monitor_stop_error", map[string]any{
-						"endpoint_url": endpointURL,
-						"error":        err.Error(),
-					})
-				}
-				stopCancel()
-				return
-			case <-ticker.C:
-				keepaliveCtx, keepaliveCancel := context.WithTimeout(ctx, 5*time.Second)
-				if err := sendMoonrakerCameraMonitorCommand(keepaliveCtx, endpointURL, false); err != nil {
-					a.audit("moonraker_camera_monitor_keepalive_error", map[string]any{
-						"endpoint_url": endpointURL,
-						"error":        err.Error(),
-					})
-				}
-				keepaliveCancel()
-			}
-		}
-	}()
-}
-
-func isMoonrakerMonitorSnapshotURL(snapshotURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(snapshotURL))
-	if err != nil {
-		return false
-	}
-	return parsed.Path == moonrakerCameraMonitorPath
+	a.moonrakerCameraAdapter().StartMonitorKeepalive(ctx, endpointURL, snapshotURL)
 }
 
 func (a *agent) openSnapshotLoopReader(ctx context.Context, snapshotURL string) (io.ReadCloser, string, error) {
-	pipeReader, pipeWriter := io.Pipe()
-	go func() {
-		const (
-			snapshotPollInterval           = 1 * time.Second
-			maxSnapshotConsecutiveFailures = 30
-		)
-		ticker := time.NewTicker(snapshotPollInterval)
-		defer ticker.Stop()
-		defer pipeWriter.Close()
-		consecutiveFailures := 0
-		var lastErr error
-		for {
-			requestURL := strings.ReplaceAll(snapshotURL, "{ts}", strconv.FormatInt(time.Now().UnixMilli(), 10))
-			snapshotBytes, err := a.fetchCameraSnapshotBytes(ctx, requestURL)
-			if err != nil {
-				lastErr = err
-				consecutiveFailures++
-				if consecutiveFailures >= maxSnapshotConsecutiveFailures {
-					_ = pipeWriter.CloseWithError(
-						fmt.Errorf(
-							"camera snapshot polling failed after %d consecutive errors: %w",
-							consecutiveFailures,
-							lastErr,
-						),
-					)
-					return
-				}
-			} else {
-				consecutiveFailures = 0
-				frameHeader := fmt.Sprintf(
-					"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
-					len(snapshotBytes),
-				)
-				if _, err := pipeWriter.Write([]byte(frameHeader)); err != nil {
-					return
-				}
-				if _, err := pipeWriter.Write(snapshotBytes); err != nil {
-					return
-				}
-				if _, err := pipeWriter.Write([]byte("\r\n")); err != nil {
-					return
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-	return pipeReader, "multipart/x-mixed-replace;boundary=frame", nil
+	return a.moonrakerCameraAdapter().OpenSnapshotLoopReader(ctx, snapshotURL)
 }
 
 func (a *agent) fetchCameraSnapshotBytes(ctx context.Context, snapshotURL string) ([]byte, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, snapshotURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("camera snapshot returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+	return a.moonrakerCameraAdapter().FetchSnapshotBytes(ctx, snapshotURL)
 }
 
 func sendMoonrakerCameraMonitorCommandDefault(ctx context.Context, endpointURL string, stop bool) error {
-	websocketURL, err := moonrakerWebSocketURL(endpointURL)
-	if err != nil {
-		return err
-	}
-
-	conn, reader, acceptKey, err := dialMoonrakerWebSocket(ctx, websocketURL)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := completeMoonrakerWebSocketHandshake(reader, acceptKey); err != nil {
-		return err
-	}
-
-	method := "camera.start_monitor"
-	params := map[string]any{
-		"domain":   "lan",
-		"interval": 0,
-	}
-	if stop {
-		method = "camera.stop_monitor"
-		params = map[string]any{}
-	}
-	payload, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  params,
-		"id":      time.Now().UnixNano(),
-	})
-	if err != nil {
-		return err
-	}
-	return writeWebSocketTextFrame(conn, payload)
-}
-
-func moonrakerWebSocketURL(endpointURL string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(endpointURL))
-	if err != nil {
-		return "", err
-	}
-	if parsed.Host == "" {
-		return "", errors.New("validation_error: moonraker endpoint is missing host")
-	}
-	switch parsed.Scheme {
-	case "http", "":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
-	default:
-		return "", fmt.Errorf("validation_error: unsupported moonraker endpoint scheme %q", parsed.Scheme)
-	}
-	parsed.Path = "/websocket"
-	return parsed.String(), nil
-}
-
-func dialMoonrakerWebSocket(ctx context.Context, websocketURL string) (net.Conn, *bufio.Reader, string, error) {
-	parsed, err := url.Parse(websocketURL)
-	if err != nil {
-		return nil, nil, "", err
-	}
-
-	address := parsed.Host
-	if !strings.Contains(address, ":") {
-		if parsed.Scheme == "wss" {
-			address = net.JoinHostPort(address, "443")
-		} else {
-			address = net.JoinHostPort(address, "80")
-		}
-	}
-
-	dialer := &net.Dialer{}
-	var conn net.Conn
-	switch parsed.Scheme {
-	case "ws":
-		conn, err = dialer.DialContext(ctx, "tcp", address)
-	case "wss":
-		conn, err = tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: parsed.Hostname(),
-		})
-	default:
-		err = fmt.Errorf("validation_error: unsupported websocket scheme %q", parsed.Scheme)
-	}
-	if err != nil {
-		return nil, nil, "", err
-	}
-
-	keyBytes := make([]byte, 16)
-	if _, err := rand.Read(keyBytes); err != nil {
-		conn.Close()
-		return nil, nil, "", err
-	}
-	webSocketKey := base64.StdEncoding.EncodeToString(keyBytes)
-	requestPath := parsed.RequestURI()
-	if requestPath == "" {
-		requestPath = "/websocket"
-	}
-	handshake := fmt.Sprintf(
-		"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
-		requestPath,
-		parsed.Host,
-		webSocketKey,
-	)
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	if _, err := io.WriteString(conn, handshake); err != nil {
-		conn.Close()
-		return nil, nil, "", err
-	}
-	return conn, bufio.NewReader(conn), computeWebSocketAcceptKey(webSocketKey), nil
-}
-
-func completeMoonrakerWebSocketHandshake(reader *bufio.Reader, acceptKey string) error {
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(statusLine, "101") {
-		return fmt.Errorf("moonraker websocket upgrade failed: %s", strings.TrimSpace(statusLine))
-	}
-
-	headers := make(http.Header)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return err
-		}
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			break
-		}
-		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		headers.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-	}
-
-	if !strings.EqualFold(strings.TrimSpace(headers.Get("Sec-WebSocket-Accept")), acceptKey) {
-		return errors.New("moonraker websocket upgrade failed: invalid accept key")
-	}
-	return nil
+	return moonrakeradapter.SendMonitorCommandDefault(ctx, endpointURL, stop)
 }
 
 func computeWebSocketAcceptKey(key string) string {
-	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(sum[:])
+	return moonrakeradapter.ComputeWebSocketAcceptKey(key)
 }
 
-func writeWebSocketTextFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 125 {
-		return errors.New("moonraker websocket payload too large")
+func (a *agent) moonrakerCameraAdapter() moonrakeradapter.CameraAdapter {
+	return moonrakeradapter.CameraAdapter{
+		HTTPClient:         a.client,
+		StreamClient:       a.cameraStreamHTTPClient,
+		RequestTimeout:     a.cfg.MoonrakerRequestTimeout,
+		SendMonitorCommand: sendMoonrakerCameraMonitorCommand,
+		Audit:              a.audit,
 	}
-
-	mask := make([]byte, 4)
-	if _, err := rand.Read(mask); err != nil {
-		return err
-	}
-
-	frame := make([]byte, 0, 2+len(mask)+len(payload))
-	frame = append(frame, 0x81, byte(0x80|len(payload)))
-	frame = append(frame, mask...)
-	for idx, b := range payload {
-		frame = append(frame, b^mask[idx%len(mask)])
-	}
-	_, err := conn.Write(frame)
-	return err
 }
 
 type bambuCameraSource struct {
