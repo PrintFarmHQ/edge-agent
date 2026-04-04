@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -70,6 +71,163 @@ func TestManagerEnsureDownloadsPinnedPluginBundle(t *testing.T) {
 	}
 	if !fileExists(filepath.Join(handle.PluginDir, artifact.NetworkingLib)) {
 		t.Fatalf("expected networking library in plugin dir")
+	}
+}
+
+func TestManagerPreflightReusesValidCachedBundleWithoutDownload(t *testing.T) {
+	artifact := testPluginArtifactForRuntime()
+	archiveBytes := buildTestPluginArchive(t, artifact.SourceLibrary, artifact.NetworkingLib)
+	checksum := fmt.Sprintf("%x", sha256.Sum256(archiveBytes))
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		_, _ = w.Write(archiveBytes)
+	}))
+	defer server.Close()
+
+	originalArtifactFn := currentPluginArtifactFn
+	t.Cleanup(func() {
+		currentPluginArtifactFn = originalArtifactFn
+	})
+	currentPluginArtifactFn = func() (pluginArtifact, error) {
+		artifact.URL = server.URL + "/plugin.zip"
+		artifact.ArchiveSHA256 = checksum
+		return artifact, nil
+	}
+
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	status := newPluginBundleStatus(runtimeDir, &artifact)
+	if err := os.MkdirAll(status.CacheDir, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.WriteFile(status.ArchivePath, archiveBytes, 0o644); err != nil {
+		t.Fatalf("write archive failed: %v", err)
+	}
+	if err := extractPluginArchive(status.ArchivePath, status.CacheDir, artifact); err != nil {
+		t.Fatalf("extractPluginArchive failed: %v", err)
+	}
+
+	manager := NewManager(runtimeDir, nil)
+	manager.Client = server.Client()
+	result, err := manager.PreflightPluginBundle(context.Background())
+	if err != nil {
+		t.Fatalf("PreflightPluginBundle failed: %v", err)
+	}
+	if result.Downloaded {
+		t.Fatalf("expected cached bundle to be reused without download")
+	}
+	if requestCount != 0 {
+		t.Fatalf("requestCount = %d, want 0", requestCount)
+	}
+}
+
+func TestManagerPreflightRepairsMissingArchive(t *testing.T) {
+	artifact := testPluginArtifactForRuntime()
+	archiveBytes := buildTestPluginArchive(t, artifact.SourceLibrary, artifact.NetworkingLib)
+	checksum := fmt.Sprintf("%x", sha256.Sum256(archiveBytes))
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		_, _ = w.Write(archiveBytes)
+	}))
+	defer server.Close()
+
+	originalArtifactFn := currentPluginArtifactFn
+	t.Cleanup(func() {
+		currentPluginArtifactFn = originalArtifactFn
+	})
+	currentPluginArtifactFn = func() (pluginArtifact, error) {
+		artifact.URL = server.URL + "/plugin.zip"
+		artifact.ArchiveSHA256 = checksum
+		return artifact, nil
+	}
+
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	status := newPluginBundleStatus(runtimeDir, &artifact)
+	if err := os.MkdirAll(status.CacheDir, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.WriteFile(status.SourceLibraryPath, []byte("old-source"), 0o755); err != nil {
+		t.Fatalf("write source library failed: %v", err)
+	}
+	if err := os.WriteFile(status.NetworkingLibraryPath, []byte("old-network"), 0o755); err != nil {
+		t.Fatalf("write networking library failed: %v", err)
+	}
+
+	manager := NewManager(runtimeDir, nil)
+	manager.Client = server.Client()
+	result, err := manager.PreflightPluginBundle(context.Background())
+	if err != nil {
+		t.Fatalf("PreflightPluginBundle failed: %v", err)
+	}
+	if !result.Downloaded {
+		t.Fatalf("expected missing archive to trigger repair download")
+	}
+	if requestCount != 1 {
+		t.Fatalf("requestCount = %d, want 1", requestCount)
+	}
+	if !fileExists(status.ArchivePath) {
+		t.Fatalf("expected repaired archive to exist")
+	}
+}
+
+func TestManagerPreflightRepairsChecksumMismatchInCachedBundle(t *testing.T) {
+	artifact := testPluginArtifactForRuntime()
+	goodArchiveBytes := buildTestPluginArchive(t, artifact.SourceLibrary, artifact.NetworkingLib)
+	goodChecksum := fmt.Sprintf("%x", sha256.Sum256(goodArchiveBytes))
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		_, _ = w.Write(goodArchiveBytes)
+	}))
+	defer server.Close()
+
+	originalArtifactFn := currentPluginArtifactFn
+	t.Cleanup(func() {
+		currentPluginArtifactFn = originalArtifactFn
+	})
+	currentPluginArtifactFn = func() (pluginArtifact, error) {
+		artifact.URL = server.URL + "/plugin.zip"
+		artifact.ArchiveSHA256 = goodChecksum
+		return artifact, nil
+	}
+
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	status := newPluginBundleStatus(runtimeDir, &artifact)
+	if err := os.MkdirAll(status.CacheDir, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.WriteFile(status.ArchivePath, []byte("corrupt-plugin-archive"), 0o644); err != nil {
+		t.Fatalf("write corrupt archive failed: %v", err)
+	}
+	if err := os.WriteFile(status.SourceLibraryPath, []byte("stale-source"), 0o755); err != nil {
+		t.Fatalf("write source library failed: %v", err)
+	}
+	if err := os.WriteFile(status.NetworkingLibraryPath, []byte("stale-network"), 0o755); err != nil {
+		t.Fatalf("write networking library failed: %v", err)
+	}
+
+	manager := NewManager(runtimeDir, nil)
+	manager.Client = server.Client()
+	result, err := manager.PreflightPluginBundle(context.Background())
+	if err != nil {
+		t.Fatalf("PreflightPluginBundle failed: %v", err)
+	}
+	if !result.Downloaded {
+		t.Fatalf("expected checksum mismatch to trigger repair download")
+	}
+	if requestCount != 1 {
+		t.Fatalf("requestCount = %d, want 1", requestCount)
+	}
+	finalChecksum, err := checksumFile(status.ArchivePath)
+	if err != nil {
+		t.Fatalf("checksumFile failed: %v", err)
+	}
+	if finalChecksum != goodChecksum {
+		t.Fatalf("final checksum = %q, want %q", finalChecksum, goodChecksum)
 	}
 }
 

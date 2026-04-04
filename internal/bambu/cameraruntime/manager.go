@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -58,9 +59,27 @@ type Manager struct {
 	Client   *http.Client
 }
 
+type PluginBundleStatus struct {
+	Version               string
+	ArchiveURL            string
+	CacheDir              string
+	ArchivePath           string
+	SourceLibraryPath     string
+	NetworkingLibraryPath string
+	Downloaded            bool
+}
+
 const (
 	defaultPluginsSubdir = "plugins"
 	bambuPluginVersion   = "01.04.00.15"
+)
+
+var (
+	ErrUnsupportedPlatform = errors.New("bambu plugin bundle unsupported platform")
+	ErrCacheUnavailable    = errors.New("bambu plugin bundle cache unavailable")
+	ErrDownloadFailed      = errors.New("bambu plugin bundle download failed")
+	ErrChecksumMismatch    = errors.New("bambu plugin bundle checksum mismatch")
+	ErrIncompleteBundle    = errors.New("bambu plugin bundle incomplete")
 )
 
 func NewManager(stateDir string, runner Runner) *Manager {
@@ -108,7 +127,7 @@ func currentPluginArtifact() (pluginArtifact, error) {
 			NetworkingLib: "bambu_networking.dll",
 		}, nil
 	default:
-		return pluginArtifact{}, fmt.Errorf("platform %s is not yet supported for pinned Bambu camera plugins", runtime.GOOS)
+		return pluginArtifact{}, fmt.Errorf("%w: platform %s is not yet supported for the pinned Bambu native plugin bundle", ErrUnsupportedPlatform, runtime.GOOS)
 	}
 }
 
@@ -161,7 +180,7 @@ func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error)
 		)
 	}
 
-	pluginDir, pluginLib, err := m.ensurePluginBundle(ctx)
+	status, err := m.preparePluginBundle(ctx)
 	if err != nil {
 		return Handle{}, fmt.Errorf("bambu_camera_runtime_unavailable: %w", err)
 	}
@@ -171,8 +190,8 @@ func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (Handle, error)
 		Host:              strings.TrimSpace(req.Host),
 		AccessCode:        strings.TrimSpace(req.AccessCode),
 		Support:           support,
-		PluginDir:         pluginDir,
-		PluginLibraryPath: pluginLib,
+		PluginDir:         status.CacheDir,
+		PluginLibraryPath: status.SourceLibraryPath,
 	}, nil
 }
 
@@ -180,39 +199,73 @@ func (m *Manager) EnsurePluginBundle(ctx context.Context) (dir string, sourceLib
 	if m == nil {
 		return "", "", errors.New("bambu_camera_runtime_unavailable: runtime manager is not configured")
 	}
-	pluginDir, pluginLib, err := m.ensurePluginBundle(ctx)
+	status, err := m.preparePluginBundle(ctx)
 	if err != nil {
 		return "", "", fmt.Errorf("bambu_camera_runtime_unavailable: %w", err)
 	}
-	return pluginDir, pluginLib, nil
+	return status.CacheDir, status.SourceLibraryPath, nil
 }
 
-func (m *Manager) ensurePluginBundle(ctx context.Context) (dir string, sourceLibrary string, err error) {
+func (m *Manager) PreflightPluginBundle(ctx context.Context) (PluginBundleStatus, error) {
+	if m == nil {
+		return PluginBundleStatus{}, errors.New("runtime manager is not configured")
+	}
+	return m.preparePluginBundle(ctx)
+}
+
+func (m *Manager) preparePluginBundle(ctx context.Context) (PluginBundleStatus, error) {
 	artifact, err := currentPluginArtifactFn()
 	if err != nil {
-		return "", "", err
+		return newPluginBundleStatus(m.StateDir, nil), err
 	}
-	root := filepath.Join(m.StateDir, defaultPluginsSubdir, runtime.GOOS, artifact.Version)
-	sourcePath := filepath.Join(root, artifact.SourceLibrary)
-	networkingPath := filepath.Join(root, artifact.NetworkingLib)
-	if fileExists(sourcePath) && fileExists(networkingPath) {
-		return root, sourcePath, nil
+	status := newPluginBundleStatus(m.StateDir, &artifact)
+	if err := validatePluginBundle(status, artifact); err == nil {
+		return status, nil
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return "", "", err
+	if err := m.repairPluginBundle(ctx, status, artifact); err != nil {
+		return status, err
 	}
+	status.Downloaded = true
+	if err := validatePluginBundle(status, artifact); err != nil {
+		return status, err
+	}
+	return status, nil
+}
 
-	archivePath := filepath.Join(root, "plugin.zip")
-	if err := m.downloadPluginArchive(ctx, artifact, archivePath); err != nil {
-		return "", "", err
+func (m *Manager) repairPluginBundle(ctx context.Context, status PluginBundleStatus, artifact pluginArtifact) error {
+	if err := os.RemoveAll(status.CacheDir); err != nil {
+		return wrapCacheError("reset pinned plugin cache", err)
 	}
-	if err := extractPluginArchive(archivePath, root, artifact); err != nil {
-		return "", "", err
+	if err := os.MkdirAll(status.CacheDir, 0o755); err != nil {
+		return wrapCacheError("create pinned plugin cache directory", err)
 	}
-	if !fileExists(sourcePath) || !fileExists(networkingPath) {
-		return "", "", errors.New("downloaded Bambu camera plugin bundle is incomplete")
+	if err := m.downloadPluginArchive(ctx, artifact, status.ArchivePath); err != nil {
+		return err
 	}
-	return root, sourcePath, nil
+	if err := extractPluginArchive(status.ArchivePath, status.CacheDir, artifact); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePluginBundle(status PluginBundleStatus, artifact pluginArtifact) error {
+	if !fileExists(status.ArchivePath) {
+		return fmt.Errorf("%w: pinned archive missing at %s", ErrIncompleteBundle, status.ArchivePath)
+	}
+	sum, err := checksumFile(status.ArchivePath)
+	if err != nil {
+		return wrapCacheError("read pinned plugin archive", err)
+	}
+	if !strings.EqualFold(sum, artifact.ArchiveSHA256) {
+		return fmt.Errorf("%w: got %s want %s", ErrChecksumMismatch, sum, artifact.ArchiveSHA256)
+	}
+	if !fileExists(status.SourceLibraryPath) {
+		return fmt.Errorf("%w: missing %s", ErrIncompleteBundle, filepath.Base(status.SourceLibraryPath))
+	}
+	if !fileExists(status.NetworkingLibraryPath) {
+		return fmt.Errorf("%w: missing %s", ErrIncompleteBundle, filepath.Base(status.NetworkingLibraryPath))
+	}
+	return nil
 }
 
 func (m *Manager) downloadPluginArchive(ctx context.Context, artifact pluginArtifact, targetPath string) error {
@@ -221,35 +274,38 @@ func (m *Manager) downloadPluginArchive(ctx context.Context, artifact pluginArti
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, artifact.URL, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: build request: %v", ErrDownloadFailed, err)
 	}
 	resp, err := m.Client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrDownloadFailed, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("download pinned Bambu plugin archive failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("%w: status=%d body=%s", ErrDownloadFailed, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var buffer bytes.Buffer
 	hasher := sha256.New()
 	writer := io.MultiWriter(&buffer, hasher)
 	if _, err := io.Copy(writer, resp.Body); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrDownloadFailed, err)
 	}
 	sum := fmt.Sprintf("%x", hasher.Sum(nil))
 	if !strings.EqualFold(sum, artifact.ArchiveSHA256) {
-		return fmt.Errorf("Bambu plugin archive checksum mismatch: got %s want %s", sum, artifact.ArchiveSHA256)
+		return fmt.Errorf("%w: got %s want %s", ErrChecksumMismatch, sum, artifact.ArchiveSHA256)
 	}
-	return os.WriteFile(targetPath, buffer.Bytes(), 0o644)
+	if err := os.WriteFile(targetPath, buffer.Bytes(), 0o644); err != nil {
+		return wrapCacheError("write pinned plugin archive", err)
+	}
+	return nil
 }
 
 func extractPluginArchive(archivePath string, targetDir string, artifact pluginArtifact) error {
 	reader, err := zip.OpenReader(archivePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: open archive %s: %v", ErrIncompleteBundle, archivePath, err)
 	}
 	defer reader.Close()
 
@@ -264,12 +320,12 @@ func extractPluginArchive(archivePath string, targetDir string, artifact pluginA
 		}
 		stream, err := file.Open()
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: open archive entry %s: %v", ErrIncompleteBundle, name, err)
 		}
 		data, err := io.ReadAll(stream)
 		_ = stream.Close()
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: read archive entry %s: %v", ErrIncompleteBundle, name, err)
 		}
 		targetPath := filepath.Join(targetDir, name)
 		mode := os.FileMode(0o644)
@@ -277,14 +333,59 @@ func extractPluginArchive(archivePath string, targetDir string, artifact pluginA
 			mode = 0o755
 		}
 		if err := os.WriteFile(targetPath, data, mode); err != nil {
-			return err
+			return wrapCacheError("write extracted plugin library", err)
 		}
 		delete(want, name)
 	}
 	if len(want) != 0 {
-		return fmt.Errorf("plugin archive missing required files: %v", mapsKeys(want))
+		return fmt.Errorf("%w: plugin archive missing required files: %v", ErrIncompleteBundle, mapsKeys(want))
 	}
 	return nil
+}
+
+func newPluginBundleStatus(stateDir string, artifact *pluginArtifact) PluginBundleStatus {
+	version := bambuPluginVersion
+	sourceLibrary := ""
+	networkingLibrary := ""
+	archiveURL := ""
+	if artifact != nil {
+		version = artifact.Version
+		sourceLibrary = artifact.SourceLibrary
+		networkingLibrary = artifact.NetworkingLib
+		archiveURL = artifact.URL
+	}
+	cacheDir := filepath.Join(stateDir, defaultPluginsSubdir, runtime.GOOS, version)
+	status := PluginBundleStatus{
+		Version:     version,
+		ArchiveURL:  archiveURL,
+		CacheDir:    cacheDir,
+		ArchivePath: filepath.Join(cacheDir, "plugin.zip"),
+	}
+	if sourceLibrary != "" {
+		status.SourceLibraryPath = filepath.Join(cacheDir, sourceLibrary)
+	}
+	if networkingLibrary != "" {
+		status.NetworkingLibraryPath = filepath.Join(cacheDir, networkingLibrary)
+	}
+	return status
+}
+
+func checksumFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func wrapCacheError(action string, err error) error {
+	return fmt.Errorf("%w: %s: %v", ErrCacheUnavailable, action, err)
 }
 
 func fileExists(path string) bool {
@@ -297,5 +398,6 @@ func mapsKeys(values map[string]struct{}) []string {
 	for key := range values {
 		out = append(out, key)
 	}
+	sort.Strings(out)
 	return out
 }

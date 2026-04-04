@@ -48,6 +48,7 @@ import (
 const (
 	agentVersion                 = "0.1.0"
 	agentSchemaVersion           = 2
+	bambuPluginStartupTimeout    = 60 * time.Second
 	discoverySeedRetention       = 24 * time.Hour
 	discoverySeedMaxEntries      = 512
 	discoveryManualLockRetry     = 250 * time.Millisecond
@@ -94,6 +95,7 @@ var bambuAuthInputReader io.Reader = os.Stdin
 var bambuAuthOutputWriter io.Writer = os.Stdout
 var isBambuAuthInteractiveConsole = defaultIsBambuAuthInteractiveConsole
 var sendMoonrakerCameraMonitorCommand = sendMoonrakerCameraMonitorCommandDefault
+var preflightBambuPluginBundleOnStartup = preflightBambuPluginBundleOnStartupDefault
 
 type bootstrapConfig struct {
 	ControlPlaneURL string    `json:"control_plane_url"`
@@ -740,7 +742,11 @@ func main() {
 		activeCameraSessions:      make(map[string]context.CancelFunc),
 	}
 	if cfg.EnableBambu {
-		app.bambuCameraRuntime = bambucamera.NewManager(cfg.BambuCameraRuntimeDir, runExternalCommand)
+		bambuRuntime, err := prepareBambuRuntimeForStartup(cfg)
+		if err != nil {
+			log.Fatalf("failed to prepare Bambu runtime: %v", err)
+		}
+		app.bambuCameraRuntime = bambuRuntime
 	}
 	bambuLANStoreWarning := ""
 	if cfg.EnableBambu {
@@ -883,6 +889,86 @@ func (a *agent) bootstrapSync(ctx context.Context) {
 	if err := a.pushPrinterControlStatusOnce(ctx); err != nil {
 		a.audit("bootstrap_control_status_push_error", map[string]any{"error": err.Error()})
 	}
+}
+
+func preflightBambuPluginBundleOnStartupDefault(ctx context.Context, stateDir string) (bambucamera.PluginBundleStatus, error) {
+	manager := bambucamera.NewManager(stateDir, runExternalCommand)
+	return manager.PreflightPluginBundle(ctx)
+}
+
+func prepareBambuRuntimeForStartup(cfg appConfig) (bambucamera.Runtime, error) {
+	if !cfg.EnableBambu {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), bambuPluginStartupTimeout)
+	defer cancel()
+
+	status, err := preflightBambuPluginBundleOnStartup(ctx, cfg.BambuCameraRuntimeDir)
+	if err != nil {
+		return nil, formatBambuPluginStartupError(status, err)
+	}
+
+	installState := "reused_cache"
+	if status.Downloaded {
+		installState = "downloaded_and_cached"
+	}
+	log.Printf(
+		"Bambu native plugin bundle ready: version=%s cache_dir=%s source_library=%s install_state=%s",
+		status.Version,
+		status.CacheDir,
+		status.SourceLibraryPath,
+		installState,
+	)
+
+	return bambucamera.NewManager(cfg.BambuCameraRuntimeDir, runExternalCommand), nil
+}
+
+func formatBambuPluginStartupError(status bambucamera.PluginBundleStatus, err error) error {
+	version := strings.TrimSpace(status.Version)
+	if version == "" {
+		version = "unknown"
+	}
+	cacheDir := strings.TrimSpace(status.CacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join("<unknown>", "plugins", runtime.GOOS, version)
+	}
+
+	failureClass := "bundle preparation failed"
+	nextAction := "Verify that the cache directory is writable and that this machine can reach the pinned official Bambu plugin archive, then restart edge-agent with --bambu."
+	switch {
+	case errors.Is(err, bambucamera.ErrUnsupportedPlatform):
+		failureClass = "unsupported platform"
+		nextAction = "Use edge-agent without --bambu on this platform, or move Bambu mode to a supported OS."
+	case errors.Is(err, context.DeadlineExceeded):
+		failureClass = "startup preflight timed out"
+		nextAction = "Verify network connectivity to the pinned official Bambu plugin archive and retry startup."
+	case errors.Is(err, bambucamera.ErrCacheUnavailable):
+		failureClass = "cache directory unavailable"
+		nextAction = fmt.Sprintf("Verify that %s is writable by the current user, then restart edge-agent with --bambu.", cacheDir)
+	case errors.Is(err, bambucamera.ErrChecksumMismatch):
+		failureClass = "archive checksum mismatch"
+		nextAction = "Retry later or inspect any proxy/cache in front of the official Bambu archive. edge-agent will not use an unverified bundle."
+	case errors.Is(err, bambucamera.ErrDownloadFailed):
+		failureClass = "pinned archive download failed"
+		if strings.TrimSpace(status.ArchiveURL) != "" {
+			nextAction = fmt.Sprintf("Verify that this machine can reach the pinned official Bambu plugin archive (%s) and retry startup.", status.ArchiveURL)
+		} else {
+			nextAction = "Verify that this machine can reach the pinned official Bambu plugin archive and retry startup."
+		}
+	case errors.Is(err, bambucamera.ErrIncompleteBundle):
+		failureClass = "bundle extraction incomplete"
+		nextAction = fmt.Sprintf("Delete the broken cache at %s if it still exists, then restart edge-agent with --bambu.", cacheDir)
+	}
+
+	return fmt.Errorf(
+		"Bambu mode (--bambu) requires the pinned native plugin bundle version %s under %s. edge-agent could not prepare it automatically (%s): %w. %s",
+		version,
+		cacheDir,
+		failureClass,
+		err,
+		nextAction,
+	)
 }
 
 func (a *agent) bootstrapFromStartupCredentials(ctx context.Context) error {

@@ -19,12 +19,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	bambuauth "printfarmhq/edge-agent/internal/bambu/auth"
+	bambucamera "printfarmhq/edge-agent/internal/bambu/cameraruntime"
 	bambucloud "printfarmhq/edge-agent/internal/bambu/cloud"
 	snapmakeru1 "printfarmhq/edge-agent/internal/printeradapter/moonraker/snapmaker_u1"
 	bambustore "printfarmhq/edge-agent/internal/store"
@@ -429,6 +431,96 @@ func TestLoadConfigIgnoresEnableBambuSpikeAlias(t *testing.T) {
 	cfg := loadConfig()
 	if cfg.EnableBambu {
 		t.Fatalf("EnableBambu = true, want false when only ENABLE_BAMBU_SPIKE is set")
+	}
+}
+
+func TestPrepareBambuRuntimeForStartupSkipsPreflightWhenDisabled(t *testing.T) {
+	cfg := appConfig{
+		EnableBambu:           false,
+		BambuCameraRuntimeDir: filepath.Join(t.TempDir(), "runtime"),
+	}
+
+	runtimeManager, err := prepareBambuRuntimeForStartup(cfg)
+	if err != nil {
+		t.Fatalf("prepareBambuRuntimeForStartup returned error: %v", err)
+	}
+	if runtimeManager != nil {
+		t.Fatalf("expected no runtime manager when Bambu is disabled")
+	}
+}
+
+func TestPrepareBambuRuntimeForStartupRunsPluginPreflight(t *testing.T) {
+	originalPreflight := preflightBambuPluginBundleOnStartup
+	t.Cleanup(func() {
+		preflightBambuPluginBundleOnStartup = originalPreflight
+	})
+
+	expectedRuntimeDir := filepath.Join(t.TempDir(), "runtime")
+	var called bool
+	preflightBambuPluginBundleOnStartup = func(ctx context.Context, stateDir string) (bambucamera.PluginBundleStatus, error) {
+		called = true
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatalf("expected startup preflight context to have a deadline")
+		}
+		if stateDir != expectedRuntimeDir {
+			t.Fatalf("stateDir = %q, want %q", stateDir, expectedRuntimeDir)
+		}
+		return bambucamera.PluginBundleStatus{
+			Version:           "01.04.00.15",
+			CacheDir:          filepath.Join(expectedRuntimeDir, "plugins", runtime.GOOS, "01.04.00.15"),
+			SourceLibraryPath: filepath.Join(expectedRuntimeDir, "plugins", runtime.GOOS, "01.04.00.15", "libBambuSource.dylib"),
+		}, nil
+	}
+
+	runtimeManager, err := prepareBambuRuntimeForStartup(appConfig{
+		EnableBambu:           true,
+		BambuCameraRuntimeDir: expectedRuntimeDir,
+	})
+	if err != nil {
+		t.Fatalf("prepareBambuRuntimeForStartup returned error: %v", err)
+	}
+	if !called {
+		t.Fatalf("expected startup preflight to be called")
+	}
+	if runtimeManager == nil {
+		t.Fatalf("expected Bambu runtime manager after successful preflight")
+	}
+}
+
+func TestPrepareBambuRuntimeForStartupReturnsActionableError(t *testing.T) {
+	originalPreflight := preflightBambuPluginBundleOnStartup
+	t.Cleanup(func() {
+		preflightBambuPluginBundleOnStartup = originalPreflight
+	})
+
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	cacheDir := filepath.Join(runtimeDir, "plugins", runtime.GOOS, "01.04.00.15")
+	preflightBambuPluginBundleOnStartup = func(ctx context.Context, stateDir string) (bambucamera.PluginBundleStatus, error) {
+		return bambucamera.PluginBundleStatus{
+			Version:    "01.04.00.15",
+			ArchiveURL: "https://public-cdn.bambulab.com/upgrade/studio/plugins/01.04.00.15/mac_01.04.00.15.zip",
+			CacheDir:   cacheDir,
+		}, fmt.Errorf("%w: got bad want good", bambucamera.ErrChecksumMismatch)
+	}
+
+	runtimeManager, err := prepareBambuRuntimeForStartup(appConfig{
+		EnableBambu:           true,
+		BambuCameraRuntimeDir: runtimeDir,
+	})
+	if err == nil {
+		t.Fatalf("expected startup preflight error")
+	}
+	if runtimeManager != nil {
+		t.Fatalf("expected no runtime manager on startup preflight failure")
+	}
+	if !strings.Contains(err.Error(), "Bambu mode (--bambu) requires the pinned native plugin bundle version 01.04.00.15") {
+		t.Fatalf("error = %q, want talking startup guidance", err)
+	}
+	if !strings.Contains(err.Error(), "archive checksum mismatch") {
+		t.Fatalf("error = %q, want checksum failure class", err)
+	}
+	if !strings.Contains(err.Error(), cacheDir) {
+		t.Fatalf("error = %q, want cache directory", err)
 	}
 }
 

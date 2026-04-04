@@ -12,6 +12,8 @@ The operator runs only `edge-agent`.
 
 `edge-agent` owns the Bambu camera runtime lifecycle locally and pushes camera bytes back to SaaS through the existing camera-session relay flow.
 
+The same pinned native bundle is also reused by `edge-agent` for Bambu native control-tunnel work such as printer file-control operations. This document focuses on the bundle lifecycle and camera runtime contract.
+
 ## Network Model
 
 The camera architecture is intentionally outbound-only:
@@ -39,6 +41,7 @@ These routes are for `edge-agent`'s own runtime and diagnostics. They are not a 
 Instead, the Bambu native plugin dependency is:
 
 - pinned to a specific version,
+- preflighted on `--bambu` startup,
 - downloaded from the official Bambu CDN when missing,
 - checksum-verified before use,
 - cached under `~/.printfarmhq`,
@@ -48,7 +51,7 @@ Current pinned plugin version:
 
 - `01.04.00.15`
 
-If the cached bundle is missing:
+If the pinned bundle is missing or invalid:
 
 1. `edge-agent` downloads the pinned official archive for the current platform.
 2. It verifies the archive SHA256.
@@ -56,6 +59,31 @@ If the cached bundle is missing:
 4. It uses the cached copy instead of depending on the live Bambu Studio install.
 
 If checksum verification fails, camera startup must fail closed.
+
+## Startup Preflight
+
+When `edge-agent` starts with `--bambu`, startup first verifies that the pinned plugin bundle is ready in the edge-managed cache.
+
+Valid pinned bundle requirements:
+
+- `plugin.zip` exists in the pinned version directory
+- `plugin.zip` SHA256 matches the pinned official checksum
+- the required source library exists for the current platform
+- the required networking library exists for the current platform
+
+If any of those checks fail:
+
+1. `edge-agent` clears the broken pinned-version cache directory.
+2. It re-downloads the pinned official archive.
+3. It re-verifies the archive checksum.
+4. It re-extracts the required native libraries.
+
+If the bundle still cannot be prepared, `edge-agent` exits with a clear operator-facing error that explains:
+
+- the pinned version,
+- the expected cache directory,
+- what failed,
+- and what the operator should check next.
 
 ## Cache Layout
 
@@ -157,6 +185,7 @@ The user-facing error should be specific and actionable, but it must not leak se
 
 ## Notes
 
-- This document covers the camera runtime only.
+- This document focuses on the pinned native bundle lifecycle plus the camera runtime that consumes it.
+- The same pinned bundle is also reused by the Bambu native control tunnel for file-control flows.
 - It does not change the Bambu print/control architecture.
 - It does not change the trust boundary: printer-local secrets remain on the edge host.

@@ -100,8 +100,11 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
   - pause/resume/stop prefer the local MQTT command channel when LAN credentials are available, with the legacy cloud path remaining as fallback outside the adopted LAN path.
 - Bambu camera is now managed internally by `edge-agent`:
   - `edge-agent` owns the local Bambu camera runtime and exposes a loopback-only internal MJPEG contract for its own use.
+  - when started with `--bambu`, `edge-agent` preflights the pinned native Bambu plugin bundle before startup continues.
   - the required Bambu plugin bundle is pinned to a specific version and checksum-verified before use.
-  - if the pinned plugin bundle is missing, `edge-agent` downloads the official archive into `~/.printfarmhq` and uses the cached copy instead of following whatever Bambu Studio version is installed locally.
+  - if the pinned plugin bundle is missing or invalid, `edge-agent` repairs it from the official pinned archive into `~/.printfarmhq` instead of following whatever Bambu Studio version is installed locally.
+  - if the pinned plugin bundle still cannot be prepared, startup exits with a clear operator-facing error instead of running with a broken Bambu runtime.
+  - the same pinned native bundle also backs the native Bambu control tunnel used for printer file-control operations.
   - SaaS still does not connect to `edge-agent` directly; `edge-agent` pulls camera-session work and pushes stream bytes back to the control plane.
   - directly tested Bambu camera support currently exists only for `P1S`.
   - unverified families such as `X1C` must remain truthfully unavailable until they are directly validated and implemented.
@@ -121,7 +124,7 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
   - `BAMBU_CLOUD_PRINT_PATH` (default `/v1/iot-service/api/user/print`)
 - To reduce repeated retries on deterministic non-retryable failures, tune:
   - `ACTION_NON_RETRYABLE_COOLDOWN_MS` (default `180000`)
-- Cloud auth/MFA + cloud print lifecycle rollout is tracked in `backlog/todo/p0.md`.
+- The completed LAN-first Bambu rollout is tracked in `backlog/todos/done/bambu-start-control-across-saas-edge.md`.
 
 ## Docs
 
