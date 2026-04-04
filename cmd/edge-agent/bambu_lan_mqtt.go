@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -296,34 +297,13 @@ func (a *agent) executeBambuLANControlAction(
 	binding edgeBinding,
 	command string,
 ) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-
-	publisher := a.bambuMQTTPublish
-	if publisher == nil {
-		publisher = defaultBambuPrintCommandPublisher{}
-	}
-	if err := publisher.PublishPrintCommand(ctx, bambuMQTTCommandRequest{
-		BrokerAddr:         net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
-		Topic:              formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
-		Username:           bambuLANMQTTUsername,
-		Password:           strings.TrimSpace(credentials.AccessCode),
-		Command:            strings.TrimSpace(command),
-		Param:              "",
-		InsecureSkipVerify: true,
-	}); err != nil {
-		return err
-	}
-	return a.verifyBambuControlAction(ctx, strings.TrimSpace(credentials.Serial), command)
+	runtimeAction := runtimeActionFromQueuedAction(queuedAction)
+	runtimeAction.Kind = strings.TrimSpace(command)
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeAction, printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeBambuLANPrinterCommand(
@@ -331,141 +311,11 @@ func (a *agent) executeBambuLANPrinterCommand(
 	queuedAction action,
 	binding edgeBinding,
 ) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-
-	var payload []byte
-	switch strings.TrimSpace(queuedAction.Kind) {
-	case "light_on", "light_off":
-		ledMode := "on"
-		if strings.TrimSpace(queuedAction.Kind) == "light_off" {
-			ledMode = "off"
-		}
-		payload, err = json.Marshal(map[string]any{
-			"system": map[string]any{
-				"command":       "ledctrl",
-				"sequence_id":   strconv.FormatInt(time.Now().UnixMilli(), 10),
-				"led_node":      "chamber_light",
-				"led_mode":      ledMode,
-				"led_on_time":   500,
-				"led_off_time":  500,
-				"loop_times":    0,
-				"interval_time": 0,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("marshal bambu led payload: %w", err)
-		}
-		if err := publishBambuMQTTRawFunc(
-			ctx,
-			net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
-			formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
-			bambuLANMQTTUsername,
-			strings.TrimSpace(credentials.AccessCode),
-			payload,
-			true,
-		); err != nil {
-			return err
-		}
-		return a.verifyBambuLEDState(ctx, strings.TrimSpace(credentials.Serial), ledMode)
-	case "load_filament", "unload_filament":
-		target := 255
-		if strings.TrimSpace(queuedAction.Kind) == "unload_filament" {
-			target = 254
-		}
-		payload, err = json.Marshal(map[string]any{
-			"print": map[string]any{
-				"command":     "ams_change_filament",
-				"sequence_id": strconv.FormatInt(time.Now().UnixMilli(), 10),
-				"target":      target,
-				"curr_temp":   bambuLANFilamentCommandTemp,
-				"tar_temp":    bambuLANFilamentCommandTemp,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("marshal bambu filament payload: %w", err)
-		}
-		return publishBambuMQTTRawFunc(
-			ctx,
-			net.JoinHostPort(strings.TrimSpace(credentials.Host), bambuLANMQTTBrokerPort),
-			formatBambuLANMQTTRequestTopic(strings.TrimSpace(credentials.Serial)),
-			bambuLANMQTTUsername,
-			strings.TrimSpace(credentials.AccessCode),
-			payload,
-			true,
-		)
-	case "home_axes":
-		gcodeLine, err := buildBambuLANHomeAxesGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	case "jog_motion":
-		gcodeLine, err := buildBambuLANJogMotionGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	case "jog_motion_batch":
-		gcodeLine, err := buildBambuLANJogMotionBatchGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	case "set_fan_enabled":
-		gcodeLine, err := buildBambuLANFanControlGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	case "set_nozzle_temperature":
-		gcodeLine, err := buildBambuLANNozzleTemperatureGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	case "set_bed_temperature":
-		gcodeLine, err := buildBambuLANBedTemperatureGCode(queuedAction.Payload)
-		if err != nil {
-			return err
-		}
-		return publishBambuLANGCodeLine(
-			ctx,
-			credentials,
-			gcodeLine,
-		)
-	default:
-		return fmt.Errorf("validation_error: unsupported bambu lan printer command %s", queuedAction.Kind)
-	}
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func publishBambuLANGCodeLine(

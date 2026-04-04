@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
 
@@ -193,149 +194,11 @@ func bambuLANDeleteVerificationError(path string, files []printerFileEntry) erro
 }
 
 func (a *agent) executeBambuLANPrintAction(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-
-	artifact, err := a.downloadArtifact(ctx, queuedAction.Target)
-	if err != nil {
-		return err
-	}
-	defer a.cleanupArtifact(artifact.LocalPath)
-
-	if ext := strings.ToLower(strings.TrimSpace(artifact.NormalizedExtension)); ext != ".3mf" && ext != ".gcode.3mf" {
-		return fmt.Errorf(
-			"validation_error: bambu lan print start requires a .3mf artifact, got %q",
-			artifact.preferredSourceName(),
-		)
-	}
-
-	remoteStartFileName := artifact.bambuLANRemoteName()
-	projectPath := defaultBambuLANProjectFileParam()
-	baseAuditFields := artifactAuditFields(queuedAction, "bambu", remoteStartFileName)
-
-	a.audit("artifact_downloaded", mergedAuditFields(baseAuditFields, map[string]any{
-		"source_filename": artifact.preferredSourceName(),
-		"size_bytes":      artifact.SizeBytes,
-	}))
-	a.audit("artifact_reuse_probe_attempt", mergedAuditFields(baseAuditFields, map[string]any{
-		"transport": "bambu_lan_ftps",
-	}))
-
-	reused, reason, probeErr := probeBambuLANArtifact(ctx, credentials, remoteStartFileName, artifact)
-	switch {
-	case probeErr != nil:
-		a.audit("artifact_reuse_probe_fallback_upload", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-			"reason":    reason,
-			"error":     probeErr.Error(),
-		}))
-	case reused:
-		a.audit("artifact_reused", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-			"reason":    reason,
-		}))
-	case reason != "" && reason != "absent":
-		a.audit("artifact_reuse_probe_mismatch", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-			"reason":    reason,
-		}))
-	}
-
-	if !reused {
-		fileBytes, err := osReadFile(artifact.LocalPath)
-		if err != nil {
-			return err
-		}
-		a.audit("bambu_lan_upload_attempt", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-		}))
-		if err := uploadBambuLANArtifact(ctx, credentials, remoteStartFileName, fileBytes); err != nil {
-			a.audit("bambu_lan_upload_failed", mergedAuditFields(baseAuditFields, map[string]any{
-				"transport": "bambu_lan_ftps",
-				"error":     err.Error(),
-			}))
-			return fmt.Errorf("bambu_lan_upload_failed: %w", err)
-		}
-
-		a.audit("bambu_lan_upload_success", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-		}))
-		a.audit("artifact_uploaded", mergedAuditFields(baseAuditFields, map[string]any{
-			"transport": "bambu_lan_ftps",
-		}))
-	}
-
-	projectReq := bambuLANProjectFileRequest{
-		RemoteName:  remoteStartFileName,
-		FileMD5:     strings.ToUpper(strings.TrimSpace(artifact.MD5)),
-		ProjectPath: projectPath,
-	}
-	a.audit("bambu_print_start_dispatch_attempt", mergedAuditFields(baseAuditFields, map[string]any{
-		"project_path":       projectPath,
-		"transport":          "bambu_lan_mqtt",
-		"has_file_md5":       projectReq.FileMD5 != "",
-		"uses_fixed_options": true,
-	}))
-	previousEchoAudit := auditBambuLANProjectFileEcho
-	auditBambuLANProjectFileEcho = func(payload map[string]any) {
-		merged := map[string]any{
-			"printer_id":     queuedAction.PrinterID,
-			"job_id":         queuedAction.Target.JobID,
-			"plate_id":       queuedAction.Target.PlateID,
-			"filename":       remoteStartFileName,
-			"project_path":   projectPath,
-			"transport":      "bambu_lan_mqtt",
-			"adapter_family": "bambu",
-		}
-		for key, value := range payload {
-			merged[key] = value
-		}
-		a.audit("bambu_print_start_dispatch_echo", merged)
-	}
-	defer func() {
-		auditBambuLANProjectFileEcho = previousEchoAudit
-	}()
-	if err := dispatchBambuLANProjectFile(ctx, credentials, projectReq); err != nil {
-		a.audit("bambu_print_start_dispatch_failure", map[string]any{
-			"printer_id":     queuedAction.PrinterID,
-			"job_id":         queuedAction.Target.JobID,
-			"plate_id":       queuedAction.Target.PlateID,
-			"filename":       remoteStartFileName,
-			"project_path":   projectPath,
-			"transport":      "bambu_lan_mqtt",
-			"adapter_family": "bambu",
-			"error":          err.Error(),
-		})
-		return err
-	}
-	a.extendBambuRuntimeConnectivitySuppression(queuedAction.PrinterID, a.bambuPrintStartVerificationTimeout())
-
-	// Project a queued runtime state immediately so SaaS treats calibration/preparation
-	// as an in-progress start instead of an overdue start that never began.
-	a.markPrintStartInProgress(queuedAction)
-
-	if err := a.verifyBambuPrintStart(ctx, strings.TrimSpace(printerID)); err != nil {
-		return fmt.Errorf("bambu_start_verification_timeout: %w", err)
-	}
-
-	a.audit("bambu_print_start_verified", mergedAuditFields(baseAuditFields, map[string]any{
-		"project_path": projectPath,
-		"transport":    "bambu_lan_mqtt",
-	}))
-	a.audit("print_start_requested", mergedAuditFields(baseAuditFields, map[string]any{
-		"transport": "bambu_lan_mqtt",
-	}))
-	return nil
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 var osReadFile = func(path string) ([]byte, error) {

@@ -3,7 +3,7 @@
 ## Roles
 
 - `edge-agent`
-  - Discovers printers from providers (Moonraker, Bambu cloud)
+  - Discovers printers from providers (Moonraker, Bambu LAN)
   - Normalizes provider-specific data into canonical runtime states
   - Pushes runtime state and discovery inventory to SaaS
 

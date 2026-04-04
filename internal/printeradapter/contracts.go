@@ -138,10 +138,19 @@ type CommandCatalog struct {
 }
 
 type StartPrintRequest struct {
-	ArtifactURL    string
-	ChecksumSHA256 string
-	JobID          string
-	PlateID        int
+	IntentVersion       int
+	DesiredPrinterState string
+	DesiredJobState     string
+	ArtifactURL         string
+	ChecksumSHA256      string
+	JobID               string
+	PlateID             int
+}
+
+type RuntimeAction struct {
+	Kind    string
+	Payload map[string]any
+	Target  StartPrintRequest
 }
 
 type CoreAdapter interface {

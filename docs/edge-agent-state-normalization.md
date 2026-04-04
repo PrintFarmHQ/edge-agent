@@ -84,7 +84,7 @@ that intent alone.
 - `CANCELED` / `CANCELLED` -> `idle / canceled`
 - `ACTIVE` / `IDLE` / `READY` / `STANDBY` / `COMPLETED` / `FINISHED` -> `idle / completed`
 
-For runtime snapshots, if a Bambu cloud device is offline, the agent returns connectivity failure for that binding so SaaS can project printer offline.
+For runtime snapshots, if a Bambu LAN printer is unreachable, the agent returns connectivity failure for that binding so SaaS can project printer offline.
 
 ### Bambu LAN MQTT
 

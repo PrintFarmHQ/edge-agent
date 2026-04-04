@@ -167,9 +167,14 @@ This keeps SaaS and frontend reading from one normalized command/capability mode
 Camera is the first migration slice because it already demonstrates the need for multiple capability levels.
 
 Current implementation checkpoint:
-- generic Moonraker webcam discovery, stream vs snapshot selection, snapshot polling, and Snapmaker `monitor.jpg` keepalive routing have started moving into `internal/printeradapter/moonraker/`
+- generic Moonraker webcam discovery, stream vs snapshot selection, snapshot polling, and Snapmaker `monitor.jpg` keepalive routing now live in `internal/printeradapter/moonraker/`
 - the camera-session path and local web UI now reuse the same Moonraker adapter-owned camera logic
-- Bambu camera still uses the current internal runtime path and remains the next extraction slice
+- Bambu camera ownership now lives in `internal/printeradapter/bambu/`
+- the camera-session path, internal Bambu loopback route, and local web UI Bambu proxy path now reuse the same adapter-owned Bambu camera logic
+- top-level Moonraker and Bambu runtime dispatch now lives in `internal/printeradapter/moonraker/runtime.go` and `internal/printeradapter/bambu/runtime.go`
+- Moonraker print lifecycle, command/control actions, and printer-file actions now dispatch through the Moonraker runtime adapter
+- Bambu LAN print lifecycle, command/control actions, and printer-file actions now dispatch through the Bambu runtime adapter
+- Bambu support in `edge-agent` is now LAN-only; Bambu cloud and Bambu Connect paths have been removed
 
 ### `live_stream`
 

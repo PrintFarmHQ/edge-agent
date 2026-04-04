@@ -13,6 +13,12 @@ Intended layout:
 Current architecture direction:
 - `registry.go` is the profile catalog and fallback resolver
 - `moonraker/camera.go` is now the adapter-owned home for generic Moonraker camera behavior
+- `bambu/camera.go` is now the adapter-owned home for Bambu camera behavior
+- `moonraker/runtime.go` is now the adapter-owned home for top-level Moonraker runtime dispatch
+- `bambu/runtime.go` is now the adapter-owned home for top-level Bambu runtime dispatch
+- Moonraker print start, command/control, and printer-file actions now dispatch through the Moonraker runtime package
+- Bambu LAN print start, command/control, and printer-file actions now dispatch through the Bambu runtime package
+- Bambu support is LAN-only; cloud/connect paths are no longer part of the runtime architecture
 - profiles are matched from adapter family plus detected model/runtime hints
 - the resolver publishes printer support metadata such as:
   - `profile_key`

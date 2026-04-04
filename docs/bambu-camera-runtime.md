@@ -14,6 +14,10 @@ The operator runs only `edge-agent`.
 
 The same pinned native bundle is also reused by `edge-agent` for Bambu native control-tunnel work such as printer file-control operations. This document focuses on the bundle lifecycle and camera runtime contract.
 
+Current ownership checkpoint:
+- the low-level native runtime still lives under `internal/bambu/cameraruntime/`
+- the higher-level Bambu camera selection and orchestration path is now beginning to move into `internal/printeradapter/bambu/`
+
 ## Network Model
 
 The camera architecture is intentionally outbound-only:

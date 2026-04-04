@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
 )
 
 type printerFileDeleteTarget struct {
@@ -478,374 +480,49 @@ func (a *agent) fetchMoonrakerRemoteFileMetadata(
 }
 
 func (a *agent) executeMoonrakerStartExistingFile(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	path, expected, err := parsePrinterFileActionPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	if !isMoonrakerPrintableFileFormat(path) {
-		return fmt.Errorf("validation_error: unsupported moonraker file format for start: %s", path)
-	}
-	sizeBytes, modifiedAt, exists, err := a.fetchMoonrakerRemoteFileMetadata(ctx, binding.EndpointURL, path)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return errors.New("printer_file_not_found: moonraker file no longer exists")
-	}
-	if !printerFileFingerprintMatches(path, sizeBytes, modifiedAt, expected) {
-		return errors.New("printer_file_snapshot_mismatch: moonraker file changed since the last refresh")
-	}
-	if err := a.callMoonrakerPost(ctx, binding.EndpointURL, "/printer/print/start", map[string]string{"filename": path}); err != nil {
-		return err
-	}
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.moonrakerRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeMoonrakerDeleteFile(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	path, expected, err := parsePrinterFileActionPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	sizeBytes, modifiedAt, exists, err := a.fetchMoonrakerRemoteFileMetadata(ctx, binding.EndpointURL, path)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return errors.New("printer_file_not_found: moonraker file no longer exists")
-	}
-	if !printerFileFingerprintMatches(path, sizeBytes, modifiedAt, expected) {
-		return errors.New("printer_file_snapshot_mismatch: moonraker file changed since the last refresh")
-	}
-	activePath, _ := a.fetchMoonrakerCurrentFilename(ctx, binding.EndpointURL)
-	if activePath != "" && strings.EqualFold(strings.TrimSpace(activePath), strings.TrimSpace(path)) {
-		return errors.New("printer_file_active: cannot delete the currently active moonraker file")
-	}
-
-	requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(
-		requestCtx,
-		http.MethodDelete,
-		resolveURL(binding.EndpointURL, "/server/files/gcodes/"+url.PathEscape(path)),
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("moonraker delete file failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.moonrakerRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeMoonrakerDeleteAllFiles(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	targets, err := parsePrinterFileDeleteTargetsPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	activePath, _ := a.fetchMoonrakerCurrentFilename(ctx, binding.EndpointURL)
-	for _, target := range targets {
-		sizeBytes, modifiedAt, exists, metadataErr := a.fetchMoonrakerRemoteFileMetadata(ctx, binding.EndpointURL, target.Path)
-		if metadataErr != nil {
-			return metadataErr
-		}
-		if !exists {
-			return fmt.Errorf("printer_file_not_found: moonraker file no longer exists: %s", target.Path)
-		}
-		if !printerFileFingerprintMatches(target.Path, sizeBytes, modifiedAt, target.Expected) {
-			return fmt.Errorf("printer_file_snapshot_mismatch: moonraker file changed since the last refresh: %s", target.Path)
-		}
-		if activePath != "" && strings.EqualFold(strings.TrimSpace(activePath), strings.TrimSpace(target.Path)) {
-			return fmt.Errorf("printer_file_active: cannot delete the currently active moonraker file: %s", target.Path)
-		}
-	}
-
-	for _, target := range targets {
-		requestCtx, cancel := context.WithTimeout(ctx, a.cfg.MoonrakerRequestTimeout)
-		req, reqErr := http.NewRequestWithContext(
-			requestCtx,
-			http.MethodDelete,
-			resolveURL(binding.EndpointURL, "/server/files/gcodes/"+url.PathEscape(target.Path)),
-			nil,
-		)
-		if reqErr != nil {
-			cancel()
-			return reqErr
-		}
-		resp, doErr := a.client.Do(req)
-		if doErr != nil {
-			cancel()
-			return doErr
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			cancel()
-			return fmt.Errorf("moonraker delete file failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		resp.Body.Close()
-		cancel()
-	}
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.moonrakerRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeBambuLANStartExistingFile(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-	path, expected, err := parsePrinterFileActionPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	if !isBambuPrintableFileFormat(path) {
-		return fmt.Errorf("validation_error: unsupported bambu printer file format for start: %s", path)
-	}
-	ftpsPath, projectRemoteName, projectPath, err := parseBambuStartDescriptor(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	sizeBytes, modifiedAt, err := fetchBambuLANRemoteFileMetadata(ctx, credentials, ftpsPath)
-	if err != nil {
-		if isBambuLANFTPSNotFound(err) {
-			return errors.New("printer_file_not_found: bambu file no longer exists")
-		}
-		return err
-	}
-	if !printerFileFingerprintMatches(path, sizeBytes, modifiedAt, expected) {
-		return errors.New("printer_file_snapshot_mismatch: bambu file changed since the last refresh")
-	}
-	fileMD5, retrievedSize, err := fetchBambuLANRemoteFileMD5(ctx, credentials, ftpsPath)
-	if err != nil {
-		return err
-	}
-	if sizeBytes != nil && retrievedSize != nil && *sizeBytes != *retrievedSize {
-		return errors.New("printer_file_snapshot_mismatch: bambu file size changed during start verification")
-	}
-	projectReq := bambuLANProjectFileRequest{
-		RemoteName:  projectRemoteName,
-		FileMD5:     fileMD5,
-		ProjectPath: projectPath,
-	}
-	if err := dispatchBambuLANProjectFile(ctx, credentials, projectReq); err != nil {
-		return err
-	}
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeBambuLANDeleteFile(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-	path, expected, err := parsePrinterFileActionPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	if !isBambuDeletableFileFormat(path) {
-		return fmt.Errorf("validation_error: unsupported bambu printer file format for delete: %s", path)
-	}
-	deleteDescriptor, err := parseBambuDeleteDescriptor(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-	sizeBytes, modifiedAt, err := fetchBambuLANRemoteFileMetadata(ctx, credentials, deleteDescriptor.PrimaryFTPSPath)
-	if err != nil {
-		if isBambuLANFTPSNotFound(err) {
-			return errors.New("printer_file_not_found: bambu file no longer exists")
-		}
-		return err
-	}
-	if !printerFileFingerprintMatches(path, sizeBytes, modifiedAt, expected) {
-		return errors.New("printer_file_snapshot_mismatch: bambu file changed since the last refresh")
-	}
-	if snapshot, snapErr := fetchBambuLANMQTTSnapshot(ctx, strings.TrimSpace(credentials.Host), strings.TrimSpace(credentials.Serial), strings.TrimSpace(credentials.AccessCode)); snapErr == nil {
-		if snapshot.ActiveFilePath != "" && strings.EqualFold(bambuLANLogicalPrintableKey(snapshot.ActiveFilePath), bambuLANLogicalPrintableKey(path)) {
-			return errors.New("printer_file_active: cannot delete the currently active bambu file")
-		}
-	}
-	controlDeleteAttempted := false
-	if deleteDescriptor.ControlDeletePath != "" || deleteDescriptor.ControlDeleteName != "" {
-		if pluginLibraryPath, pluginErr := ensureBambuLANPluginLibrary(ctx, a.cfg.BambuCameraRuntimeDir); pluginErr == nil {
-			controlDeleteAttempted = true
-			controlErr := deleteBambuLANControlFiles(ctx, pluginLibraryPath, credentials, []bambuLANControlDeleteTarget{{
-				Path: deleteDescriptor.ControlDeletePath,
-				Name: deleteDescriptor.ControlDeleteName,
-			}})
-			if controlErr != nil {
-				a.audit("bambu_file_control_delete_fallback", map[string]any{
-					"printer_id": binding.PrinterID,
-					"path":       path,
-					"error":      controlErr.Error(),
-				})
-			}
-		}
-	}
-	if err := deleteBambuLANExistingFile(ctx, credentials, deleteDescriptor.PrimaryFTPSPath); err != nil {
-		if !(controlDeleteAttempted && isBambuLANFTPSNotFound(err)) {
-			return err
-		}
-	}
-	for _, companionFTPSPath := range deleteDescriptor.CompanionFTPSPaths {
-		if err := deleteBambuLANExistingFile(ctx, credentials, companionFTPSPath); err != nil && !isBambuLANFTPSNotFound(err) {
-			return err
-		}
-	}
-	activeFilePath := ""
-	if snapshot, snapErr := fetchBambuLANMQTTSnapshot(ctx, strings.TrimSpace(credentials.Host), strings.TrimSpace(credentials.Serial), strings.TrimSpace(credentials.AccessCode)); snapErr == nil {
-		activeFilePath = snapshot.ActiveFilePath
-	}
-	filesAfterDelete, listErr := defaultListBambuLANPrinterFiles(ctx, credentials, activeFilePath)
-	if listErr != nil {
-		return fmt.Errorf("printer_file_delete_verification_failed: unable to refresh printer files after delete: %w", listErr)
-	}
-	for _, file := range filesAfterDelete {
-		if strings.TrimSpace(file.Path) == strings.TrimSpace(path) {
-			return bambuLANDeleteVerificationError(path, filesAfterDelete)
-		}
-	}
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }
 
 func (a *agent) executeBambuLANDeleteAllFiles(ctx context.Context, queuedAction action, binding edgeBinding) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
-	if err != nil {
-		return err
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(ctx, printerID)
-	if err != nil {
-		if isBambuLANCredentialsUnavailable(err) {
-			return a.decorateBambuLANCredentialsUnavailable(ctx, binding, err)
-		}
-		return err
-	}
-	targets, err := parsePrinterFileDeleteTargetsPayload(queuedAction.Payload)
-	if err != nil {
-		return err
-	}
-
-	activeLogicalKey := ""
-	if snapshot, snapErr := fetchBambuLANMQTTSnapshot(ctx, strings.TrimSpace(credentials.Host), strings.TrimSpace(credentials.Serial), strings.TrimSpace(credentials.AccessCode)); snapErr == nil {
-		activeLogicalKey = bambuLANLogicalPrintableKey(snapshot.ActiveFilePath)
-	}
-
-	client, err := dialBambuLANArtifactClient(ctx, strings.TrimSpace(credentials.Host))
-	if err != nil {
-		return err
-	}
-	defer client.close()
-	if err := client.login(bambuLANFTPSUsername, strings.TrimSpace(credentials.AccessCode)); err != nil {
-		return err
-	}
-	if err := client.setBinaryMode(); err != nil {
-		return err
-	}
-
-	pathsToDelete := make([]string, 0, len(targets)*2)
-	controlTargets := make([]bambuLANControlDeleteTarget, 0, len(targets))
-	seenPaths := make(map[string]struct{})
-	for _, target := range targets {
-		if !isBambuDeletableFileFormat(target.Path) {
-			return fmt.Errorf("validation_error: unsupported bambu printer file format for delete: %s", target.Path)
-		}
-		deleteDescriptor, descriptorErr := parseBambuDeleteDescriptor(map[string]any{
-			"path":              target.Path,
-			"delete_descriptor": target.DeleteDescriptor,
-		})
-		if descriptorErr != nil {
-			return descriptorErr
-		}
-		sizeBytes, metadataErr := client.size(deleteDescriptor.PrimaryFTPSPath)
-		if metadataErr != nil {
-			if isBambuLANFTPSNotFound(metadataErr) {
-				return fmt.Errorf("printer_file_not_found: bambu file no longer exists: %s", target.Path)
-			}
-			return metadataErr
-		}
-		sizePtr := int64Pointer(sizeBytes)
-		modifiedPtr, _ := client.modTime(deleteDescriptor.PrimaryFTPSPath)
-		if !printerFileFingerprintMatches(target.Path, sizePtr, modifiedPtr, target.Expected) {
-			return fmt.Errorf("printer_file_snapshot_mismatch: bambu file changed since the last refresh: %s", target.Path)
-		}
-		if activeLogicalKey != "" && strings.EqualFold(activeLogicalKey, bambuLANLogicalPrintableKey(target.Path)) {
-			return fmt.Errorf("printer_file_active: cannot delete the currently active bambu file: %s", target.Path)
-		}
-		if _, ok := seenPaths[deleteDescriptor.PrimaryFTPSPath]; !ok {
-			seenPaths[deleteDescriptor.PrimaryFTPSPath] = struct{}{}
-			pathsToDelete = append(pathsToDelete, deleteDescriptor.PrimaryFTPSPath)
-		}
-		for _, companionFTPSPath := range deleteDescriptor.CompanionFTPSPaths {
-			if _, ok := seenPaths[companionFTPSPath]; ok {
-				continue
-			}
-			seenPaths[companionFTPSPath] = struct{}{}
-			pathsToDelete = append(pathsToDelete, companionFTPSPath)
-		}
-		if deleteDescriptor.ControlDeletePath != "" || deleteDescriptor.ControlDeleteName != "" {
-			controlTargets = append(controlTargets, bambuLANControlDeleteTarget{
-				Path: deleteDescriptor.ControlDeletePath,
-				Name: deleteDescriptor.ControlDeleteName,
-			})
-		}
-	}
-
-	if len(controlTargets) > 0 {
-		if pluginLibraryPath, pluginErr := ensureBambuLANPluginLibrary(ctx, a.cfg.BambuCameraRuntimeDir); pluginErr == nil {
-			if controlErr := deleteBambuLANControlFiles(ctx, pluginLibraryPath, credentials, controlTargets); controlErr != nil {
-				a.audit("bambu_file_control_delete_fallback", map[string]any{
-					"printer_id": binding.PrinterID,
-					"count":      len(controlTargets),
-					"error":      controlErr.Error(),
-				})
-			}
-		}
-	}
-
-	for _, ftpsPath := range pathsToDelete {
-		if err := client.delete(ftpsPath); err != nil && !isBambuLANFTPSNotFound(err) {
-			return err
-		}
-	}
-
-	filesAfterDelete, listErr := defaultListBambuLANPrinterFiles(ctx, credentials, "")
-	if listErr != nil {
-		return fmt.Errorf("printer_file_delete_verification_failed: unable to refresh printer files after bulk delete: %w", listErr)
-	}
-	surviving := make(map[string]struct{}, len(filesAfterDelete))
-	for _, file := range filesAfterDelete {
-		surviving[strings.TrimSpace(file.Path)] = struct{}{}
-	}
-	for _, target := range targets {
-		if _, ok := surviving[strings.TrimSpace(target.Path)]; ok {
-			return bambuLANDeleteVerificationError(target.Path, filesAfterDelete)
-		}
-	}
-
-	a.bestEffortRefreshPrinterFiles(ctx, binding)
-	return nil
+	return a.bambuRuntimeAdapter().ExecuteAction(ctx, runtimeActionFromQueuedAction(queuedAction), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	})
 }

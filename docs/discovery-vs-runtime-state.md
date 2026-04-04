@@ -20,7 +20,7 @@ This channel drives printer availability and print execution UX.
 
 ## Practical Example (Bambu)
 
-- Bambu cloud account has 5 devices.
+- Bambu LAN discovery sees 5 devices on the local network.
 - Discovery can list all 5, with some `reachable` and some `unreachable`.
 - User can adopt both reachable and unreachable Bambu entries.
 - After adopting an unreachable Bambu entry, printer appears in Printers list as `offline` until device comes back online and runtime updates become reachable.

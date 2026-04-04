@@ -11,12 +11,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	printeradapter "printfarmhq/edge-agent/internal/printeradapter"
 	moonrakeradapter "printfarmhq/edge-agent/internal/printeradapter/moonraker"
 	bambustore "printfarmhq/edge-agent/internal/store"
 )
@@ -263,7 +263,7 @@ func (a *agent) handleInternalBambuCamera(w http.ResponseWriter, r *http.Request
 	}
 
 	if resource == "snapshot.jpg" {
-		imageBytes, snapshotErr := fetchManagedBambuSnapshot(r.Context(), handle)
+		imageBytes, snapshotErr := a.bambuCameraAdapter().FetchManagedSnapshot(r.Context(), printerID)
 		if snapshotErr != nil {
 			http.Error(w, snapshotErr.Error(), localCameraProxyStatusCode(snapshotErr))
 			return
@@ -275,7 +275,7 @@ func (a *agent) handleInternalBambuCamera(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	reader, streamErr := openManagedBambuMJPEGReader(r.Context(), handle)
+	reader, streamErr := a.bambuCameraAdapter().OpenManagedRuntimeStream(r.Context(), printerID)
 	if streamErr != nil {
 		http.Error(w, streamErr.Error(), localCameraProxyStatusCode(streamErr))
 		return
@@ -439,99 +439,20 @@ func (a *agent) proxyLocalCameraResponse(w http.ResponseWriter, r *http.Request,
 }
 
 func (a *agent) proxyBambuCameraResponse(w http.ResponseWriter, r *http.Request, binding edgeBinding, variant string) error {
-	printerID, err := parseBambuPrinterEndpointID(binding.EndpointURL)
+	stream, err := a.bambuCameraAdapter().OpenProxyReader(r.Context(), printeradapter.Binding{
+		PrinterID:     binding.PrinterID,
+		AdapterFamily: binding.AdapterFamily,
+		EndpointURL:   binding.EndpointURL,
+	}, variant)
 	if err != nil {
 		return err
 	}
-	if a.bambuCameraRuntime != nil {
-		resource := "stream.mjpeg"
-		if variant == "snapshot" {
-			resource = "snapshot.jpg"
-		}
-		internalURL, urlErr := a.internalBambuCameraContractURL(printerID, resource)
-		if urlErr != nil {
-			return urlErr
-		}
-		return a.proxyLocalCameraResponse(w, r, internalURL, resource == "stream.mjpeg")
-	}
-	credentials, err := a.resolveBambuLANRuntimeCredentials(r.Context(), printerID)
-	if err != nil {
-		return err
-	}
-	source, err := a.resolveBambuCameraSource(r.Context(), credentials)
-	if err != nil {
-		return err
-	}
-	if source.Kind == bambuCameraSourceKindHelper && variant == "stream" {
-		return a.proxyLocalCameraResponse(w, r, source.URL, true)
-	}
-
-	ffmpegPath, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		return errors.New("ffmpeg is required on the edge host for bambu camera streaming")
-	}
-
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "error",
-		"-nostdin",
-	}
-	if source.Kind == bambuCameraSourceKindRTSP {
-		args = append(args, "-rtsp_transport", "tcp")
-	}
-	args = append(args, "-i", source.URL)
-	contentType := "multipart/x-mixed-replace;boundary=frame"
-	if variant == "snapshot" {
-		args = append(args,
-			"-frames:v", "1",
-			"-f", "image2pipe",
-			"-vcodec", "mjpeg",
-			"pipe:1",
-		)
-		contentType = "image/jpeg"
-	} else {
-		args = append(args,
-			"-f", "mpjpeg",
-			"-boundary_tag", "frame",
-			"-q:v", "6",
-			"-r", "5",
-			"pipe:1",
-		)
-	}
-
-	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	cmd.Stdout = w
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	stderrCh := make(chan string, 1)
-	go func() {
-		msg, _ := io.ReadAll(io.LimitReader(stderr, 4096))
-		stderrCh <- strings.TrimSpace(string(msg))
-	}()
-
-	w.Header().Set("Content-Type", contentType)
+	defer stream.Reader.Close()
+	w.Header().Set("Content-Type", stream.ContentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-
-	waitErr := cmd.Wait()
-	stderrMsg := <-stderrCh
-	if waitErr != nil {
-		if stderrMsg != "" {
-			return fmt.Errorf("bambu ffmpeg proxy failed: %s", stderrMsg)
-		}
-		return waitErr
-	}
-	return nil
+	_, err = io.Copy(w, stream.Reader)
+	return err
 }
 
 func (a *agent) internalBambuCameraContractURL(printerID string, resource string) (string, error) {

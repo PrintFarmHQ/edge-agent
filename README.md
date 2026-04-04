@@ -46,7 +46,7 @@ Override example:
 make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 SETUP_BIND_ADDR=127.0.0.1:18100 EDGE_AGENT_FLAGS="--klipper"
 ```
 
-Bambu cloud auth example:
+Bambu LAN example:
 
 ```bash
 make dev EDGE_API_KEY=pfh_edge_xxx EDGE_AGENT_FLAGS="--klipper --bambu"
@@ -88,16 +88,13 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
 
 ## Current Bambu Status
 
-- Bambu startup now performs cloud authentication (MFA supported) and persists token material locally in `~/.printfarmhq/bambu/credentials.json`.
+- Bambu support in `edge-agent` is now LAN-only.
 - Bambu mode requires only `--bambu`.
-- Startup first tries stored token reuse (and refresh token when available). If not valid, it prompts for username/password interactively.
-- Password input is treated as secret in terminal sessions and is not echoed back.
-- When MFA is required, startup blocks and asks for the code on the interactive console.
-- Empty/invalid MFA code (or non-interactive console) makes startup fail with a non-zero exit.
-- Bambu cloud devices are discovered through the same discovery inventory pipeline as Klipper and submitted to SaaS on the periodic inventory cadence (default 30s).
-- Bambu print lifecycle actions are enabled:
-  - adopted LAN print start uses Bambu FTPS upload plus local MQTT `project_file`, and skips upload when the target printer already has the same content-addressed artifact with matching size and MD5.
-  - pause/resume/stop prefer the local MQTT command channel when LAN credentials are available, with the legacy cloud path remaining as fallback outside the adopted LAN path.
+- `edge-agent` does not use Bambu cloud auth or Bambu Connect for discovery, snapshots, or runtime actions.
+- Adopted Bambu printers rely on the local LAN credentials store plus LAN transports:
+  - local discovery
+  - local MQTT for print/control commands
+  - FTPS for printer-resident files and print-start artifact reuse
 - Bambu camera is now managed internally by `edge-agent`:
   - `edge-agent` owns the local Bambu camera runtime and exposes a loopback-only internal MJPEG contract for its own use.
   - when started with `--bambu`, `edge-agent` preflights the pinned native Bambu plugin bundle before startup continues.
@@ -115,13 +112,7 @@ make dev EDGE_API_KEY=pfh_edge_xxx DEV_CONTROL_PLANE_URL=http://localhost:8000 E
   - Moonraker now also pushes live control-status telemetry every second for nozzle/bed plus optional chamber temperatures and writable fan state, and reuses the same buffered `jog_motion_batch` UX as Bambu.
   - the command-center filament button now uses edge-reported `filament_state` plus `filament_action_state`; Moonraker needs a real filament sensor for a trustworthy single-button filament UX, and Bambu prefers `ams.tray_now` active-source detection with command-memory fallback plus `needs_user_confirmation` when load/unload flows still require operator completion on the printer.
   - when a printer rejects a command, edge-agent now summarizes the printer-facing error message before acknowledging it back to SaaS so the UI can show the real reason instead of a huge traceback blob.
-- MQTT command auth resolves username from the current Bambu access-token claims (`user_id`/`uid`/`sub`) at action time.
-- Print start success is verified against Bambu cloud telemetry (`queued`/`printing`) before the action is marked successful.
-- If the upload response does not include a printable `file_url`, print-start fails fast with a validation error (no signed-upload-URL guessing).
-- Runtime action auth reuses the same persisted token store (`~/.printfarmhq/bambu/credentials.json`) and re-initializes auth on token expiry/rejection.
-- If Bambu cloud API paths differ by region/account, override with:
-  - `BAMBU_CLOUD_UPLOAD_PATH` (default `/v1/iot-service/api/user/upload`)
-  - `BAMBU_CLOUD_PRINT_PATH` (default `/v1/iot-service/api/user/print`)
+- Print start success is verified against Bambu LAN runtime telemetry (`queued`/`printing`) before the action is marked successful.
 - To reduce repeated retries on deterministic non-retryable failures, tune:
   - `ACTION_NON_RETRYABLE_COOLDOWN_MS` (default `180000`)
 - The completed LAN-first Bambu rollout is tracked in `backlog/todos/done/bambu-start-control-across-saas-edge.md`.
