@@ -4,6 +4,13 @@
 
 These instructions apply to all files under `edge-agent/`.
 
+## Project Management
+
+- Implementation work in `edge-agent/` must be tracked in the separate `backlog/` repository.
+- Task files live under `backlog/todos/`; linked implementation plans live under `backlog/plans/`.
+- Follow the detailed planning structure and workflow rules in `../backlog/AGENTS.md`.
+- If implementation scope, decisions, or status change, update the matching backlog task and plan files in the same patch set.
+
 ## Delivery Direction
 
 - Treat printer integrations as adapter-driven capabilities, not one-off vendor branches spread across the codebase.
