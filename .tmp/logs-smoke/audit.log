@@ -1,5 +1,0 @@
-{"adapters":["moonraker"],"event":"discovery_scan_started","profile":"hybrid","scan_mode":"local_background","trigger_token":"","ts":"2026-03-07T11:56:16.331859Z"}
-{"adapter_count":1,"event":"discovery_scan_plan","moonraker_target_count":254,"probe_timeout_ms":2000,"profile":"hybrid","ts":"2026-03-07T11:56:16.333041Z","worker_count":64}
-{"error":"request failed 401: {\"detail\":\"Invalid edge API key\"}","event":"claim_failed","ts":"2026-03-07T11:56:24.265846Z"}
-{"event":"agent_shutdown","kind":"interrupt","reason":"signal","ts":"2026-03-07T11:56:26.908244Z"}
-{"candidates":1,"errors":253,"event":"discovery_scan_completed","hosts_reachable":1,"hosts_scanned":254,"inventory_entries":254,"job_status":"partial","raw_candidates":254,"scan_mode":"local_background","source_breakdown":{"local_private_subnets":254},"trigger_token":"","ts":"2026-03-07T11:56:26.909188Z"}
