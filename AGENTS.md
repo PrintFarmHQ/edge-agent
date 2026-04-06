@@ -11,6 +11,12 @@ These instructions apply to all files under `edge-agent/`.
 - Follow the detailed planning structure and workflow rules in `../backlog/AGENTS.md`.
 - If implementation scope, decisions, or status change, update the matching backlog task and plan files in the same patch set.
 
+## Branch Discipline (Critical)
+
+- Before implementing any new `edge-agent` task or plan, create and switch to a dedicated branch in `edge-agent/`.
+- Do not implement new `edge-agent` work directly on `master` or `main`.
+- Keep each branch scoped to the tracked task so it can be reviewed and merged independently.
+
 ## Delivery Direction
 
 - Treat printer integrations as adapter-driven capabilities, not one-off vendor branches spread across the codebase.
