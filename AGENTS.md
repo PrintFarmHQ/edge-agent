@@ -13,9 +13,10 @@ These instructions apply to all files under `edge-agent/`.
 
 ## Branch Discipline (Critical)
 
-- Before implementing any new `edge-agent` task or plan, create and switch to a dedicated branch in `edge-agent/`.
-- Do not implement new `edge-agent` work directly on `master` or `main`.
+- Before starting actual `edge-agent` task implementation, create and switch to a dedicated branch in `edge-agent/`.
+- Do not implement real `edge-agent` task work directly on `master` or `main`.
 - Keep each branch scoped to the tracked task so it can be reviewed and merged independently.
+- This rule is for actual implementation work, not every tiny docs or instruction tweak unless that change is part of active implementation.
 
 ## Delivery Direction
 
