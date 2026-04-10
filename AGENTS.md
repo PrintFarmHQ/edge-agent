@@ -18,6 +18,11 @@ These instructions apply to all files under `edge-agent/`.
 - Keep each branch scoped to the tracked task so it can be reviewed and merged independently.
 - This rule is for actual implementation work, not every tiny docs or instruction tweak unless that change is part of active implementation.
 
+## Commit Message Guidance
+
+- When commits are requested, use clear, human-readable commit messages that explain the change plainly.
+- Prefer descriptive Conventional Commit subjects over terse shorthand so the history stays understandable from `git log`.
+
 ## Delivery Direction
 
 - Treat printer integrations as adapter-driven capabilities, not one-off vendor branches spread across the codebase.
